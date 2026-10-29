@@ -1,0 +1,53 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "unicorn", "oxc", "import", "vitest"],
+  "categories": { "correctness": "error", "suspicious": "warn" },
+  "rules": {
+    "typescript/no-explicit-any": "error",
+    "typescript/no-non-null-assertion": "error",
+    "typescript/consistent-type-assertions": ["error", { "assertionStyle": "never" }],
+    "typescript/consistent-type-imports": "error",
+    "import/no-cycle": "error",
+    "no-restricted-imports": [
+      "error",
+      {
+        "paths": [
+          {
+            "name": "effect/schema",
+            "message": "Use the stable `effect/Schema` module; `effect/schema` is a different, unstable barrel."
+          }
+        ],
+        "patterns": [
+          {
+            "group": ["foldkit", "foldkit/**"],
+            "message": "Only examples may import FoldKit; the engine and its adapter never do (design §11)."
+          }
+        ]
+      }
+    ],
+    "vitest/no-standalone-expect": [
+      "error",
+      { "additionalTestBlockFunctions": ["it.effect", "it.live", "it.scoped", "it.scopedLive", "it.layer"] }
+    ]
+  },
+  "overrides": [
+    {
+      "files": ["src/domain/**", "src/client/**", "src/foldkit/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": ["**/server", "**/server/**", "echo/server"],
+                "message": "Domain and browser code never import src/server."
+              },
+              { "group": ["foldkit", "foldkit/**"], "message": "Only examples may import FoldKit (design §11)." }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "ignorePatterns": ["node_modules"]
+}

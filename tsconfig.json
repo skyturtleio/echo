@@ -24,7 +24,24 @@
     "skipLibCheck": true,
     "types": ["bun"],
     "erasableSyntaxOnly": true,
-    "plugins": [{ "name": "@effect/language-service", "diagnostics": false }]
+    "plugins": [
+      {
+        "name": "@effect/language-service",
+        "diagnostics": false,
+        "allowedUnstableApis": [
+          "effect/http",
+          "effect/reactivity",
+          "effect/rpc",
+          "effect/sql",
+          "effect/workers",
+          "@effect/platform-browser",
+          "@effect/platform-bun",
+          "@effect/sql-pg",
+          "@effect/sql-sqlite-wasm",
+          "@effect/vitest"
+        ]
+      }
+    ]
   },
   "include": ["src", "test", "*.ts"]
 }

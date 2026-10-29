@@ -48,6 +48,10 @@
           }
         ]
       }
+    },
+    {
+      "files": ["**/*.story.test.ts"],
+      "rules": { "unicorn/no-thenable": "off" }
     }
   ],
   "ignorePatterns": ["node_modules"]

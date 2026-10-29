@@ -24,6 +24,10 @@
     "skipLibCheck": true,
     "types": ["bun"],
     "erasableSyntaxOnly": true,
+    "paths": {
+      "echo/domain": ["./src/domain/index.ts"],
+      "echo/domain/testing": ["./src/domain/testing/index.ts"]
+    },
     "plugins": [
       {
         "name": "@effect/language-service",
@@ -43,5 +47,5 @@
       }
     ]
   },
-  "include": ["src", "test", "*.ts"]
+  "include": ["src", "test", "examples", "*.ts"]
 }

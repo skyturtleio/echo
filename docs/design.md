@@ -97,13 +97,16 @@ The sequence diagram in the thread reply shows this for two housemates claiming 
 
 ## 4. Building blocks (the domain package)
 
-Vocabulary and shapes are Alchemy's; signatures below are sketches to be verified against the
-pinned Effect v4 source when implemented (`Schema.TaggedClass`, `Schema.TaggedError`,
-`Context.Service` tags on the classes as Alchemy does).
+Vocabulary and shapes are Alchemy's. The sketch below is what Phase 0 implemented in
+`src/domain` (2026-10-29) against the pinned Effect v4 source: `Domain.Event` and
+`Domain.Command` are `Schema.TaggedClass`, `Domain.Rejection` is `Schema.TaggedError`, every
+block carries `kind` and `tag` statics, and `decide`/`evolve` are objects of one handler per tag
+(§14 item 8). The `version` argument on events and `Command.authority` are not implemented yet;
+no Phase 0 story needed them (§9, phase 3b).
 
 ```ts
 // Chore/ChoreClaimed.event.ts
-export class ChoreClaimed extends Domain.Event("ChoreClaimed", { by: UserId, at: Instant }, { version: 1 }) {}
+export class ChoreClaimed extends Domain.Event("ChoreClaimed", { by: UserId, at: Instant }) {}
 
 // Chore/ClaimedByHousemate.rejection.ts
 export class ClaimedByHousemate extends Domain.Rejection("ClaimedByHousemate", { by: UserId }) {}
@@ -112,30 +115,40 @@ export class ClaimedByHousemate extends Domain.Rejection("ClaimedByHousemate", {
 export class ClaimChore extends Domain.Command("ClaimChore", {
   target: ChoreId,
   events: [ChoreClaimed],
-  rejects: [ClaimedByHousemate, NotShared, NotYourChore],
+  rejects: [ClaimedByHousemate, NotShared],
+  reads: [Room],                       // other streams `decide` may read (§8, §14 item 2)
 }) {}
+
+// Chore/Chore.indexes.ts — declared apart from the aggregate so a command can name one in `reads`
+export const ChoreIndexes = Domain.Index(ChoreId, ChoreState, { by_room: ["roomId"], by_day: ["scheduledDay"] })
 
 // Chore/Chore.aggregate.ts
 export class Chore extends Domain.Aggregate("Chore", {
   id: ChoreId,
-  state: ChoreState,                       // Schema; versioned, see §9
-  initial: ChoreState.absent,
+  state: ChoreState,                       // Schema; `null` while the stream has no events
+  initial: null,
   commands: [CreateChore, EditChore, ClaimChore, ReleaseClaim, CompleteChore, MoveChore, DeleteChore],
-  scope: (state) => state.accessScopeId,  // which scope this stream is visible in (§7)
-  indexes: { by_room: ["roomId"], by_day: ["scheduledDay"] },
-  decide: (state, cmd, ctx) => Match.valueTags(cmd, {
-    ClaimChore: () =>
+  scope: (state) => state?.accessScopeId ?? null,  // which scope this stream is visible in (§7)
+  indexes: ChoreIndexes,                   // also reachable as `Chore.by_room`
+  decide: {                               // one pure handler per command; the checker lists a missing one
+    ClaimChore: (state, cmd, ctx) =>
       state.visibility !== "shared" ? new NotShared() :
       state.claimedBy !== null && state.claimedBy !== ctx.principal ? new ClaimedByHousemate({ by: state.claimedBy }) :
       [new ChoreClaimed({ by: ctx.principal, at: ctx.now })],
     ...
-  }),
-  evolve: (state, event) => Match.valueTags(event, {
-    ChoreClaimed: ({ by }) => ({ ...state, claimedBy: by }),
+  },
+  evolve: {                               // one total handler per event
+    ChoreClaimed: (state, { by }) => ({ ...state, claimedBy: by }),
     ...
-  }),
+  },
 }) {}
 ```
+
+`NotYourChore` is not in the sketch on purpose: who may write a stream is decided once by the
+engine from `scope(state)` and the principal's grants, and a story asserts
+`Domain.Scope.ScopeForbidden` (§15, story 5; §14 item 9). `Domain.Scope` also holds `Principal`,
+`Scope`, `privateScope`, `catalogScope` and the Phase 0 grant rule (own private scope: read and
+write; `catalog:*`: read), which the grants aggregate replaces in phase 3b.
 
 What is **kept from Alchemy** unchanged: `Event`, `Rejection`, `Command`
 (`target/input/events/rejects/reply`), `Aggregate` (`decide/evolve/initial`), `Envelope`
@@ -463,7 +476,7 @@ replay stays bounded.
 **Taken (2026-10-29), with the alternative each was chosen over:**
 
 2. **Cross-stream checks use `ctx.read` in `decide`**, declared per command
-   (`reads: [Project.by_code]`), not Alchemy's rule of an aggregate per protected
+   (`reads: [ProjectIndexes.by_code]`, item 10), not Alchemy's rule of an aggregate per protected
    value. How `CreateProject` learns another project has this code, or
    `RemoveTask` that entries still reference it: `decide` reads other streams' current
    state through the indexes. On the server the read is inside the SERIALIZABLE transaction, so
@@ -491,6 +504,36 @@ replay stays bounded.
    upgrade handshake, proxy and hibernation concerns, and ping/pong anyway; nothing here needs
    the client-to-server direction at stream latency) and polling (the "request every 15 s"
    shape; latency equals the interval and most requests return nothing).
+8. **`decide` and `evolve` are objects with one handler per tag** (`decide: { LogEntry:
+   (state, cmd, ctx) => ... }`), not one function dispatching with `Match.valueTags` as the
+   first §4 sketch had. Reason (Phase 0, 2026-10-29): the tags are known from `commands` and
+   their `events`, so the checker reports a missing or misspelt handler, types each handler's
+   command and its return (`Decision` of that command's own events and rejections), and the
+   story runner and engine look a handler up by tag without evaluating a match. Rejected:
+   `Match.valueTags`, which needs the union assembled at the call site and gives one return
+   type for all branches.
+9. **`ScopeForbidden`, `Principal`, `Scope` and the Phase 0 grant rule live in `echo/domain`
+   (`Domain.Scope`)**, not in an `Engine` module. Reason: story 5 asserts the rejection, so the
+   domain package must name it, and domain code never imports the engine. The story runner
+   applies the same check (writer grant on `scope(state)`) before `decide`; the engine will
+   apply it the same way. The grant rule (own private scope: read and write; `catalog:*`: read)
+   is what exists before the grants aggregate of phase 3b replaces it. Rejected: an `Engine`
+   namespace the stories import from.
+10. **Indexes are declared with `Domain.Index(id, state, spec)` and bound to their aggregate by
+   `Aggregate.make`**, which also exposes them as statics (`Entry.by_task`). Reason: a
+   command must be able to name an index of its own aggregate in `reads`
+   (`CreateProject` reads `Project.by_code`), and the aggregate imports its commands,
+   so an index declared only inside the aggregate would be an import cycle. A command of
+   another aggregate may use the static. Rejected: `indexes: {...}` inline only (the §4
+   sketch), which would make own-aggregate `reads` strings or late-bound thunks.
+11. **The story runner is pure and lives in `echo/domain` (`Domain.Story.run`); `echo/domain/testing`
+   binds it to vitest.** `given` is a list (the target stream) or a record keyed `Aggregate/id`
+   (several streams); seeded streams must belong to the aggregate under test or to a declared
+   read, `ctx.read` answers only declared reads and only streams the principal may see, and an
+   undeclared read fails the story with a `StoryError` naming the read. Reason: the `reads` declaration is
+   then checked by the stories, before any engine enforces it. Rejected: a runner that reads
+   any seeded stream (hides a missing `reads`), and one that depends on vitest (an app's domain
+   package would import a test runner).
 
 **Open:**
 
@@ -571,36 +614,45 @@ replay stays bounded.
    // Entry/Entry.aggregate.ts — one stream per entry, scope = its member's private scope
    export class Entry extends Domain.Aggregate("Entry", {
      id: EntryId,
-     state: EntryState, initial: EntryState.absent,
+     state: EntryState, initial: null,                                     // EntryState = NullOr(row)
      commands: [LogEntry, AmendEntry, DeleteEntry],
-     scope: (state) => state.scope,
-     indexes: { by_day: ["scope", "day"], by_task: ["taskId"], by_project: ["projectId"] },
-     decide: (state, cmd, ctx) => Match.valueTags(cmd, {
-       LogEntry: ({ data }) => {
-         const project = ctx.read(Project, data.projectId)                // reads: declared on the command
+     scope: (state) => state?.scope ?? null,
+     indexes: EntryIndexes,  // Domain.Index(EntryId, EntryState, { by_day: ["scope", "day"], by_task: ["taskId"], by_project: ["projectId"] })
+     decide: {
+       LogEntry: (state, { data }, ctx) => {
+         if (state !== null) return new EntryAlreadyLogged()
+         const project = ctx.read(Project, data.projectId)                // reads: [Project] declared on the command
          if (project === null) return new UnknownProject({ id: data.projectId })
-         if (!inOrder(data.startedAt, data.endedAt)) return new TimesOutOfOrder()
+         if (!inOrder(data)) return new TimesOutOfOrder()
          return [new EntryLogged({ ...data, scope: privateScope(ctx.principal) })]
        },
-       AmendEntry: ({ changes }) => {
-         const next = { ...state, ...changes }                               // sparse patch, rule on the merged row
-         if (!inOrder(next.startedAt, next.endedAt)) return new TimesOutOfOrder()
+       AmendEntry: (state, { changes }) => {
+         if (state === null || state.deleted) return new NoSuchEntry()
+         if (!inOrder({ ...state, ...changes })) return new TimesOutOfOrder()  // sparse patch, rule on the merged row
          return [new EntryAmended({ changes })]
        },
-       DeleteEntry: () => [new EntryDeleted()],
-     }),
-     evolve: (state, event) => Match.valueTags(event, {
-       EntryLogged: (e) => ({ ...e, deleted: false }),
-       EntryAmended: ({ changes }) => ({ ...state, ...changes }),
-       EntryDeleted: () => ({ ...state, deleted: true }),
-     }),
+       DeleteEntry: (state) => state === null || state.deleted ? new NoSuchEntry() : [new EntryDeleted()],
+     },
+     evolve: {
+       EntryLogged: (_, e) => ({ day: e.day, ..., scope: e.scope, deleted: false }),
+       EntryAmended: (state, { changes }) => state === null ? state : { ...state, ...changes },
+       EntryDeleted: (state) => state === null ? state : { ...state, deleted: true },
+     },
    }) {}
    ```
 
+   The code is `examples/timesheet/domain` (2026-10-29): one folder per aggregate with its
+   `*.id.ts`, `*.state.ts`, `*.indexes.ts`, `*.command.ts` (each command with the events and
+   rejections only it produces), `*.aggregate.ts` and `*.story.test.ts`. Writing the three
+   aggregates added rejections the five stories do not cover, because `decide` must answer on
+   every state: `EntryAlreadyLogged`, `NoSuchEntry`, `TaskAlreadyAdded`, `NoSuchTask`,
+   `ProjectAlreadyCreated`. They are the "stream exists / does not exist" answers; each needs a
+   story before it counts as a rule.
+
    ```ts
-   // Entry/Entry.story.ts
+   // Entry/Entry.story.test.ts
    Story.make(Entry, "an amendment that ends an entry before it starts is refused on the merged row", {
-     given: [new EntryLogged({ ...mondayMorning, startedAt: t("10:00"), endedAt: t("10:45") })],
+     given: [new EntryLogged({ ...mondayMorning, startedAt: t("10:00"), endedAt: t("10:45"), scope: privateScope(member) })],
      when: new AmendEntry({ target: entryId, changes: { endedAt: t("09:50") } }),
      as: member,
      then: new TimesOutOfOrder(),
@@ -608,52 +660,62 @@ replay stays bounded.
    // → needs nothing beyond this stream's state. Confirms sparse patches are decided on the merged row.
 
    Story.make(Entry, "an entry against a project the member cannot see is refused", {
-     given: { [`Project/${acme}`]: [new ProjectCreated({ code: "ACME", scope: privateScope(otherMember) })] },
+     given: { [`Project/${acme}`]: [new ProjectCreated({ code: "ACME", name: "Acme Corp", scope: privateScope(otherMember) })] },
      when: new LogEntry({ target: entryId, data: { ...mondayMorning, projectId: acme } }),
      as: member,
      then: new UnknownProject({ id: acme }),
    })
    // → forces: `reads` on LogEntry, `ctx.read` scoped to the streams the principal may see
    //   (so the catalog scope works and another member's private project does not), and a
-   //   story runner whose `given` can seed other streams.
+   //   story runner whose `given` can seed other streams. The runner only lets `given` seed
+   //   streams of the aggregate under test or of a declared read, and throws on an undeclared
+   //   `ctx.read`, so a missing `reads` entry fails before any engine exists.
 
    Story.make(Project, "a second project with the same code is refused", {
      given: { [`Project/${acme}`]: [new ProjectCreated({ code: "ACME", scope: privateScope(member) })] },
-     when: new CreateProject({ target: acmeAgain, data: { code: "acme", ... } }),
+     when: new CreateProject({ target: acmeAgain, data: { code: " acme ", name: "Acme Corporation" } }),
      as: member,
      then: new DuplicateCode({ existing: acme }),
    })
    // → forces: an index read (`by_code`) in `decide`, normalisation inside `decide`
-   //   ("acme" matches "ACME"), and the server-side SSI guarantee of §14 item 2.
+   //   (" acme " matches "ACME"), the server-side SSI guarantee of §14 item 2, and an index a
+   //   command of the same aggregate can name in `reads` (§14 item 10).
 
    Story.make(Task, "a task with entries cannot be removed", {
-     given: { [`Task/${review}`]: [new TaskAdded({...})], [`Entry/${e1}`]: [new EntryLogged({ ...mondayMorning, taskId: review })] },
+     given: { [`Task/${review}`]: [new TaskAdded({...})], [`Entry/${entryId}`]: [new EntryLogged({ ...mondayMorning, taskId: review, scope: privateScope(member) })] },
      when: new RemoveTask({ target: review }),
      as: member,
      then: new TaskInUse({ entries: 1 }),
    })
-   // → forces: `reads` over the `Entry.by_task` index. Confirms decision 2: in-use is a
-   //   read, not a counter aggregate the app must maintain.
+   // → forces: `reads` over the `Entry.by_task` index, and that an index read returns
+   //   the matching streams' state (`decide` skips deleted entries). Confirms decision 2:
+   //   in-use is a read, not a counter aggregate the app must maintain.
 
    Story.make(Entry, "another member cannot amend my entry", {
-     given: [new EntryLogged({ ...mondayMorning })],
+     given: [new EntryLogged({ ...mondayMorning, scope: privateScope(member) })],
      when: new AmendEntry({ target: entryId, changes: { notes: "x" } }),
      as: otherMember,
-     then: new Engine.ScopeForbidden({ scope: privateScope(member) }),
+     then: new Domain.Scope.ScopeForbidden({ scope: privateScope(member) }),
    })
    // → the interesting one: this rule is the apps' `own()` check, copied into every handler
    //   today. The first draft of this story said `then: new NotYourEntry()` and put the check
    //   in `decide`; writing it showed the check is the same for every aggregate and depends
    //   only on `scope(state)` and the principal's grants, so it is the engine's job. The story
    //   stays, asserting the engine's generic rejection, and `own()` disappears from the domain.
+   //   The rejection lives in `echo/domain`, not an `Engine` module, because the story (and
+   //   so the domain package) names it and domain code never imports the engine (§14 item 9);
+   //   the story runner performs the same check before `decide`, as the engine will.
    ```
 
-   What this batch of stories tells us before any engine exists: the `ctx` surface this
-   shape of app needs is `principal`, `now`, `read` by id and `read` by index, nothing else;
-   every rule is decidable on the device; three of five rules need `reads`, which settles
-   item 2 for this shape; and one rule the apps thought was domain logic is engine logic.
-   Stories do not cover the queries (`entries.list` by day cursor, `entries.totals`); those
-   are read models over the indexes and get their own tests in phase 2.
+   What this batch of stories told us (run 2026-10-29, all five pass): the `ctx` surface
+   this shape of app needs is `principal`, `now`, `read` by id and `read` by index, nothing
+   else (`now` is supplied but no timesheet rule uses it); every rule is decidable on the
+   device; three of five rules need `reads` (stories 2, 3 and 4: `Project` by id,
+   `Project.by_code`, `Entry.by_task`), which settles item 2 for this shape; and one rule the
+   apps thought was domain logic is engine logic. No story needed `Policy`, `Batch`,
+   `authority` or versioning. Stories do not cover the queries (`entries.list` by day cursor,
+   `entries.totals`); those are read models over the indexes and get their own tests in
+   phase 2.
 1. **Server:** streams, events, receipts, scope log with compaction, grants aggregate, policies,
    `Execute`/`Pull`/`Changes` over `effect/rpc`, epoch. Integration tests against Postgres.
 2. **Client:** leader election, journal, replica cache, effective state, rebase, queries,

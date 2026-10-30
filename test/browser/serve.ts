@@ -28,6 +28,7 @@ await Effect.runPromise(
       if (!build.success) return yield* Effect.die(new AggregateError(build.logs, "Browser scenario bundle failed"))
       const script = build.outputs[0]
       if (script === undefined) return yield* Effect.die(new Error("Missing browser scenario bundle"))
+      let unauthorizedRequests = 0
       yield* Effect.acquireRelease(
         Effect.sync(() =>
           Bun.serve({
@@ -35,8 +36,11 @@ await Effect.runPromise(
             fetch(request) {
               const path = new URL(request.url).pathname
               if (path === "/sync" || path === "/sync/") return rpc(request)
-              if (path === "/unauthorized" || path === "/unauthorized/")
+              if (path === "/auth-count") return Response.json(unauthorizedRequests)
+              if (path === "/unauthorized" || path === "/unauthorized/") {
+                unauthorizedRequests++
                 return new Response("Unauthorized", { status: 401 })
+              }
               // Only the fixture app shell is cached. RPC is never intercepted or mocked by this worker.
               if (path === "/shell-worker.js")
                 return new Response(

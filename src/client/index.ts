@@ -43,7 +43,7 @@ export interface Options {
   readonly principal: Principal
   readonly aggregates: ReadonlyArray<Aggregate.Any>
   readonly transport: Transport
-  /** Defaults to true. Disable only when intentionally driving sync manually. */
+  /** Defaults to true. Auth failure stops automation until close/reopen; sync remains a one-shot attempt. */
   readonly autoConnect?: boolean
 }
 export interface Status {
@@ -435,16 +435,19 @@ export const open = (options: Options) =>
         ).pipe(
           Stream.runForEach(() => sync),
           Effect.catch((error) =>
-            SubscriptionRef.update(status, (s): Status => ({
-              ...s,
-              connection: error._tag === "TransportError" ? error.reason : "error",
-              error
-            }))
+            Effect.gen(function* () {
+              yield* SubscriptionRef.update(status, (s): Status => ({
+                ...s,
+                connection: error._tag === "TransportError" ? error.reason : "error",
+                error
+              }))
+              if (error._tag === "TransportError" && error.reason === "auth") return yield* error
+            })
           )
         )
         yield* Effect.sleep("1 second")
       })
-    )
+    ).pipe(Effect.catchTag("TransportError", () => Effect.void))
     if (options.autoConnect !== false) yield* Effect.forkScoped(connect)
     return {
       execute,

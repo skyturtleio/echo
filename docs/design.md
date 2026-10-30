@@ -284,6 +284,12 @@ behaviour adds or amends an item here in the same branch.
     explicit. Rejected: one-line Effect/Stream wrappers and fabricated framework objects,
     which omit FoldKit brands and Scene metadata. Client close releases its resources and
     terminates its public streams; app resource generations guard already-delivered messages.
+    Amended 2026-10-30: an authentication failure observed by the automatic connection loop
+    ends that loop, keeping the profile, journal and local APIs open. After restoring the
+    same principal's session, close and reopen to restart automation; explicit `sync` remains
+    a one-shot attempt and does not restart subscriptions. Rejected: retrying authentication
+    every second (request churn without new credentials), or implicitly restarting the loop
+    from `sync` (which the loop itself calls).
 
 ## 3. Invariants catalogue
 
@@ -322,6 +328,8 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
 - **INV-CLIENT-5:** Typed queries expose effective state and suppress structurally unchanged emissions.
 - **INV-SYNC-1:** A browser's offline journal survives reload, reconnects over authenticated
   HTTP RPC to Postgres, converges with an independent device and retains authoritative rejection notices.
+  Authentication failure in automatic Pull, Execute or Changes stops automatic retries without
+  losing durable intents or preventing local writes; authenticated close/reopen resumes them.
 
 ## 4. Phases
 

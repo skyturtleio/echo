@@ -9,6 +9,7 @@ import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as Str from "effect/String"
 import * as SubscriptionRef from "effect/SubscriptionRef"
+import { FetchHttpClient, HttpClient } from "effect/http"
 import { DefineTag, Note, NoteId, Tag, TagId, WriteNote } from "../../examples/fixture/domain/src/index.ts"
 import * as Domain from "../../src/domain/index.ts"
 import * as Client from "../../src/client/index.ts"
@@ -525,7 +526,87 @@ const verifyServerReload = (profile: string) =>
         auth._tag === "TransportError" && auth.reason === "auth",
         "HTTP 401 not distinguished from offline/error"
       )
-      return "PASS INV-SYNC-1 actual HTTP/PG: offline reload note converges on second device; raced rejection retained; HTTP401 is auth"
+      const counts: Array<string> = []
+      // Standalone browser scenario entry point; this client only reads the fixture's request counter.
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide
+      const counterHttp = yield* HttpClient.HttpClient.pipe(Effect.provide(FetchHttpClient.layer))
+      const requestCount = counterHttp.get(`${location.origin}/auth-count`).pipe(
+        Effect.flatMap((response) => response.json),
+        Effect.flatMap(Schema.decodeUnknownEffect(Schema.Int))
+      )
+      // Catch retrying either a failed sync or a failed Changes stream. Each denial is real HTTP 401.
+      for (const denied of ["pull", "execute", "changes"]) {
+        const authProfile = `${profile}-auth-${denied}`
+        const target = TagId.make(authProfile)
+        const authOptions = { profile: authProfile, principal, aggregates: [Tag, Note] }
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const seed = yield* Client.open({ ...authOptions, transport: http, autoConnect: false })
+            if (denied !== "changes") yield* seed.execute(Tag, new DefineTag({ target, name: authProfile }))
+          })
+        )
+        const blockedScope = yield* Scope.make()
+        const blocked = yield* Client.open({
+          ...authOptions,
+          transport: {
+            pull: denied === "pull" ? unauthorized.pull : http.pull,
+            execute: denied === "execute" ? unauthorized.execute : http.execute,
+            changes: denied === "changes" ? unauthorized.changes : Stream.never
+          }
+        }).pipe(Effect.provideService(Scope.Scope, blockedScope))
+        yield* Effect.gen(function* () {
+          yield* blocked.status.pipe(
+            Stream.filter((s) => s.connection === "auth"),
+            Stream.runHead,
+            Effect.timeout("5 seconds")
+          )
+          const before = yield* requestCount
+          // New local work must not implicitly resume an auth-blocked connection.
+          if (denied === "changes") yield* blocked.execute(Tag, new DefineTag({ target, name: authProfile }))
+          yield* blocked.execute(Tag, new DefineTag({ target: TagId.make(`${target}-later`), name: `${target}-later` }))
+          yield* Effect.sleep("3500 millis")
+          const after = yield* requestCount
+          yield* check(after === before, `${denied} auth retried automatically: ${before} -> ${after} in 3500ms`)
+          const status = yield* Stream.runHead(blocked.status)
+          yield* check(
+            status._tag === "Some" && status.value.connection === "auth" && status.value.pending === 2,
+            `${denied} auth lost pending work or status`
+          )
+          counts.push(`${denied} ${before}->${after}/3500ms`)
+          if (denied !== "changes") {
+            const retry = yield* blocked.sync.pipe(Effect.flip)
+            yield* check(retry._tag === "TransportError" && retry.reason === "auth", "explicit retry lost auth error")
+            const explicit = yield* requestCount
+            yield* Effect.sleep("1500 millis")
+            yield* check(
+              explicit === after + 1 && (yield* requestCount) === explicit,
+              "explicit sync restarted automatic auth retries"
+            )
+          }
+        }).pipe(Effect.ensuring(Scope.close(blockedScope, Exit.void)))
+        // Restoring authenticated transport and reopening deliberately starts automation again.
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const resumed = yield* Client.open({ ...authOptions, transport: http })
+            yield* check(
+              resumed.query((read) => read.get(Tag, target))?.name === authProfile,
+              "auth close/reopen lost durable intent"
+            )
+            yield* resumed.status.pipe(
+              Stream.filter((s) => s.connection === "idle" && s.pending === 0 && s.lastSynced !== null),
+              Stream.runHead,
+              Effect.timeout("5 seconds")
+            )
+            yield* other.sync
+            yield* check(
+              other.query((read) => read.get(Tag, target))?.name === authProfile &&
+                other.query((read) => read.get(Tag, TagId.make(`${target}-later`)))?.name === `${target}-later`,
+              "authenticated reopen did not commit retained intents"
+            )
+          })
+        )
+      }
+      return `PASS INV-SYNC-1 actual HTTP/PG: offline reload converges; rejection retained; auth stops (${Arr.join(counts, ", ")}); 2 durable intents per case resume on authenticated reopen`
     })
   )
 

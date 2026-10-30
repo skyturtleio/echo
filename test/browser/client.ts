@@ -299,7 +299,152 @@ const rebaseAndEpoch = (profile: string) =>
           Stream.runHead,
           Effect.timeout("3 seconds")
         )
-      return "PASS INV-CLIENT-3 rebase/epoch: rejection retained, uncertainty quarantined, failed replica reset retries safely, changed Keepalive resyncs"
+      // Full-size generic catalog, not private app data. Check every row independently of reconciliation.
+      const catalog = "catalog:fixture"
+      const other = "catalog:other"
+      const count = 84_780
+      const upsert = (
+        id: string,
+        amount: number,
+        scope = catalog
+      ): PullResponse["scopes"][number]["entries"][number] => ({
+        _tag: "Upsert",
+        aggregate: "Counter",
+        id,
+        seq: 1,
+        state: { value: amount, scope }
+      })
+      let reply: PullResponse = {
+        epoch: "catalog",
+        scopes: [
+          {
+            scope: catalog,
+            cursor: 1,
+            reset: true,
+            entries: Array.from({ length: count }, (_, i) => upsert(`row:${i}`, i))
+          }
+        ]
+      }
+      let cursors: Readonly<Record<string, number>> = {}
+      const catalogClient = yield* Client.open({
+        ...options(`${profile}-catalog`, {
+          ...disconnected,
+          pull: (request) => {
+            cursors = request.cursors
+            return Effect.succeed(reply)
+          }
+        }),
+        aggregates: [Counter, Tag]
+      })
+      const start = performance.now()
+      yield* catalogClient.sync
+      const elapsed = performance.now() - start
+      const loaded = catalogClient.query((read) => read.scan(Counter))
+      yield* check(
+        loaded.length === count &&
+          Arr.every(loaded, (row, i) => row.id === `row:${i}` && row.state?.value === i && row.state.scope === catalog),
+        "catalog lost, reordered or corrupted rows"
+      )
+      // The former per-entry scan takes ~47s here; leave ample headroom over indexed sync (~0.6s).
+      yield* check(elapsed < 5_000, `catalog reconciliation exceeded 5s: ${elapsed.toFixed(1)}ms`)
+      // Replacements append, same ids in different aggregates coexist, and stale Gone/reset
+      // from the old scope must not delete a stream that moved to the other scope.
+      reply = {
+        epoch: "catalog",
+        scopes: [
+          {
+            scope: catalog,
+            cursor: 2,
+            reset: true,
+            entries: [
+              upsert("a", 1),
+              upsert("b", 2),
+              upsert("c", 3),
+              {
+                _tag: "Upsert",
+                aggregate: "Tag",
+                id: "a",
+                seq: 1,
+                state: { name: "same id", removed: false, scope: catalog }
+              }
+            ]
+          },
+          { scope: other, cursor: 1, reset: false, entries: [upsert("b", 20, other)] },
+          {
+            scope: catalog,
+            cursor: 3,
+            reset: false,
+            entries: [
+              { _tag: "Gone", aggregate: "Counter", id: "b" },
+              upsert("a", 10),
+              upsert("a", 11),
+              { _tag: "Gone", aggregate: "Counter", id: "c" },
+              { _tag: "Gone", aggregate: "Counter", id: "c" },
+              upsert("c", 30)
+            ]
+          }
+        ]
+      }
+      yield* catalogClient.sync
+      const reconciled = catalogClient.query((read) => read.scan(Counter))
+      yield* check(
+        reconciled.length === 3 &&
+          reconciled[0]?.id === "b" &&
+          reconciled[0].state?.value === 20 &&
+          reconciled[1]?.id === "a" &&
+          reconciled[1].state?.value === 11 &&
+          reconciled[2]?.id === "c" &&
+          reconciled[2].state?.value === 30 &&
+          catalogClient.query((read) => read.get(Tag, TagId.make("a")))?.name === "same id",
+        "Pull conflated identities, lost moved rows, or changed replacement order"
+      )
+      reply = {
+        epoch: "catalog",
+        scopes: [
+          // Move twice before resetting the old scope in this same Pull: rebuilding the
+          // index on a later sync would hide stale membership left behind by replacement.
+          { scope: catalog, cursor: 3, reset: false, entries: [upsert("b", 22)] },
+          { scope: other, cursor: 1, reset: false, entries: [upsert("b", 20, other)] },
+          { scope: catalog, cursor: 4, reset: true, entries: [upsert("d", 4)] },
+          { scope: other, cursor: 1, reset: false, entries: [] },
+          { scope: catalog, cursor: 5, reset: true, entries: [] }
+        ]
+      }
+      yield* catalogClient.sync
+      yield* check(
+        catalogClient.query((read) => read.scan(Counter)).length === 1 &&
+          catalogClient.query((read) => read.get(Counter, "b"))?.value === 20,
+        "reset deleted another scope or retained an earlier block"
+      )
+      reply = {
+        epoch: "catalog",
+        scopes: [
+          {
+            scope: other,
+            cursor: 2,
+            reset: false,
+            entries: [
+              upsert("b", 21, other),
+              { _tag: "Upsert", aggregate: "Counter", id: "bad", seq: 1, state: "invalid" },
+              { _tag: "Gone", aggregate: "Counter", id: "bad" }
+            ]
+          }
+        ]
+      }
+      const invalid = yield* catalogClient.sync.pipe(Effect.flip)
+      yield* check(
+        invalid._tag === "ClientError" &&
+          cursors[catalog] === 5 &&
+          catalogClient.query((read) => read.get(Counter, "b"))?.value === 20,
+        "invalid overwritten entry escaped validation or partially published"
+      )
+      reply = { epoch: "catalog", scopes: [{ scope: catalog, cursor: 6, reset: false, entries: [] }] }
+      yield* catalogClient.sync
+      yield* check(
+        cursors[other] === 1 && catalogClient.query((read) => read.scan(Counter)).length === 0,
+        "failed Pull advanced cursor or absent scope retained rows"
+      )
+      return `PASS INV-CLIENT-3 rebase/epoch and ordered scope reconciliation: ${count} catalog rows verified; sync ${elapsed.toFixed(1)}ms`
     })
   )
 

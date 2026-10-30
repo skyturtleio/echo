@@ -98,6 +98,8 @@ export const httpTransport = (url: string, requestInit: RequestInit = { credenti
 
 const attempt = <A>(body: () => A) => Effect.try({ try: body, catch: (cause) => new ClientError({ cause }) })
 const emptyReplica = (): Model.Replica => ({ epoch: null, cursors: {}, rows: [] })
+// Length-prefix the aggregate so separators in either string cannot alias identities.
+const streamKey = (aggregate: string, id: string) => `${aggregate.length}:${aggregate}${id}`
 const covered = (intent: Model.Intent, replica: Model.Replica): boolean =>
   intent.receipt?._tag === "Accepted" &&
   Arr.every(intent.receipt.seqs, (ref) =>
@@ -226,19 +228,36 @@ export const open = (options: Options) =>
       }
       yield* locked(
         Effect.gen(function* () {
-          const scopes = Arr.map(response.scopes, (scope) => scope.scope)
-          let rows = Arr.filter(replica.rows, (row) => scopes.includes(row.scope))
+          const scopes = new Set(Arr.map(response.scopes, (scope) => scope.scope))
+          // Map insertion order matches filter-then-push: replacements move to the end.
+          const rows = new Map<string, Model.Row>()
+          const members = new Map<string, Set<string>>()
+          const remove = (key: string) => {
+            const row = rows.get(key)
+            if (row === undefined) return
+            members.get(row.scope)?.delete(key)
+            rows.delete(key)
+          }
+          const append = (key: string, row: Model.Row) => {
+            rows.set(key, row)
+            let scopeMembers = members.get(row.scope)
+            if (scopeMembers === undefined) {
+              scopeMembers = new Set()
+              members.set(row.scope, scopeMembers)
+            }
+            scopeMembers.add(key)
+          }
+          for (const row of replica.rows) {
+            if (scopes.has(row.scope)) append(streamKey(row.aggregate, row.id), row)
+          }
           const cursors: Record<string, number> = {}
           for (const scope of response.scopes) {
-            if (scope.reset) rows = Arr.filter(rows, (row) => row.scope !== scope.scope)
+            if (scope.reset) {
+              for (const key of members.get(scope.scope) ?? []) remove(key)
+            }
             for (const entry of scope.entries) {
-              rows = Arr.filter(
-                rows,
-                (row) =>
-                  row.aggregate !== entry.aggregate ||
-                  row.id !== entry.id ||
-                  (entry._tag === "Gone" && row.scope !== scope.scope)
-              )
+              const key = streamKey(entry.aggregate, entry.id)
+              if (entry._tag === "Upsert" || rows.get(key)?.scope === scope.scope) remove(key)
               if (entry._tag === "Upsert") {
                 const aggregate = Option.getOrUndefined(
                   Arr.findFirst(options.aggregates, (a) => a.tag === entry.aggregate)
@@ -246,7 +265,7 @@ export const open = (options: Options) =>
                 if (aggregate === undefined)
                   return yield* Effect.fail(new ClientError({ cause: `Unknown aggregate ${entry.aggregate}` }))
                 yield* attempt(() => Model.decode(aggregate.definition.state, entry.state))
-                rows.push({
+                append(key, {
                   aggregate: entry.aggregate,
                   id: entry.id,
                   scope: scope.scope,
@@ -259,7 +278,7 @@ export const open = (options: Options) =>
           }
           // Journal epoch first: a crash here invalidates the old replica on the next open.
           yield* writeJournal({ ...journal, epoch: response.epoch })
-          const next = { epoch: response.epoch, rows, cursors }
+          const next = { epoch: response.epoch, rows: [...rows.values()], cursors }
           yield* Storage.save(replicaDb, next)
           replica = next
           yield* publish(true)

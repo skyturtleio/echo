@@ -290,6 +290,14 @@ behaviour adds or amends an item here in the same branch.
     a one-shot attempt and does not restart subscriptions. Rejected: retrying authentication
     every second (request churn without new credentials), or implicitly restarting the loop
     from `sync` (which the loop itself calls).
+18. **Pull reconciliation uses an ordered stream index and scope membership sets**
+    (2026-10-30). Repeatedly filtering the whole replica for each entry is quadratic for
+    full catalogs. Index by the exact `(aggregate, id)` pair, remove replacements before
+    appending, and process scope blocks in response order. Gone removes only the current
+    scope's row; reset removes current members of that scope. Rejected: sorting or grouping
+    entries (changes scan order and repeated-block semantics), and increasing transport
+    timeouts to mask client CPU work. The index is temporary; validation and durable commit
+    boundaries remain unchanged.
 
 ## 3. Invariants catalogue
 
@@ -322,6 +330,9 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
 - **INV-CLIENT-3:** Authoritative state rebases intents in journal order and surfaces rejections;
   epoch transitions invalidate old cache state even if persisting the new cache fails, and a
   changed authority epoch on a keepalive triggers resynchronization without a separate poke.
+  Pull reconciles catalog-sized snapshots without per-entry replica scans, preserving exact
+  stream identity, response order (replacement appends), scope-local Gone/reset and complete
+  membership eviction. Every Upsert is validated before publishing any part of the response.
 - **INV-CLIENT-4:** An exclusive profile lifetime prevents competing leaders. Open hydrates
   offline and owns automatic connection startup; close ends streams and releases storage,
   connection and lock before another profile instance opens.

@@ -274,6 +274,11 @@ behaviour adds or amends an item here in the same branch.
     Accepted intents remain durable until replica sequences cover their receipt. Sent intents
     crossing an epoch become Unknown notices rather than risking duplicate execution after
     restore. Rejected: pretending multi-tab leadership or receipt recovery across epochs works.
+    The initial client exposes one command per intent and equality-index queries, recomputing
+    selectors over full replay; atomic client batches, range indexes and dependency tracking
+    remain future work. Browser eviction or user-cleared site data can remove both databases;
+    this separation protects against engine cache reset, not deletion of origin storage.
+    Journal decode failure never authorizes deleting it. There is no destructive discard API.
 17. **Connection lifecycle belongs to the client, not a framework adapter** (2026-10-30).
     Scoped `open` hydrates before starting its default connection loop; manual-sync mode is
     explicit. Rejected: one-line Effect/Stream wrappers and fabricated framework objects,
@@ -309,7 +314,8 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
 - **INV-CLIENT-2:** Retries preserve intent identity; accepted intents remain until the
   durable replica covers every receipt sequence.
 - **INV-CLIENT-3:** Authoritative state rebases intents in journal order and surfaces rejections;
-  epoch transitions invalidate old cache state even if persisting the new cache fails.
+  epoch transitions invalidate old cache state even if persisting the new cache fails, and a
+  changed authority epoch on a keepalive triggers resynchronization without a separate poke.
 - **INV-CLIENT-4:** An exclusive profile lifetime prevents competing leaders. Open hydrates
   offline and owns automatic connection startup; close ends streams and releases storage,
   connection and lock before another profile instance opens.

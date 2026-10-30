@@ -38,6 +38,12 @@
         "no-restricted-imports": [
           "error",
           {
+            "paths": [
+              {
+                "name": "effect/schema",
+                "message": "Use the stable `effect/Schema` module; `effect/schema` is a different, unstable barrel."
+              }
+            ],
             "patterns": [
               {
                 "group": ["**/server", "**/server/**", "echo/server"],

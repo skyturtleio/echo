@@ -23,3 +23,9 @@ agent-browser --session "$session" wait --fn 'typeof echoScenarios === "object"'
 agent-browser --session "$session" eval "echoScenarios.verifyServerReload('$profile-server')"
 agent-browser --session "$session" set offline off
 agent-browser --session "$session" eval "echoScenarios.verifyServerReload('$profile-server')"
+curl --fail --silent --show-error "${ECHO_BROWSER_URL:-http://localhost:4178}/seed-catalog"
+agent-browser --session "$session" eval "echoScenarios.largeCatalog('$profile-catalog')"
+agent-browser --session "$session" reload
+agent-browser --session "$session" wait --fn 'typeof echoScenarios === "object"'
+agent-browser --session "$session" eval "echoScenarios.largeCatalog('$profile-catalog', true)"
+agent-browser --session "$session" eval "echoScenarios.oversizedCatalog('$profile-catalog')"

@@ -755,9 +755,161 @@ const verifyServerReload = (profile: string) =>
     })
   )
 
+// INV-SYNC-1: catches the default 16Mi NDJSON limit and publishing only an in-memory catalog.
+const largeCatalog = (profile: string, reload: boolean) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const http = yield* Client.httpTransport(`${location.origin}/sync`)
+      let seenCursors: Readonly<Record<string, number>> = {}
+      let received = -1
+      const transport: Client.Transport = {
+        ...http,
+        pull: (request) => {
+          seenCursors = request.cursors
+          return http.pull(request).pipe(
+            Effect.tap((reply) =>
+              Effect.sync(() => {
+                received = Arr.reduce(reply.scopes, 0, (n, s) => n + s.entries.length)
+              })
+            )
+          )
+        }
+      }
+      const client = yield* Client.open({ profile, principal, aggregates: [Tag, Note], transport, autoConnect: false })
+      const verify = () => {
+        const rows = client.query((read) =>
+          Arr.filter(read.scan(Tag), (row) => row.state?.scope === "catalog:transport")
+        )
+        return (
+          rows.length === 84_780 &&
+          Arr.every(rows, (row) => {
+            const i = Number(Str.slice("catalog:".length)(row.id))
+            return (
+              Number.isInteger(i) &&
+              i >= 0 &&
+              i < 84_780 &&
+              row.state?.name === `${i}:${Str.repeat(380)("x")}` &&
+              !row.state.removed
+            )
+          }) &&
+          new Set(Arr.map(rows, (row) => row.id)).size === 84_780
+        )
+      }
+      if (reload) yield* check(verify(), "offline navigation did not hydrate all durable catalog rows")
+      const start = performance.now()
+      yield* client.sync
+      yield* check(verify(), "large HTTP catalog failed complete state validation")
+      const elapsed = performance.now() - start
+      if (reload)
+        yield* check(
+          received === 0 && (seenCursors["catalog:transport"] ?? 0) > 0,
+          "durable cursor redownloaded catalog"
+        )
+      // Keep the same transport deadline; this is not a relaxed fixture timeout.
+      yield* check(elapsed < 5_000, `large catalog sync exceeded 5s: ${elapsed.toFixed(1)}ms`)
+      return `PASS INV-SYNC-1 ${reload ? "durable navigation/reopen, unchanged Pull" : "HTTP/PG catalog"}: 84780 exact rows, ${received} received, ${elapsed.toFixed(1)}ms`
+    })
+  )
+
+// Same INV-SYNC-1 scenario: deterministic frame rejection must not become a download loop.
+const oversizedCatalog = (profile: string) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const http = yield* Client.httpTransport(`${location.origin}/sync`)
+      const oversized = yield* Client.httpTransport(`${location.origin}/oversized`)
+      const base = { profile, principal, aggregates: [Tag, Note] }
+      const target = TagId.make(`${profile}-pending`)
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const seed = yield* Client.open({ ...base, transport: disconnected, autoConnect: false })
+          yield* seed.execute(Tag, new DefineTag({ target, name: target }))
+        })
+      )
+      // Standalone scenario's HTTP request counter, independent of the transport under test.
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide
+      const counterHttp = yield* HttpClient.HttpClient.pipe(Effect.provide(FetchHttpClient.layer))
+      const count = counterHttp.get(`${location.origin}/oversized-count`).pipe(
+        Effect.flatMap((response) => response.json),
+        Effect.flatMap(Schema.decodeUnknownEffect(Schema.Int))
+      )
+      let cursors: Readonly<Record<string, number>> = {}
+      const before = yield* count
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const client = yield* Client.open({
+            ...base,
+            transport: {
+              ...oversized,
+              changes: Stream.never,
+              pull: (request) => {
+                cursors = request.cursors
+                return oversized.pull(request)
+              }
+            }
+          })
+          const status = yield* client.status.pipe(
+            Stream.filter((s) => s.connection === "oversized"),
+            Stream.runHead,
+            Effect.timeout("5 seconds")
+          )
+          const frameError = Schema.Struct({
+            cause: Schema.TaggedStruct("RpcClientError", {
+              reason: Schema.TaggedStruct("RpcClientDefect", {
+                cause: Schema.TaggedStruct("MaxBufferSizeExceeded", { maxBufferSize: Schema.Literal(67_108_864) })
+              })
+            })
+          })
+          yield* check(
+            status._tag === "Some" && Schema.is(frameError)(status.value.error),
+            "oversized status lost parser cause/limit"
+          )
+          yield* client.execute(Tag, new DefineTag({ target: TagId.make(`${target}-later`), name: `${target}-later` }))
+          yield* Effect.sleep("3500 millis")
+          yield* check((yield* count) === before + 1, "oversized response automatically redownloaded")
+          const retry = yield* client.sync.pipe(Effect.flip)
+          yield* check(
+            retry._tag === "TransportError" && retry.reason === "oversized",
+            "explicit retry lost oversized error"
+          )
+          yield* Effect.sleep("1500 millis")
+          yield* check((yield* count) === before + 2, "explicit sync restarted automatic oversized retries")
+        })
+      )
+      let recoveredCursors: Readonly<Record<string, number>> = {}
+      const reopened = yield* Client.open({
+        ...base,
+        autoConnect: false,
+        transport: {
+          ...http,
+          pull: (request) => {
+            recoveredCursors = request.cursors
+            return Effect.fail(offline)
+          }
+        }
+      })
+      const rows = reopened.query((read) => read.scan(Tag))
+      yield* check(
+        Arr.filter(rows, (row) => row.state?.scope === "catalog:transport").length === 84_780 &&
+          reopened.query((read) => read.get(Tag, target))?.name === target &&
+          reopened.query((read) => read.get(Tag, TagId.make(`${target}-later`)))?.name === `${target}-later`,
+        "oversized failure changed durable catalog or lost pending writes"
+      )
+      yield* Effect.ignore(reopened.sync)
+      yield* check(
+        Record.keys(recoveredCursors).length === Record.keys(cursors).length &&
+          Arr.every(Record.keys(cursors), (key) => recoveredCursors[key] === cursors[key]) &&
+          (cursors["catalog:transport"] ?? 0) > 0,
+        "oversized failure advanced or deleted durable cursors"
+      )
+      return `PASS INV-SYNC-1 oversized: nested MaxBufferSizeExceeded/67108864; requests ${before}->${before + 1}/3500ms; explicit only +1/1500ms; 84780 durable rows/cursors and 2 pending intents preserved`
+    })
+  )
+
 const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect)
 Object.assign(globalThis, {
   echoScenarios: {
+    largeCatalog: (profile: string, reload = false) => run(largeCatalog(profile, reload)),
+    oversizedCatalog: (profile: string) => run(oversizedCatalog(profile)),
     prepareServerReload: (profile: string) => run(prepareServerReload(profile)),
     pendingServerWrite: (profile: string) => run(pendingServerWrite(profile)),
     verifyServerReload: (profile: string) => run(verifyServerReload(profile)),

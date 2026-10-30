@@ -1,6 +1,7 @@
 import * as PgClient from "@effect/sql-pg/PgClient"
 import * as Effect from "effect/Effect"
 import * as Redacted from "effect/Redacted"
+import * as Str from "effect/String"
 import { HttpEffect } from "effect/http"
 import { Note, Tag } from "../../examples/fixture/domain/src/index.ts"
 import { Principal } from "../../src/domain/Scope.ts"
@@ -22,6 +23,19 @@ await Effect.runPromise(
       const rpc = HttpEffect.toWebHandler(
         Server.httpApp(server, () => Effect.succeed(Principal.make("browser-fixture")))
       )
+      const run = Effect.runPromiseWith(yield* Effect.context())
+      const seedCatalog = () =>
+        run(
+          server.ingestCatalog({
+            scope: "catalog:transport",
+            release: "large",
+            rows: Array.from({ length: 84_780 }, (_, i) => ({
+              aggregate: "Tag",
+              id: `catalog:${i}`,
+              state: { name: `${i}:${Str.repeat(380)("x")}`, removed: false, scope: "catalog:transport" }
+            }))
+          })
+        )
       const build = yield* Effect.promise(() =>
         Bun.build({ entrypoints: ["test/browser/client.ts"], target: "browser" })
       )
@@ -29,13 +43,38 @@ await Effect.runPromise(
       const script = build.outputs[0]
       if (script === undefined) return yield* Effect.die(new Error("Missing browser scenario bundle"))
       let unauthorizedRequests = 0
+      let oversizedRequests = 0
       yield* Effect.acquireRelease(
         Effect.sync(() =>
           Bun.serve({
             port: 4178,
-            fetch(request) {
+            fetch(request, listener) {
               const path = new URL(request.url).pathname
               if (path === "/sync" || path === "/sync/") return rpc(request)
+              if (path === "/seed-catalog") {
+                // Administrative fixture ingestion can exceed Bun's idle timeout; RPC deadlines stay unchanged.
+                listener.timeout(request, 0)
+                return seedCatalog().then(() => Response.json(true))
+              }
+              if (path === "/oversized-count") return Response.json(oversizedRequests)
+              if (path === "/oversized" || path === "/oversized/") {
+                oversizedRequests++
+                // Fault injection over real HTTP: fragmented unfinished NDJSON frame exceeds
+                // the response cap without allocating a second enormous catalog on the server.
+                let chunks = 0
+                return new Response(
+                  new ReadableStream({
+                    pull(controller) {
+                      if (chunks++ < 65) controller.enqueue(new TextEncoder().encode(Str.repeat(1024 * 1024)(" ")))
+                      else {
+                        controller.enqueue(new TextEncoder().encode("{}\n"))
+                        controller.close()
+                      }
+                    }
+                  }),
+                  { headers: { "content-type": "application/ndjson" } }
+                )
+              }
               if (path === "/auth-count") return Response.json(unauthorizedRequests)
               if (path === "/unauthorized" || path === "/unauthorized/") {
                 unauthorizedRequests++

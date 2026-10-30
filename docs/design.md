@@ -298,6 +298,17 @@ behaviour adds or amends an item here in the same branch.
     entries (changes scan order and repeated-block semantics), and increasing transport
     timeouts to mask client CPU work. The index is temporary; validation and durable commit
     boundaries remain unchanged.
+19. **Browser NDJSON responses have an explicit 64 Mi code-unit frame limit** (2026-10-30).
+    A complete catalog snapshot is one RPC frame; Effect's default 16 Mi limit rejects
+    ordinary large catalogs before reconciliation. The browser accepts at most 67,108,864
+    UTF-16 code units per frame (not bytes; the newline delimiter is excluded). Server request
+    parsing retains Effect's 16,777,216-code-unit default. This is a frame bound, not a heap
+    bound: parsed objects, validation and IndexedDB cloning also consume memory. A response
+    beyond the bound produces `TransportError` with reason `oversized`, stops automation
+    until close/reopen, and leaves prior replica/cursors and pending intents intact. Explicit
+    `sync` remains one-shot. Deadlines, snapshot transactions and atomic installation are
+    unchanged. Rejected: unbounded parsing, app-specific transport overrides, and paging now
+    (independent pages cannot preserve a snapshot without snapshot identity and staging).
 
 ## 3. Invariants catalogue
 
@@ -341,6 +352,9 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
   HTTP RPC to Postgres, converges with an independent device and retains authoritative rejection notices.
   Authentication failure in automatic Pull, Execute or Changes stops automatic retries without
   losing durable intents or preventing local writes; authenticated close/reopen resumes them.
+  Catalog responses above 16 Mi and within the 64 Mi UTF-16-code-unit frame bound install
+  completely and survive browser reload with their cursors. An oversized response stops
+  automatic retries without partially publishing rows/cursors or losing pending work.
 
 ## 4. Phases
 

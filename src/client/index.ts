@@ -24,7 +24,7 @@ export class ClientClosed extends Data.TaggedError("ClientClosed") {}
 export class ProfileMismatch extends Data.TaggedError("ProfileMismatch") {}
 export class ClientError extends Data.TaggedError("ClientError")<{ readonly cause: unknown }> {}
 export class TransportError extends Data.TaggedError("TransportError")<{
-  readonly reason: "offline" | "auth" | "error"
+  readonly reason: "offline" | "auth" | "error" | "oversized"
   readonly cause: unknown
 }> {}
 
@@ -43,11 +43,11 @@ export interface Options {
   readonly principal: Principal
   readonly aggregates: ReadonlyArray<Aggregate.Any>
   readonly transport: Transport
-  /** Defaults to true. Auth failure stops automation until close/reopen; sync remains a one-shot attempt. */
+  /** Defaults to true. Auth/oversized failures stop automation until close/reopen; sync stays one-shot. */
   readonly autoConnect?: boolean
 }
 export interface Status {
-  readonly connection: "idle" | "syncing" | "offline" | "error" | "auth"
+  readonly connection: "idle" | "syncing" | "offline" | "error" | "auth" | "oversized"
   readonly pending: number
   readonly lastSynced: number | null
   readonly error: unknown
@@ -58,6 +58,13 @@ export type Outcome<A extends Aggregate.Any = Aggregate.Any> =
   | { readonly _tag: "Rejected"; readonly rejection: Model.DomainRejection<A> }
 
 const failure = (cause: unknown): TransportError => {
+  const oversized = Schema.is(
+    Schema.TaggedStruct("RpcClientError", {
+      reason: Schema.TaggedStruct("RpcClientDefect", {
+        cause: Schema.TaggedStruct("MaxBufferSizeExceeded", { maxBufferSize: Schema.Number })
+      })
+    })
+  )(cause)
   const unauthorized = Schema.is(
     Schema.Struct({
       reason: Schema.Struct({
@@ -65,7 +72,10 @@ const failure = (cause: unknown): TransportError => {
       })
     })
   )(cause)
-  return new TransportError({ reason: unauthorized ? "auth" : navigator.onLine ? "error" : "offline", cause })
+  return new TransportError({
+    reason: oversized ? "oversized" : unauthorized ? "auth" : navigator.onLine ? "error" : "offline",
+    cause
+  })
 }
 
 /** Browser RPC transport; session credentials remain the server's source of identity. */
@@ -75,7 +85,9 @@ export const httpTransport = (url: string, requestInit: RequestInit = { credenti
       Effect.map(HttpClient.HttpClient, HttpClient.filterStatusOk)
     ).pipe(Layer.provide(FetchHttpClient.layer), Layer.provide(Layer.succeed(FetchHttpClient.RequestInit)(requestInit)))
     const protocol = RpcClient.layerProtocolHttp({ url }).pipe(
-      Layer.provide(RpcSerialization.layerNdjson),
+      // NDJSON measures UTF-16 code units per response frame, not bytes or total heap.
+      // Server request parsing keeps Effect's smaller default limit.
+      Layer.provide(RpcSerialization.layerNdjsonWith({ maxBufferSize: 64 * 1024 * 1024 })),
       Layer.provide(httpClient)
     )
     // Browser transport entry point: its RPC and HTTP resources belong to the caller's scope.
@@ -460,7 +472,8 @@ export const open = (options: Options) =>
                 connection: error._tag === "TransportError" ? error.reason : "error",
                 error
               }))
-              if (error._tag === "TransportError" && error.reason === "auth") return yield* error
+              if (error._tag === "TransportError" && (error.reason === "auth" || error.reason === "oversized"))
+                return yield* error
             })
           )
         )

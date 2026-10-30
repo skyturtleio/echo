@@ -5,7 +5,6 @@ import * as Equal from "effect/Equal"
 import * as Option from "effect/Option"
 import * as Predicate from "effect/Predicate"
 import * as Record from "effect/Record"
-import * as Str from "effect/String"
 import * as Aggregate from "./Aggregate.ts"
 import type * as Command from "./Command.ts"
 import type * as Index from "./Indexes.ts"
@@ -16,14 +15,30 @@ export interface SomeEvent {
   readonly _tag: string
 }
 
+/** One seeded stream: the aggregate it belongs to, its id and the events it has recorded. */
+export interface Seed {
+  readonly aggregate: Aggregate.Any
+  readonly id: string
+  readonly events: ReadonlyArray<SomeEvent>
+}
+
 /**
- * The events that already happened: a list for the stream the command targets, or streams by
- * key (`Entry/<id>`) when the rule needs other streams. A seeded stream must belong to the
+ * Seeds a stream of any aggregate for `given`. Naming the aggregate class (not a `Note/id`
+ * string) types the events and loads the aggregate's module, so an index of it declared in
+ * `reads` has its owner.
+ */
+export const stream = <A extends Aggregate.Any>(
+  aggregate: A,
+  id: Aggregate.IdOf<A>,
+  events: ReadonlyArray<Aggregate.EventInstance<A>>
+): Seed => ({ aggregate, id, events })
+
+/**
+ * The events that already happened: a list for the stream the command targets, or seeds from
+ * {@link stream} when the rule needs other streams. A seeded stream must belong to the
  * aggregate under test or to one the command declares in `reads`.
  */
-export type Given<A extends Aggregate.Any> =
-  | ReadonlyArray<Aggregate.EventInstance<A>>
-  | { readonly [stream: string]: ReadonlyArray<SomeEvent> }
+export type Given<A extends Aggregate.Any> = ReadonlyArray<Aggregate.EventInstance<A>> | ReadonlyArray<Seed>
 
 /** The command class of the aggregate whose instances have this `_tag`. */
 export type CommandClassOf<A extends Aggregate.Any, W extends SomeEvent> = Aggregate.ByTag<
@@ -59,9 +74,18 @@ const fixedNow = DateTime.makeUnsafe("2026-01-01T00:00:00Z")
 const key = (aggregate: Aggregate.Any, id: string): string => `${aggregate.tag}/${id}`
 
 const describe = (read: Command.Read): string =>
-  read.kind === "Aggregate" ? read.tag : `${Aggregate.ofIndex(read).tag}.${read.name}`
+  read.kind === "Aggregate"
+    ? read.tag
+    : Option.match(Aggregate.ofIndex(read), {
+        onNone: () => read.name,
+        onSome: (owner) => `${owner.tag}.${read.name}`
+      })
 
-const isList = (given: Given<Aggregate.Any>): given is ReadonlyArray<SomeEvent> => Arr.isArray(given)
+const isSeed = (value: unknown): value is Seed =>
+  Predicate.hasProperty(value, "aggregate") &&
+  Predicate.hasProperty(value.aggregate, "kind") &&
+  value.aggregate.kind === "Aggregate" &&
+  Predicate.hasProperty(value, "events")
 
 const fold = (aggregate: Aggregate.Any, events: ReadonlyArray<SomeEvent>): unknown =>
   Arr.reduce(events, aggregate.definition.initial, (state, event) => {
@@ -94,33 +118,33 @@ export const run = <A extends Aggregate.Any, W extends Aggregate.CommandInstance
   const reads = command.value.reads
   const declared = (read: Command.Read): boolean => Arr.some(reads, (r) => r === read)
 
-  const reachable = Record.fromEntries(
-    Arr.map(
-      [aggregate, ...Arr.map(reads, (read) => (read.kind === "Aggregate" ? read : Aggregate.ofIndex(read)))],
-      (a): [string, Aggregate.Any] => [a.tag, a]
-    )
+  // The aggregates a seeded stream may belong to: the one under test and every declared read's.
+  // Compared by tag: `class Note extends Domain.Aggregate(...)` is a subclass of the class an index is bound to.
+  const reachable: ReadonlyArray<string> = Arr.map(
+    [
+      aggregate,
+      ...Arr.flatMap(reads, (read) => (read.kind === "Aggregate" ? [read] : Option.toArray(Aggregate.ofIndex(read))))
+    ],
+    (a) => a.tag
   )
 
-  // Widened to the erased aggregate so the list-or-record shape can be told apart.
-  const seeded: Given<Aggregate.Any> = story.given
-  const given: { readonly [stream: string]: ReadonlyArray<SomeEvent> } = isList(seeded)
-    ? { [key(aggregate, when.target)]: seeded }
-    : seeded
+  // Widened to the erased aggregate so the list-or-seeds shape can be told apart.
+  const given: Given<Aggregate.Any> = story.given
+  const seeds: ReadonlyArray<Seed> = Arr.every(given, isSeed) ? given : [{ aggregate, id: when.target, events: given }]
 
-  const streams = Record.map(given, (events, stream): Stream => {
-    const slash = Str.indexOf("/")(stream)
-    const name = Option.isSome(slash) ? Str.slice(0, slash.value)(stream) : stream
-    const owner = Record.get(reachable, name)
-    if (Option.isNone(slash) || Option.isNone(owner)) {
-      throw new StoryError({
-        message: `given seeds ${stream}, but ${tag} on ${aggregate.tag} reaches no aggregate ${name}; declare it in reads`
-      })
-    }
-    return { aggregate: owner.value, id: Str.slice(slash.value + 1)(stream), state: fold(owner.value, events) }
-  })
+  const streams = Record.fromEntries(
+    Arr.map(seeds, (seed): [string, Stream] => {
+      if (!Arr.contains(reachable, seed.aggregate.tag)) {
+        throw new StoryError({
+          message: `given seeds ${key(seed.aggregate, seed.id)}, but ${tag} on ${aggregate.tag} reaches no ${seed.aggregate.tag}; declare it in reads`
+        })
+      }
+      return [key(seed.aggregate, seed.id), { ...seed, state: fold(seed.aggregate, seed.events) }]
+    })
+  )
 
-  const visible = (stream: Stream): boolean => {
-    const scope = stream.aggregate.definition.scope(stream.state)
+  const visible = (row: Stream): boolean => {
+    const scope = row.aggregate.definition.scope(row.state)
     return scope !== null && canRead(principal, scope)
   }
 
@@ -139,22 +163,27 @@ export const run = <A extends Aggregate.Any, W extends Aggregate.CommandInstance
     }
     if (ref.kind === "Aggregate") {
       if (!Predicate.isString(arg)) throw new StoryError({ message: `a read of ${ref.tag} takes an id` })
-      const stream = Record.get(streams, key(ref, arg))
-      return Option.isSome(stream) && visible(stream.value) ? stream.value.state : null
+      const row = Record.get(streams, key(ref, arg))
+      return Option.isSome(row) && visible(row.value) ? row.value.state : null
     }
+    // An index whose aggregate's module never loaded has no seeded streams either.
     const owner = Aggregate.ofIndex(ref)
+    if (Option.isNone(owner)) return []
     const values: unknown = ref.fields.length === 1 ? [arg] : arg
     if (!Arr.isArray(values)) {
       throw new StoryError({ message: `a read over ${describe(ref)} takes one value per field, as a tuple` })
     }
-    const matches = (stream: Stream): boolean =>
+    const matches = (row: Stream): boolean =>
       Arr.every(
         ref.fields,
-        (field, i) => Predicate.hasProperty(stream.state, field) && Equal.equals(stream.state[field], values[i])
+        (field, i) => Predicate.hasProperty(row.state, field) && Equal.equals(row.state[field], values[i])
       )
     return Arr.map(
-      Arr.filter(Record.values(streams), (stream) => stream.aggregate === owner && visible(stream) && matches(stream)),
-      (stream) => ({ id: stream.id, state: stream.state })
+      Arr.filter(
+        Record.values(streams),
+        (row) => row.aggregate.tag === owner.value.tag && visible(row) && matches(row)
+      ),
+      (row) => ({ id: row.id, state: row.state })
     )
   }
 

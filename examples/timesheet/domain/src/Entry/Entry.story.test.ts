@@ -2,6 +2,7 @@ import * as Domain from "echo/domain"
 import { Story } from "echo/domain/testing"
 import { acme, entryId, member, mondayMorning, otherMember, t } from "../fixtures.ts"
 import { ProjectCreated } from "../Project/CreateProject.command.ts"
+import { Project } from "../Project/Project.aggregate.ts"
 import { Code } from "../Project/Project.state.ts"
 import { AmendEntry } from "./AmendEntry.command.ts"
 import { Entry } from "./Entry.aggregate.ts"
@@ -20,11 +21,11 @@ Story.make(Entry, "an amendment that ends an entry before it starts is refused o
 })
 
 Story.make(Entry, "an entry against a project the member cannot see is refused", {
-  given: {
-    [`Project/${acme}`]: [
+  given: [
+    Story.stream(Project, acme, [
       new ProjectCreated({ code: Code.make("ACME"), name: "Acme Corp", scope: privateScope(otherMember) })
-    ]
-  },
+    ])
+  ],
   when: new LogEntry({ target: entryId, data: { ...mondayMorning, projectId: acme } }),
   as: member,
   then: new UnknownProject({ id: acme })

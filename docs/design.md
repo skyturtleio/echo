@@ -210,13 +210,18 @@ behaviour adds or amends an item here in the same branch.
    only inside the aggregate would be an import cycle. Rejected: `indexes: {...}` inline only,
    which would make own-aggregate `reads` strings or late-bound thunks.
 10. **The story runner is pure and lives in `echo/domain`; `echo/domain/testing` binds it to
-    vitest** (Phase 0, 2026-10-29). `given` is a list (the target stream) or a record keyed
-    `Aggregate/id`; seeded streams must belong to the aggregate under test or to a declared
-    read; `ctx.read` answers only declared reads and only streams the principal may see; an
-    undeclared read fails the story with a `StoryError` naming it, so `reads` is checked by the
-    stories before any engine enforces it. Rejected: a runner that reads any seeded stream
-    (hides a missing `reads`), and one that depends on vitest (an app's domain package would
-    import a test runner).
+    vitest** (Phase 0, 2026-10-29). `given` is a list (the target stream) or seeds
+    `Story.stream(Aggregate, id, events)`; seeded streams must belong to the aggregate under
+    test or to a declared read; `ctx.read` answers only declared reads and only streams the
+    principal may see; an undeclared read fails the story with a `StoryError` naming it, so
+    `reads` is checked by the stories before any engine enforces it. Rejected: a runner that
+    reads any seeded stream (hides a missing `reads`), and one that depends on vitest (an app's
+    domain package would import a test runner). Amended 2026-10-30: seeds name the aggregate
+    class instead of a record keyed `"Aggregate/id"`. An index is bound to its aggregate when
+    the aggregate's module loads (item 9), so with string keys a story that seeded streams
+    reached only through another aggregate's index needed a side-effect import of that
+    aggregate; naming the class types the seeded events and loads the module. An index whose
+    aggregate has not loaded reads as empty.
 11. **Own building blocks, Alchemy-shaped, not a dependency on `@alchemy.run/domain`**
     (2026-10-29, built in Phase 0). The package (`2.0.0-beta.84` at alchemy 383d8e8) peer-depends
     on `alchemy`, the IaC package, at runtime; its kernel hands `decide` exactly one stream's

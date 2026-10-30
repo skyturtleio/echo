@@ -1,4 +1,5 @@
 import type * as DateTime from "effect/DateTime"
+import * as Option from "effect/Option"
 import * as Record from "effect/Record"
 import type * as Schema from "effect/Schema"
 import type * as Command from "./Command.ts"
@@ -100,7 +101,7 @@ export type CommandsOf<A extends Any> = A["definition"]["commands"][number]
 export type CommandInstance<A extends Any> = InstanceOf<CommandsOf<A>>
 export type EventInstance<A extends Any> = InstanceOf<EventsOf<A["definition"]["commands"]>>
 
-/** The class type returned by {@link make}: the definition plus one static per index (`Entry.by_task`). */
+/** The class type returned by {@link make}: the definition plus one static per index (`Note.by_tag`). */
 export type AggregateClass<
   Name extends string,
   Id extends Index.IdSchema,
@@ -130,7 +131,7 @@ export const make = <
   name: Name,
   definition: Definition<Id, S, C, X>
 ): AggregateClass<Name, Id, S, C, X> => {
-  // oxlint-disable-next-line typescript/no-extraneous-class -- a class so an app writes `class Entry extends Domain.Aggregate(...)`, as with every other block
+  // oxlint-disable-next-line typescript/no-extraneous-class -- a class so an app writes `class Note extends Domain.Aggregate(...)`, as with every other block
   class Aggregate {
     static readonly kind = "Aggregate" as const
     static readonly tag = name
@@ -147,9 +148,5 @@ export const make = <
   return Object.assign(Aggregate, definition.indexes)
 }
 
-/** The aggregate an index was declared on. */
-export const ofIndex = (index: Index.Any): Any => {
-  const owner = owners.get(index)
-  if (owner === undefined) throw new Error(`index ${index.name} is not declared on any aggregate`)
-  return owner
-}
+/** The aggregate an index is bound to; none until that aggregate's module has loaded. */
+export const ofIndex = (index: Index.Any): Option.Option<Any> => Option.fromNullishOr(owners.get(index))

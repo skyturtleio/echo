@@ -30,6 +30,12 @@
     "vitest": "5.0.5"
   },
   "peerDependencies": {
-    "effect": "4.0.5"
+    "effect": "4.0.5",
+    "vitest": ">=5"
+  },
+  "peerDependenciesMeta": {
+    "vitest": {
+      "optional": true
+    }
   }
 }

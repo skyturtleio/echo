@@ -47,5 +47,5 @@
       }
     ]
   },
-  "include": ["src", "test", "examples", "*.ts"]
+  "include": ["src", "test", "examples", "*.ts", ".agents/check-invariants.ts"]
 }

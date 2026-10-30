@@ -8,11 +8,10 @@
     "./domain/testing": "./src/domain/testing/index.ts",
     "./protocol": "./src/protocol.ts",
     "./server": "./src/server/index.ts",
-    "./client": "./src/client/index.ts",
-    "./foldkit": "./src/foldkit/index.ts"
+    "./client": "./src/client/index.ts"
   },
   "scripts": {
-    "check": "bun run typecheck && bun run lint && oxfmt --check && vitest run",
+    "check": "bun .agents/check-invariants.ts && bun run typecheck && bun run lint && oxfmt --check && vitest run",
     "typecheck": "effect-tsgo tsc@7.1.0-beta --noEmit",
     "lint": "oxlint --deny-warnings && effect-tsgo oxlint --config .oxlintrc.type-aware.json --type-aware --deny-warnings",
     "test": "vitest run",

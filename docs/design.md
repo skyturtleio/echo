@@ -148,11 +148,12 @@ requests; the server fans out `{ principal, clientId, state }` to the room's mem
 same `Changes` stream and expires the entry when that stream ends. One connection per leader
 whether or not the app uses presence.
 
-**FoldKit adapter.** `echo/foldkit` is a translation of the tab API and imports nothing from the
-framework: `Echo.subscribe(query, args)` → `Subscription<Msg>` of `Settled<A>`;
-`Echo.execute(batch)` → `Command<Msg>` resolving to `Accepted | Rejected(r) | Pending`;
-`Echo.status`; `Echo.notices` / `Echo.dismiss`; `Echo.presence` / `Echo.track`;
-`Echo.resource` wiring the leader for the app's lifetime.
+**FoldKit integration.** Apps use the framework's real branded `Command.define`,
+`Subscription.make` and `ManagedResource` constructors. `Client.open` hydrates offline and
+owns a scoped connection loop by default (`autoConnect: false` selects manual sync); there
+is no public `connect` method or `echo/foldkit` adapter. Closing the client releases storage,
+connection and profile lock and ends query/status/notice streams. Apps still gate late messages
+by readiness and resource generation.
 
 **Non-goals for v1:** collaborative text (CRDT) fields, per-row ACLs inside a scope, partial
 replication of a scope, multi-region servers, transactions beyond one Postgres.
@@ -253,6 +254,32 @@ behaviour adds or amends an item here in the same branch.
     if they were a product, and a fixture is far easier to grow than to shrink once the engine
     phases are built against it.
 
+15. **First dogfood server uses serialized writes and snapshot pulls** (2026-10-30).
+    A transactional singleton lock orders SERIALIZABLE writes and cursor advancement; retry
+    serialization failures. This trades write throughput for a small, correct first slice,
+    rather than using sequence allocations that can commit out of cursor order. Pull returns
+    the complete visible scope list and replaces a changed scope with current state; unchanged
+    cursors return no rows. Receipts are retained indefinitely and bound to authenticated
+    principal, client id and batch id. Catalog imports are state-only with a release record.
+    Sharing, policies, presence, history-tail compaction and receipt expiry are deferred, not
+    stubbed. Catalog and private scopes are the only supported scopes; commands cannot move
+    streams between scopes. Epoch mismatch refuses execution before checking receipts.
+    The singleton is a global write bottleneck, including receipt-only transactions. Per-scope
+    cursors avoid re-downloading unchanged catalogs after private writes. LISTEN uses a separate
+    physical connection per Changes stream so it cannot exhaust the application query pool;
+    apps must bound authenticated connections to their database connection budget.
+16. **The first browser profile uses IndexedDB and an exclusive Web Lock** (2026-10-30).
+    Separate journal and replica databases preserve the journal across cache reset. A second
+    leader gets ProfileBusy; SharedWorker tab multiplexing and OPFS SQLite remain deferred.
+    Accepted intents remain durable until replica sequences cover their receipt. Sent intents
+    crossing an epoch become Unknown notices rather than risking duplicate execution after
+    restore. Rejected: pretending multi-tab leadership or receipt recovery across epochs works.
+17. **Connection lifecycle belongs to the client, not a framework adapter** (2026-10-30).
+    Scoped `open` hydrates before starting its default connection loop; manual-sync mode is
+    explicit. Rejected: one-line Effect/Stream wrappers and fabricated framework objects,
+    which omit FoldKit brands and Scene metadata. Client close releases its resources and
+    terminates its public streams; app resource generations guard already-delivered messages.
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -266,11 +293,29 @@ Areas: `SERVER` (execute, receipts, scope log, grants, policies, epoch), `CLIENT
 journal, replica, effective state, rebase, outcomes, queries), `SYNC` (end to end across
 devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
 
-No invariants yet: Phase 0 has no engine. Phase 1's `SERVER` entries are written before the
-first server code. Known entries to write then: a read over an index returns the matching
-streams in every scope the principal can read, so a uniqueness check in a private scope also
-sees the catalog (the Phase 0 story runner behaves this way; whether a rule wants that is the
-domain's choice); a read by id returns `null` for a stream in a scope the principal cannot read.
+- **INV-SERVER-1:** Accepted and rejected batches are atomic and deduplicated under the
+  authenticated principal, client id and batch id; retrying cannot append events twice.
+- **INV-SERVER-2:** Concurrent decisions serialize, including declared index reads; two
+  claims for the same visible unique value cannot both be accepted.
+- **INV-SERVER-3:** Writes require the principal's private scope; declared reads see private
+  and catalog rows only, hidden ids read as null, and undeclared reads fail.
+- **INV-SERVER-4:** Pull snapshots and cursors share one transaction snapshot; reconnect
+  cannot skip committed state. Epoch mismatches refuse writes and pulls.
+- **INV-SERVER-5:** Catalog ingestion validates state and catalog scope, writes no per-row
+  events, and atomically exposes a release to readers.
+- **INV-SERVER-6:** HTTP RPC resolves identity outside request bodies and Changes wakes a
+  connected reader after a commit; reconnect starts with a catchup poke.
+- **INV-CLIENT-1:** Journal survives offline reload and replica reset.
+- **INV-CLIENT-2:** Retries preserve intent identity; accepted intents remain until the
+  durable replica covers every receipt sequence.
+- **INV-CLIENT-3:** Authoritative state rebases intents in journal order and surfaces rejections;
+  epoch transitions invalidate old cache state even if persisting the new cache fails.
+- **INV-CLIENT-4:** An exclusive profile lifetime prevents competing leaders. Open hydrates
+  offline and owns automatic connection startup; close ends streams and releases storage,
+  connection and lock before another profile instance opens.
+- **INV-CLIENT-5:** Typed queries expose effective state and suppress structurally unchanged emissions.
+- **INV-SYNC-1:** A browser's offline journal survives reload, reconnects over authenticated
+  HTTP RPC to Postgres, converges with an independent device and retains authoritative rejection notices.
 
 ## 4. Phases
 
@@ -291,7 +336,7 @@ domain's choice); a read by id returns `null` for a stream in a scope the princi
    outcome phases. `CLIENT` and `SYNC` invariants; browser scenarios (a script driving Chromium
    through `agent-browser` against a real server, printing PASS/FAIL and evidence) for
    offline, rebase, rejection and epoch.
-3. **Apps.** (a) FoldKit adapter and the single-user app's port in its own repository:
+3. **Apps.** (a) FoldKit lifecycle integration and the single-user app's port in its own repository:
    catalogs, `reads`, cursor and aggregate queries, multi-device rebase, import of its current
    data. (b) The shared shape, through a stand-in under `examples/` written then and the shared
    app's port in its own repository: grants aggregate, `Batch`, `Policy`, `authority: "server"`
@@ -318,5 +363,7 @@ per invariant.
 scenario for an engine invariant, named after the failure it catches and citing its `INV` id.
 No per-function unit tests, no snapshot tests, no test whose expected value was read off the
 implementation. Before keeping a test, name the plausible wrong implementation that fails it;
-if there is none, delete the test. `bun run check` gains, with the first scenario in phase 1, a
-gate that rejects a test block whose name cites no existing `INV` id and is not a `Story`.
+if there is none, delete the test. `bun run check` rejects a test block whose name cites no
+catalogued `INV` id and is not a `Story`. Scenario declarations use `it`, `test`, or their
+direct modifiers (`it.effect`, `it.skip`, etc.) with a literal name, not aliased imports,
+computed names or `each` factories; the small naming gate deliberately supports these forms.

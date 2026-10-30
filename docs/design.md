@@ -310,6 +310,28 @@ behaviour adds or amends an item here in the same branch.
     unchanged. Rejected: unbounded parsing, app-specific transport overrides, and paging now
     (independent pages cannot preserve a snapshot without snapshot identity and staging).
 
+20. **Diagnostics are bounded, session-local scalar snapshots** (2026-10-30).
+    `client.diagnostics` reads memory and the Effect clock, without storage or network work.
+    It exports the latest 100 completed operations, not payloads, identifiers, URLs, timestamps
+    or raw errors. Execute/Pull durations cover transport effects only (including decoding,
+    excluding reconciliation and locks). Journal/replica timings cover save through transaction
+    completion; rebase covers replay and publication including any nested journal save, so
+    durations must not be summed. Effect Clock monotonic nanoseconds supply elapsed milliseconds.
+    Successful counts mean receipts, scope entries (Upsert and Gone), journal intents,
+    persisted replica rows and effective rows respectively; failures have null counts. Bytes
+    are null, not zero or JSON-size estimates: neither RPC nor IndexedDB exposes accurate bytes.
+    Fixed failure categories never export error text; domain rejection receipts are successful
+    Execute responses. Recording is best-effort: instrumentation defects may omit records,
+    but do not replace operation outcomes or cause an operation to run twice.
+    `failedOperationFollowups` counts calls following a failed same-operation call in this
+    session, excluding initial attempts; it does not imply the same request or automatic retry.
+    Pending count includes Accepted awaiting replica coverage, excludes Rejected/Unknown, and
+    oldest age uses existing durable intent creation time and the current device wall clock,
+    clamped to zero after backwards clock changes. No pending work means null age. Clock changes
+    can distort age; it is not server age. Reopening resets records/counters, not pending age.
+    Rejected: persistent diagnostic history, payload logging, a telemetry backend, approximate
+    byte metrics, and new journal metadata solely for diagnostics.
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -348,6 +370,10 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
   offline and owns automatic connection startup; close ends streams and releases storage,
   connection and lock before another profile instance opens.
 - **INV-CLIENT-5:** Typed queries expose effective state and suppress structurally unchanged emissions.
+- **INV-CLIENT-6:** Diagnostic snapshots retain at most 100 completed operations with scalar
+  allowlisted timing/count/failure data only. Offline work retains its age across reopen;
+  follow-up counts exclude initial calls, successful sync reports actual response counts,
+  and diagnostic reads neither sync nor persist nor mutate the retained records.
 - **INV-SYNC-1:** A browser's offline journal survives reload, reconnects over authenticated
   HTTP RPC to Postgres, converges with an independent device and retains authoritative rejection notices.
   Authentication failure in automatic Pull, Execute or Changes stops automatic retries without

@@ -1,8 +1,10 @@
 import * as Arr from "effect/Array"
+import * as Clock from "effect/Clock"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
+import * as Option from "effect/Option"
 import * as Record from "effect/Record"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
@@ -905,9 +907,173 @@ const oversizedCatalog = (profile: string) =>
     })
   )
 
+// INV-CLIENT-6 catches payload/error leakage, reset ages, unbounded history and counting initial calls as retries.
+const diagnostics = (profile: string) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const secret = `${profile}-diagnostic-private-payload`
+      const firstScope = yield* Scope.make()
+      const first = yield* Client.open({ ...options(profile), aggregates: [Tag] }).pipe(
+        Effect.provideService(Scope.Scope, firstScope)
+      )
+      yield* first.execute(Tag, new DefineTag({ target: TagId.make(profile), name: secret }))
+      yield* Effect.ignore(first.sync)
+      const before = yield* first.diagnostics
+      yield* check(
+        before.pending.count === 1 && before.failedOperationFollowups.pull === 0,
+        "initial offline attempt counted as retry"
+      )
+      const clock = yield* Clock.Clock
+      const backwards = yield* first.diagnostics.pipe(
+        Effect.provideService(Clock.Clock, {
+          ...clock,
+          currentTimeMillis: Effect.succeed(0)
+        })
+      )
+      yield* check(backwards.pending.oldestAgeMs === 0, "backward device clock produced negative pending age")
+      yield* Scope.close(firstScope, Exit.void)
+      yield* Effect.sleep("30 millis")
+      const http = yield* Client.httpTransport(`${location.origin}/sync`)
+      let failPull = true
+      let failExecute = true
+      let pullCount: number | null = null
+      const transport: Client.Transport = {
+        changes: Stream.never,
+        pull: (request) =>
+          Effect.gen(function* () {
+            yield* Effect.sleep("20 millis")
+            if (failPull)
+              return yield* new Client.TransportError({
+                reason: "offline",
+                cause: { secret, url: "https://private/?token=secret" }
+              })
+            const response = yield* http.pull(request)
+            pullCount = Arr.reduce(response.scopes, 0, (n, scope) => n + scope.entries.length)
+            return response
+          }),
+        execute: (request) =>
+          Effect.gen(function* () {
+            yield* Effect.sleep("20 millis")
+            if (failExecute) return yield* new Client.TransportError({ reason: "auth", cause: { secret } })
+            return yield* http.execute(request)
+          })
+      }
+      const client = yield* Client.open({ ...options(profile, transport), aggregates: [Note, Tag] })
+      const reopened = yield* client.diagnostics
+      yield* check(
+        reopened.pending.count === 1 && (reopened.pending.oldestAgeMs ?? 0) >= (before.pending.oldestAgeMs ?? 0) + 20,
+        "pending age reset on reopen"
+      )
+      yield* check(reopened.failedOperationFollowups.pull === 0, "session counters survived reopen")
+      for (let i = 0; i < 105; i++) yield* Effect.ignore(client.sync)
+      const bounded = yield* client.diagnostics
+      yield* check(
+        bounded.operations.length === 100 && bounded.failedOperationFollowups.pull === 104,
+        "history unbounded or followups counted initial attempt"
+      )
+      yield* check(
+        Arr.every(bounded.operations, (op) => op.followsFailure),
+        "retained followup flags lost"
+      )
+      yield* check(
+        Arr.every(
+          bounded.operations,
+          (op) => op.operation === "pull" && op.failure === "offline" && op.count === null && op.durationMs >= 15
+        ),
+        "failed pull timing/category/count incorrect"
+      )
+      failPull = false
+      yield* Effect.ignore(client.sync)
+      const denied = yield* client.diagnostics
+      yield* check(
+        denied.operations.at(-1)?.failure === "auth" && denied.failedOperationFollowups.execute === 0,
+        "auth failure or initial execute count incorrect"
+      )
+      failExecute = false
+      yield* client.sync
+      const synced = yield* client.diagnostics
+      yield* check(
+        synced.pending.count === 0 &&
+          synced.pending.oldestAgeMs === null &&
+          synced.failedOperationFollowups.execute === 1 &&
+          synced.failedOperationFollowups.pull === 105,
+        "sync retirement/followups incorrect"
+      )
+      const execute = Option.getOrUndefined(Arr.findLast(synced.operations, (op) => op.operation === "execute"))
+      const pull = Option.getOrUndefined(Arr.findLast(synced.operations, (op) => op.operation === "pull"))
+      yield* check(
+        execute?.count === 1 &&
+          execute.failure === null &&
+          execute.durationMs >= 15 &&
+          pull?.count === pullCount &&
+          pull?.failure === null,
+        "real RPC response counts/timing incorrect"
+      )
+      yield* check(
+        Arr.some(synced.operations, (op) => op.operation === "journal" && op.count === 0) &&
+          Arr.some(synced.operations, (op) => op.operation === "replica" && (op.count ?? 0) > 0) &&
+          Arr.some(synced.operations, (op) => op.operation === "rebase" && (op.count ?? 0) > 0),
+        "persistence/rebase counts absent"
+      )
+      yield* check(
+        Arr.every(
+          synced.operations,
+          (op) =>
+            op.bytes === null &&
+            Number.isFinite(op.durationMs) &&
+            op.durationMs >= 0 &&
+            Arr.join(Arr.sort(Record.keys(op), Str.Order), ",") ===
+              "bytes,count,durationMs,failure,followsFailure,operation"
+        ),
+        "export contains extra fields or fabricated bytes"
+      )
+      const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(synced)
+      yield* check(
+        !Str.includes(secret)(encoded) &&
+          !Str.includes(profile)(encoded) &&
+          !Str.includes(principal)(encoded) &&
+          !Str.includes("https://")(encoded),
+        "diagnostics leaked private data"
+      )
+      // Returned objects are detached, even when a JS consumer disregards readonly types.
+      if (synced.operations[0]) Object.assign(synced.operations[0], { count: 999999 })
+      const unchanged = yield* client.diagnostics
+      yield* check(
+        (yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(unchanged)) === encoded,
+        "snapshot read mutated history or triggered work"
+      )
+      // A broken diagnostic clock must neither block durable writes nor replace transport errors.
+      for (const failAtStart of [true, false]) {
+        let reads = 0
+        const faultyClock = {
+          ...clock,
+          monotonicTimeNanos: Effect.suspend(() =>
+            failAtStart || ++reads % 2 === 0 ? Effect.die(secret) : Effect.succeed(0n)
+          )
+        }
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const isolated = yield* Client.open(options(`${profile}-clock-${failAtStart}`))
+            yield* add(isolated, 3)
+            const error = yield* Effect.flip(isolated.sync)
+            yield* check(error === offline && value(isolated) === 3, "instrumentation changed operation outcome")
+          }).pipe(Effect.provideService(Clock.Clock, faultyClock))
+        )
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const restored = yield* Client.open(options(`${profile}-clock-${failAtStart}`))
+            yield* check(value(restored) === 3, "instrumentation lost or duplicated durable work")
+          })
+        )
+      }
+      return `PASS INV-CLIENT-6: 100 retained; 105 pull/1 execute failed-operation followups; durable pending age; real RPC receipts/entries; no private fields; detached read-only snapshot`
+    })
+  )
+
 const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect)
 Object.assign(globalThis, {
   echoScenarios: {
+    diagnostics: (profile: string) => run(diagnostics(profile)),
     largeCatalog: (profile: string, reload = false) => run(largeCatalog(profile, reload)),
     oversizedCatalog: (profile: string) => run(oversizedCatalog(profile)),
     prepareServerReload: (profile: string) => run(prepareServerReload(profile)),

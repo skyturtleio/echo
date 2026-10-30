@@ -16,9 +16,11 @@ import type * as Aggregate from "../domain/Aggregate.ts"
 import type { Principal } from "../domain/Scope.ts"
 import * as Protocol from "../protocol.ts"
 import * as Storage from "./BrowserStorage.ts"
+import * as Diagnostics from "./Diagnostics.ts"
 import * as Model from "./Model.ts"
 
 export { ProfileBusy, StorageError } from "./BrowserStorage.ts"
+export type { Diagnostics, DiagnosticOperation } from "./Diagnostics.ts"
 export type { Read } from "./Model.ts"
 export class ClientClosed extends Data.TaggedError("ClientClosed") {}
 export class ProfileMismatch extends Data.TaggedError("ProfileMismatch") {}
@@ -121,6 +123,11 @@ const covered = (intent: Model.Intent, replica: Model.Replica): boolean =>
 /** Hydrates before returning. All resources, connection work and ownership end with the caller's Scope. */
 export const open = (options: Options) =>
   Effect.gen(function* () {
+    const diagnostics = Diagnostics.make()
+    const saveJournal = (db: IDBDatabase, value: Model.Journal) =>
+      diagnostics.measure("journal", Storage.save(db, value), () => value.intents.length)
+    const saveReplica = (db: IDBDatabase, value: Model.Replica) =>
+      diagnostics.measure("replica", Storage.save(db, value), () => value.rows.length)
     const namespace = `${encodeURIComponent(options.profile)}:${encodeURIComponent(options.principal)}`
     yield* Storage.ownProfile(namespace)
     const journalDb = yield* Storage.openDatabase(`echo:journal:${namespace}`)
@@ -136,13 +143,13 @@ export const open = (options: Options) =>
         })
       : Schema.decodeUnknownEffect(Model.Journal)(saved)
     if (journal.principal !== options.principal) return yield* Effect.fail(new ProfileMismatch())
-    yield* Storage.save(journalDb, journal)
+    yield* saveJournal(journalDb, journal)
     const cached = yield* Storage.load(replicaDb)
     let replica = yield* saved === undefined || cached === undefined
       ? Effect.succeed(emptyReplica())
       : Schema.decodeUnknownEffect(Model.Replica)(cached)
     if (replica.epoch !== journal.epoch) replica = emptyReplica()
-    yield* Storage.save(replicaDb, replica)
+    yield* saveReplica(replicaDb, replica)
     let closed = false
     const stopped = yield* Deferred.make<void>()
     const live = <A>(stream: Stream.Stream<A>): Stream.Stream<A> =>
@@ -163,7 +170,7 @@ export const open = (options: Options) =>
       mutex.withPermit(Effect.uninterruptible(Effect.andThen(guard, effect)))
     const writeJournal = (next: Model.Journal) =>
       Effect.gen(function* () {
-        yield* Storage.save(journalDb, next)
+        yield* saveJournal(journalDb, next)
         journal = next
       })
     const publish = (rejectUnsent = false) =>
@@ -199,7 +206,7 @@ export const open = (options: Options) =>
           ...s,
           pending: Arr.filter(intents, (i) => i.phase !== "Rejected" && i.phase !== "Unknown").length
         }))
-      })
+      }).pipe((effect) => diagnostics.measure("rebase", effect, () => SubscriptionRef.getUnsafe(state).length))
     yield* publish()
     yield* Effect.addFinalizer(() =>
       mutex.withPermit(
@@ -227,14 +234,16 @@ export const open = (options: Options) =>
           // Invalidate hot authority before fallible cache I/O; never send old cursors with the new epoch.
           replica = next
           yield* publish()
-          yield* Storage.save(replicaDb, next)
+          yield* saveReplica(replicaDb, next)
         })
       )
     const pull = Effect.gen(function* () {
       const request = yield* locked(
         Effect.sync(() => ({ epoch: journal.epoch, cursors: replica.epoch === journal.epoch ? replica.cursors : {} }))
       )
-      const response = yield* options.transport.pull(request)
+      const response = yield* diagnostics.measure("pull", options.transport.pull(request), (reply) =>
+        Arr.reduce(reply.scopes, 0, (count, scope) => count + scope.entries.length)
+      )
       if (request.epoch !== null && response.epoch !== request.epoch) {
         return yield* new Protocol.ResyncRequired({ epoch: response.epoch })
       }
@@ -291,7 +300,7 @@ export const open = (options: Options) =>
           // Journal epoch first: a crash here invalidates the old replica on the next open.
           yield* writeJournal({ ...journal, epoch: response.epoch })
           const next = { epoch: response.epoch, rows: [...rows.values()], cursors }
-          yield* Storage.save(replicaDb, next)
+          yield* saveReplica(replicaDb, next)
           replica = next
           yield* publish(true)
         })
@@ -314,7 +323,11 @@ export const open = (options: Options) =>
             }
           })
         )
-        const response = yield* options.transport.execute(request)
+        const response = yield* diagnostics.measure(
+          "execute",
+          options.transport.execute(request),
+          (reply) => reply.receipts.length
+        )
         if (request.epoch !== null && response.epoch !== request.epoch) {
           return yield* new Protocol.ResyncRequired({ epoch: response.epoch })
         }
@@ -433,7 +446,7 @@ export const open = (options: Options) =>
       locked(
         Effect.gen(function* () {
           const next = emptyReplica()
-          yield* Storage.save(replicaDb, next)
+          yield* saveReplica(replicaDb, next)
           replica = next
           yield* publish()
         })
@@ -488,6 +501,21 @@ export const open = (options: Options) =>
       sync,
       resetReplica,
       dismiss,
+      /** In-memory snapshot only; age uses the device clock and durable intent creation times. */
+      diagnostics: Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis
+        let count = 0
+        let oldest: number | null = null
+        for (const intent of journal.intents) {
+          if (intent.phase === "Rejected" || intent.phase === "Unknown") continue
+          count++
+          oldest = oldest === null ? intent.now : Math.min(oldest, intent.now)
+        }
+        return {
+          ...diagnostics.snapshot(),
+          pending: { count, oldestAgeMs: oldest === null ? null : Math.max(0, now - oldest) }
+        } satisfies Diagnostics.Diagnostics
+      }),
       status: live(SubscriptionRef.changes(status)),
       notices: live(SubscriptionRef.changes(notices))
     }

@@ -11,7 +11,7 @@ agent-browser --session "$session" eval "echoScenarios.prepareReload('$profile-r
 agent-browser --session "$session" reload
 agent-browser --session "$session" wait --fn 'typeof echoScenarios === "object"'
 agent-browser --session "$session" eval "echoScenarios.verifyReload('$profile-reload')"
-for scenario in lostReceipt rebaseAndEpoch lifetime queries; do
+for scenario in lostReceipt rebaseAndEpoch lifetime queries diagnostics; do
   agent-browser --session "$session" eval "echoScenarios.$scenario('$profile-$scenario')"
 done
 agent-browser --session "$session" wait --fn 'navigator.serviceWorker.controller !== null'

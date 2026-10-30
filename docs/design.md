@@ -347,6 +347,42 @@ behaviour adds or amends an item here in the same branch.
     historical business actions, and a wire-addressable import command merely to register
     its event. Catalogs retain their explicit state-only exception.
 
+22. **Local reads share borrowed immutable snapshots** (2026-10-30). Codec encode/decode
+    functions are cached by schema identity. Each client owns weak caches by effective row-array
+    and aggregate/row identity; queries and subscribers reuse the reader for their actual snapshot,
+    including queued older snapshots. An id lookup groups raw rows once and decodes only its target;
+    scans decode each visible row once and preserve order. Equality indexes filter the cached scan
+    with Effect equality, preserving structural keys rather than substituting native Map equality.
+    Visibility is computed from decoded state before exposing it, never from persisted `row.scope`.
+    Command decisions use independent decodes, not the public decoded cache. Rows and domain
+    definitions are immutable once installed, and codecs, scopes and selectors are pure.
+    Read results (arrays, entries, nested state, and selector results aliasing them) are borrowed:
+    callers must copy before editing. Identity may be reused and is not a change signal. This is
+    a contract, not runtime mutation enforcement; freezing Date/Map is insufficient and freezing
+    Effect DateTime breaks its lazy caches. Rejected: fresh decoding for every query/subscriber
+    (catalog-sized synchronous work), generic freezing/proxying/cloning (not schema-preserving).
+    Local execution recovers dirty journal/replica reconciliation before deciding, then publishes
+    its already computed prediction only after strict journal completion. Successful reconciliation
+    stamps exclude failures, and authoritative rejection persistence remains required after failure.
+    Equal effective rows do not republish. A validated hydrated replica is not rewritten on open;
+    an exact unchanged Pull (same epoch, unique complete scope set, cursors, no reset or entries)
+    skips snapshot persistence but still reconciles pending work. Rejected: weaker durability,
+    optimistic publication before append, ignoring failed retirement, or a storage/worker rewrite.
+23. **An online event can shorten the reconnect backoff** (2026-10-30). The existing one-second
+    retry wait races a scoped browser `online` listener; completion or interruption removes it.
+    The event is a hint, not proof of reachability. The single connection loop, request deadlines,
+    Sent-receipt recovery ordering and terminal auth/oversized behavior do not change. Rejected:
+    a second connection loop, retries after terminal errors, and timeout changes.
+24. **Execute loads each command's target and declared read aggregates** (2026-10-30).
+    Within the existing singleton-serialized transaction, load the exact target regardless of
+    visibility (so a hidden target still rejects), plus visible rows of declared aggregate reads
+    and index owners. Previously touched batch states overlay persisted rows before deciding;
+    their stale persisted state is not decoded. Selected states still validate. Commands prepare
+    in order so an earlier domain rejection takes precedence over a malformed later command.
+    Rejected: decoding every stream for every Execute, or eagerly preparing a whole batch before
+    deciding (changes rejection precedence). Multi-command batches may reload a declared-read
+    aggregate; receipts, atomicity, authorization and SERIALIZABLE uniqueness remain unchanged.
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -368,6 +404,8 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
   claims for the same visible unique value cannot both be accepted.
 - **INV-SERVER-3:** Writes require the principal's private scope; declared reads see private
   and catalog rows only, hidden ids read as null, and undeclared reads fail.
+  Unrelated stored states outside the current command's target and declared-read aggregates
+  are not decoded; selected persisted states still validate.
 - **INV-SERVER-4:** Pull snapshots and cursors share one transaction snapshot; reconnect
   cannot skip committed state. Epoch mismatches refuse writes and pulls.
 - **INV-SERVER-5:** Catalog ingestion validates state and catalog scope, writes no per-row
@@ -383,10 +421,15 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
   Pull reconciles catalog-sized snapshots without per-entry replica scans, preserving exact
   stream identity, response order (replacement appends), scope-local Gone/reset and complete
   membership eviction. Every Upsert is validated before publishing any part of the response.
+  Failed journal retirement or authoritative rejection persistence remains recoverable before the
+  next local decision, without duplicating covered predictions or forgetting rejected intents.
 - **INV-CLIENT-4:** An exclusive profile lifetime prevents competing leaders. Open hydrates
   offline and owns automatic connection startup; close ends streams and releases storage,
   connection and lock before another profile instance opens.
 - **INV-CLIENT-5:** Typed queries expose effective state and suppress structurally unchanged emissions.
+  Borrowed immutable reads retain their snapshot through later changes/reset, authorize from decoded
+  scope and preserve structural index equality and decoded types. Exact unchanged pulls do not
+  rewrite journal/replica snapshots; a changed cursor, scope membership, reset or entry is not unchanged.
 - **INV-CLIENT-6:** Diagnostic snapshots retain at most 100 completed operations with scalar
   allowlisted timing/count/failure data only. Offline work retains its age across reopen;
   follow-up counts exclude initial calls, successful sync reports actual response counts,
@@ -398,6 +441,8 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
   Catalog responses above 16 Mi and within the 64 Mi UTF-16-code-unit frame bound install
   completely and survive browser reload with their cursors. An oversized response stops
   automatic retries without partially publishing rows/cursors or losing pending work.
+  An online hint wakes a nonterminal reconnect wait without waiting the full second; it never
+  restarts auth/oversized automation or a closed client.
 
 ## 4. Phases
 

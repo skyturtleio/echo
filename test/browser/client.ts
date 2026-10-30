@@ -1,5 +1,6 @@
 import * as Arr from "effect/Array"
 import * as Clock from "effect/Clock"
+import * as DateTime from "effect/DateTime"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -15,7 +16,13 @@ import { FetchHttpClient, HttpClient } from "effect/http"
 import { DefineTag, Note, NoteId, Tag, TagId, WriteNote } from "../../examples/fixture/domain/src/index.ts"
 import * as Domain from "../../src/domain/index.ts"
 import * as Client from "../../src/client/index.ts"
-import { ResyncRequired, type Change, type ExecuteRequest, type PullResponse } from "../../src/protocol.ts"
+import {
+  ResyncRequired,
+  type Change,
+  type ExecuteRequest,
+  type PullResponse,
+  type Receipt
+} from "../../src/protocol.ts"
 
 // Non-idempotent fixture: repeating a prediction changes 3 to 6, unlike a set-value command.
 const Id = Schema.String
@@ -43,6 +50,24 @@ class Counter extends Domain.Aggregate("Counter", {
         : [new Added({ amount: command.amount, scope: Domain.Scope.privateScope(ctx.principal) })]
   },
   evolve: { Added: (state, event) => ({ value: (state?.value ?? 0) + event.amount, scope: event.scope }) }
+}) {}
+
+const ReferenceState = Schema.NullOr(
+  Schema.Struct({
+    scope: Domain.Scope.Scope,
+    key: Schema.Struct({ group: Schema.String }),
+    at: Schema.DateTimeUtc
+  })
+)
+class Reference extends Domain.Aggregate("Reference", {
+  id: Id,
+  state: ReferenceState,
+  initial: null,
+  commands: [],
+  indexes: Domain.Index(Id, ReferenceState, { by_key: ["key"] }),
+  scope: (state) => state?.scope ?? null,
+  decide: {},
+  evolve: {}
 }) {}
 
 const principal = Domain.Scope.Principal.make("browser-fixture")
@@ -301,6 +326,68 @@ const rebaseAndEpoch = (profile: string) =>
           Stream.runHead,
           Effect.timeout("3 seconds")
         )
+      // A failed journal reconciliation must not mark the new replica as fully published.
+      for (const accepted of [false, true]) {
+        let remoteValue = 0
+        const recovery = yield* Client.open(
+          options(`${profile}-recovery-${accepted}`, {
+            changes: Stream.never,
+            pull: () => Effect.succeed(snapshot(remoteValue)),
+            execute: (request) =>
+              Effect.sync(() => {
+                remoteValue = 3
+                return {
+                  epoch: "one",
+                  receipts: Arr.map(
+                    request.batches,
+                    (batch) =>
+                      ({
+                        _tag: "Accepted",
+                        batchId: batch.id,
+                        seqs: [{ aggregate: "Counter", id: "one", seq: 1 }]
+                      }) satisfies Receipt
+                  )
+                }
+              })
+          })
+        )
+        yield* add(recovery, 3)
+        if (!accepted) remoteValue = 8
+        const transaction = IDBDatabase.prototype.transaction
+        let armed = false
+        let aborted = false
+        Object.defineProperty(IDBDatabase.prototype, "transaction", {
+          configurable: true,
+          writable: true,
+          value: function (this: IDBDatabase, ...args: Parameters<typeof transaction>) {
+            const tx = transaction.call(this, ...args)
+            if (args[1] === "readwrite" && remoteValue !== 0) {
+              if (Str.startsWith("echo:replica:")(this.name)) armed = true
+              else if (armed && !aborted && Str.startsWith("echo:journal:")(this.name)) {
+                aborted = true
+                queueMicrotask(() => tx.abort())
+              }
+            }
+            return tx
+          }
+        })
+        yield* recovery.sync.pipe(
+          Effect.ignore,
+          Effect.ensuring(
+            Effect.sync(() => {
+              IDBDatabase.prototype.transaction = transaction
+            })
+          )
+        )
+        yield* check(aborted && value(recovery) === remoteValue, "failed journal reconciliation hid durable replica")
+        yield* add(recovery, 1)
+        yield* check(value(recovery) === remoteValue + 1, "recovery duplicated a covered prediction or used stale rows")
+        const recoveredNotices = yield* Stream.runHead(recovery.notices)
+        yield* check(
+          accepted || (recoveredNotices._tag === "Some" && recoveredNotices.value[0]?.phase === "Rejected"),
+          "failed authoritative rejection was forgotten by local recovery"
+        )
+      }
       // Full-size generic catalog, not private app data. Check every row independently of reconciliation.
       const catalog = "catalog:fixture"
       const other = "catalog:other"
@@ -540,6 +627,108 @@ const queries = (profile: string) =>
         "typed index missed effective state"
       )
       yield* Fiber.interrupt(syncing)
+      const catalog = "catalog:query"
+      let response: PullResponse = {
+        epoch: "query",
+        scopes: [
+          {
+            scope: catalog,
+            cursor: 1,
+            reset: true,
+            entries: Arr.map(["visible", "hidden"], (id) => ({
+              _tag: "Upsert",
+              aggregate: "Reference",
+              id,
+              seq: 1,
+              // The persisted scope is deliberately misleading for the second row.
+              state: {
+                scope: id === "visible" ? catalog : "user:someone-else",
+                key: { group: "first" },
+                at: "2026-10-30T00:00:00.000Z"
+              }
+            }))
+          }
+        ]
+      }
+      const references = yield* Client.open({
+        ...options(`${profile}-references`, {
+          ...disconnected,
+          pull: () => Effect.succeed(response)
+        }),
+        aggregates: [Counter, Reference]
+      })
+      yield* references.sync
+      const before = references.query((read) => read)
+      const first = before.get(Reference, "visible")
+      yield* check(
+        first !== null &&
+          DateTime.toPartsUtc(first.at).year === 2026 &&
+          before.get(Reference, "hidden") === null &&
+          before.scan(Reference).length === 1 &&
+          before.index(Reference.by_key, { group: "first" }).length === 1,
+        "cached reads changed decoded scope, structural index equality or DateTime behavior"
+      )
+      const emitted: Array<ReadonlyArray<{ readonly id: string; readonly state: typeof ReferenceState.Type }>> = []
+      yield* references
+        .subscribe((read) => read.scan(Reference))
+        .pipe(
+          Stream.runForEach((rows) =>
+            Effect.sync(() => {
+              emitted.push(rows)
+            })
+          ),
+          Effect.forkScoped
+        )
+      yield* Effect.yieldNow
+      response = { epoch: "query", scopes: [{ scope: catalog, cursor: 1, reset: false, entries: [] }] }
+      const savedBefore = Arr.filter(
+        (yield* references.diagnostics).operations,
+        (op) => op.operation === "replica" || op.operation === "journal"
+      ).length
+      yield* references.sync
+      yield* check(
+        Arr.filter(
+          (yield* references.diagnostics).operations,
+          (op) => op.operation === "replica" || op.operation === "journal"
+        ).length === savedBefore,
+        "unchanged pull rewrote durable snapshots"
+      )
+      response = {
+        epoch: "query",
+        scopes: [
+          {
+            scope: catalog,
+            cursor: 2,
+            reset: false,
+            entries: [
+              {
+                _tag: "Upsert",
+                aggregate: "Reference",
+                id: "visible",
+                seq: 2,
+                state: { scope: catalog, key: { group: "second" }, at: "2027-01-01T00:00:00.000Z" }
+              }
+            ]
+          }
+        ]
+      }
+      yield* references.sync
+      yield* Effect.yieldNow
+      yield* check(
+        before.get(Reference, "visible")?.key.group === "first" &&
+          references.query((read) => read.get(Reference, "visible"))?.key.group === "second" &&
+          references.query((read) => read.index(Reference.by_key, { group: "first" })).length === 0 &&
+          references.query((read) => read.index(Reference.by_key, { group: "second" })).length === 1 &&
+          emitted.length === 2 &&
+          emitted[0]?.[0]?.state?.key.group === "first" &&
+          emitted[1]?.[0]?.state?.key.group === "second",
+        "snapshot cache returned stale state/index or mutated a retained snapshot"
+      )
+      yield* references.resetReplica
+      yield* check(
+        references.query((read) => read.scan(Reference)).length === 0 && before.scan(Reference).length === 1,
+        "reset reused cached rows or changed a retained snapshot"
+      )
       return "PASS INV-CLIENT-5 queries: network stalled, local value 3, count emissions [0,1], effective index hit"
     })
   )
@@ -711,6 +900,7 @@ const verifyServerReload = (profile: string) =>
           // New local work must not implicitly resume an auth-blocked connection.
           if (denied === "changes") yield* blocked.execute(Tag, new DefineTag({ target, name: authProfile }))
           yield* blocked.execute(Tag, new DefineTag({ target: TagId.make(`${target}-later`), name: `${target}-later` }))
+          globalThis.dispatchEvent(new Event("online"))
           yield* Effect.sleep("3500 millis")
           const after = yield* requestCount
           yield* check(after === before, `${denied} auth retried automatically: ${before} -> ${after} in 3500ms`)
@@ -753,7 +943,82 @@ const verifyServerReload = (profile: string) =>
           })
         )
       }
-      return `PASS INV-SYNC-1 actual HTTP/PG: offline reload converges; rejection retained; auth stops (${Arr.join(counts, ", ")}); 2 durable intents per case resume on authenticated reopen`
+      // Browser resource accounting catches successful callbacks leaking listeners despite no further traffic.
+      const listeners = new Set<EventListenerOrEventListenerObject>()
+      const originalAdd = globalThis.addEventListener
+      const originalRemove = globalThis.removeEventListener
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          Object.defineProperty(globalThis, "addEventListener", {
+            configurable: true,
+            writable: true,
+            value: (
+              type: string,
+              listener: EventListenerOrEventListenerObject | null,
+              listenerOptions?: boolean | AddEventListenerOptions
+            ) => {
+              if (type === "online" && listener !== null) listeners.add(listener)
+              if (listener !== null) originalAdd.call(globalThis, type, listener, listenerOptions)
+            }
+          })
+          Object.defineProperty(globalThis, "removeEventListener", {
+            configurable: true,
+            writable: true,
+            value: (
+              type: string,
+              listener: EventListenerOrEventListenerObject | null,
+              listenerOptions?: boolean | EventListenerOptions
+            ) => {
+              if (type === "online" && listener !== null) listeners.delete(listener)
+              if (listener !== null) originalRemove.call(globalThis, type, listener, listenerOptions)
+            }
+          })
+        }),
+        () =>
+          Effect.sync(() => {
+            for (const listener of listeners) originalRemove.call(globalThis, "online", listener)
+            globalThis.addEventListener = originalAdd
+            globalThis.removeEventListener = originalRemove
+          })
+      )
+      let hintElapsed = 0
+      for (const mode of ["online", "timeout", "close"]) {
+        const retryScope = yield* Scope.make()
+        let attempts = 0
+        const retried = yield* Deferred.make<void>()
+        const retrying = yield* Client.open({
+          ...options(`${profile}-hint-${mode}`, {
+            ...disconnected,
+            pull: () =>
+              Effect.gen(function* () {
+                if (++attempts === 1) return yield* offline
+                yield* Deferred.succeed(retried, undefined)
+                return snapshot(0)
+              })
+          }),
+          autoConnect: true
+        }).pipe(Effect.provideService(Scope.Scope, retryScope))
+        yield* retrying.status.pipe(
+          Stream.filter((s) => s.connection === "offline"),
+          Stream.runHead,
+          Effect.timeout("2 seconds")
+        )
+        yield* Effect.sleep("50 millis")
+        yield* check(listeners.size === 1, "reconnect did not install exactly one online listener")
+        const hintStart = performance.now()
+        if (mode === "online") globalThis.dispatchEvent(new Event("online"))
+        if (mode !== "close") {
+          yield* Deferred.await(retried).pipe(Effect.timeout(mode === "online" ? "500 millis" : "2 seconds"))
+          if (mode === "online") hintElapsed = performance.now() - hintStart
+        }
+        yield* Scope.close(retryScope, Exit.void)
+        yield* check(listeners.size === 0, `${mode} retry retained its browser listener`)
+        const closedAttempts = attempts
+        globalThis.dispatchEvent(new Event("online"))
+        yield* Effect.sleep("50 millis")
+        yield* check(attempts === closedAttempts, "online event restarted a closed client")
+      }
+      return `PASS INV-SYNC-1 actual HTTP/PG: offline reload converges; rejection retained; auth stops (${Arr.join(counts, ", ")}); 2 durable intents per case resume on authenticated reopen; online hint ${hintElapsed.toFixed(1)}ms; closed client stays stopped`
     })
   )
 
@@ -866,6 +1131,7 @@ const oversizedCatalog = (profile: string) =>
             "oversized status lost parser cause/limit"
           )
           yield* client.execute(Tag, new DefineTag({ target: TagId.make(`${target}-later`), name: `${target}-later` }))
+          globalThis.dispatchEvent(new Event("online"))
           yield* Effect.sleep("3500 millis")
           yield* check((yield* count) === before + 1, "oversized response automatically redownloaded")
           const retry = yield* client.sync.pipe(Effect.flip)

@@ -3,6 +3,7 @@
 import * as Array from "effect/Array"
 import * as DateTime from "effect/DateTime"
 import * as Equal from "effect/Equal"
+import { memoize } from "effect/Function"
 import * as Option from "effect/Option"
 import * as Predicate from "effect/Predicate"
 import * as Schema from "effect/Schema"
@@ -46,6 +47,7 @@ export const Replica = Schema.Struct({
 })
 export type Replica = typeof Replica.Type
 
+/** Borrowed immutable snapshots, including nested state. Copy before editing; identity may be reused. */
 export interface Read {
   get<A extends Aggregate.Any>(aggregate: A, id: Aggregate.IdOf<A>): Aggregate.StateOf<A> | null
   scan<A extends Aggregate.Any>(
@@ -55,12 +57,13 @@ export interface Read {
 }
 
 /** Schema registry is the boundary where persisted unknown values regain domain types. */
-const codec = (schema: Schema.Top): Schema.Codec<unknown, unknown> => {
+const codec = memoize((schema: Schema.Top) => {
   // Platform serialization boundary: domain schemas must be synchronous and service-free.
-  return Schema.make<Schema.Codec<unknown, unknown>>(Schema.toCodecJson(schema).ast)
-}
-export const decode = (schema: Schema.Top, value: unknown): unknown => Schema.decodeUnknownSync(codec(schema))(value)
-export const encode = (schema: Schema.Top, value: unknown): unknown => Schema.encodeSync(codec(schema))(value)
+  const json = Schema.make<Schema.Codec<unknown, unknown>>(Schema.toCodecJson(schema).ast)
+  return { decode: Schema.decodeUnknownSync(json), encode: Schema.encodeSync(json) }
+})
+export const decode = (schema: Schema.Top, value: unknown): unknown => codec(schema).decode(value)
+export const encode = (schema: Schema.Top, value: unknown): unknown => codec(schema).encode(value)
 
 export type DomainRejection<A extends Aggregate.Any> =
   | Aggregate.InstanceOf<Aggregate.CommandsOf<A>["rejects"][number]>
@@ -73,40 +76,68 @@ export const decodeRejection = <A extends Aggregate.Any>(aggregate: A, value: un
   return Schema.decodeUnknownSync(schema)(value)
 }
 
-export const reader = (rows: ReadonlyArray<Row>, principal: Principal): Read => {
-  const visible = (aggregate: Aggregate.Any) =>
-    Array.filter(rows, (row) => {
-      if (row.aggregate !== aggregate.tag) return false
-      const scope = aggregate.definition.scope(decode(aggregate.definition.state, row.state))
-      return scope !== null && canRead(principal, scope)
+/** One cache per client principal. Engine rows and domain definitions are immutable once installed. */
+export const makeReader = (principal: Principal) => {
+  // Weak row keys let old snapshots go; aggregate identity includes both codec and scope semantics.
+  const entry = memoize((aggregate: Aggregate.Any) =>
+    memoize((row: Row) => {
+      const state = decode(aggregate.definition.state, row.state)
+      const scope = aggregate.definition.scope(state)
+      return scope !== null && canRead(principal, scope) ? { id: aggregate.definition.id.make(row.id), state } : null
     })
-  function get<A extends Aggregate.Any>(aggregate: A, id: Aggregate.IdOf<A>): Aggregate.StateOf<A> | null {
-    const row = Option.getOrUndefined(Array.findFirst(visible(aggregate), (entry) => entry.id === id))
-    return row === undefined ? null : decode(aggregate.definition.state, row.state)
-  }
-  function scan<A extends Aggregate.Any>(
-    aggregate: A
-  ): ReadonlyArray<{ readonly id: Aggregate.IdOf<A>; readonly state: Aggregate.StateOf<A> }> {
-    return Array.map(visible(aggregate), (row) => ({
-      id: aggregate.definition.id.make(row.id),
-      state: decode(aggregate.definition.state, row.state)
-    }))
-  }
-  function index<I extends Index.Any>(ref: I, value: Index.Value<I>): ReadonlyArray<Index.Entry<I>>
-  function index(ref: Index.Any, value: unknown): unknown {
-    const owner = Aggregate.ofIndex(ref)
-    if (Option.isNone(owner)) return []
-    const values = ref.fields.length === 1 ? [value] : value
-    if (!Array.isArray(values)) throw new Error("Index requires one value per field")
-    return Array.filter(scan(owner.value), ({ state }) =>
-      Array.every(
-        ref.fields,
-        (field, i) => Predicate.hasProperty(state, field) && Equal.equals(state[field], values[i])
+  )
+  return memoize((rows: ReadonlyArray<Row>): Read => {
+    let grouped: Map<string, Map<string, Row>> | undefined
+    const group = (aggregate: Aggregate.Any) => {
+      if (grouped === undefined) {
+        grouped = new Map()
+        for (const row of rows) {
+          let members = grouped.get(row.aggregate)
+          if (members === undefined) {
+            members = new Map()
+            grouped.set(row.aggregate, members)
+          }
+          members.set(row.id, row)
+        }
+      }
+      return grouped.get(aggregate.tag)
+    }
+    const visible = memoize((aggregate: Aggregate.Any) => {
+      const entries: Array<{ readonly id: string; readonly state: unknown }> = []
+      for (const row of group(aggregate)?.values() ?? []) {
+        const value = entry(aggregate)(row)
+        if (value !== null) entries.push(value)
+      }
+      return entries
+    })
+    function get<A extends Aggregate.Any>(aggregate: A, id: Aggregate.IdOf<A>): Aggregate.StateOf<A> | null {
+      const row = group(aggregate)?.get(id)
+      const value = row === undefined ? null : entry(aggregate)(row)
+      return value === null ? null : value.state
+    }
+    function scan<A extends Aggregate.Any>(
+      aggregate: A
+    ): ReadonlyArray<{ readonly id: Aggregate.IdOf<A>; readonly state: Aggregate.StateOf<A> }> {
+      return visible(aggregate)
+    }
+    function index<I extends Index.Any>(ref: I, value: Index.Value<I>): ReadonlyArray<Index.Entry<I>>
+    function index(ref: Index.Any, value: unknown): unknown {
+      const owner = Aggregate.ofIndex(ref)
+      if (Option.isNone(owner)) return []
+      const values = ref.fields.length === 1 ? [value] : value
+      if (!Array.isArray(values)) throw new Error("Index requires one value per field")
+      return Array.filter(scan(owner.value), ({ state }) =>
+        Array.every(
+          ref.fields,
+          (field, i) => Predicate.hasProperty(state, field) && Equal.equals(state[field], values[i])
+        )
       )
-    )
-  }
-  return { get, scan, index }
+    }
+    return { get, scan, index }
+  })
 }
+
+export const reader = (rows: ReadonlyArray<Row>, principal: Principal): Read => makeReader(principal)(rows)
 
 export const decide = (
   aggregates: ReadonlyArray<Aggregate.Any>,

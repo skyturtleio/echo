@@ -6,6 +6,7 @@ import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as Record from "effect/Record"
 import * as Schema from "effect/Schema"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
@@ -148,8 +149,9 @@ export const open = (options: Options) =>
     let replica = yield* saved === undefined || cached === undefined
       ? Effect.succeed(emptyReplica())
       : Schema.decodeUnknownEffect(Model.Replica)(cached)
-    if (replica.epoch !== journal.epoch) replica = emptyReplica()
-    yield* saveReplica(replicaDb, replica)
+    const invalidCache = replica.epoch !== journal.epoch
+    if (invalidCache) replica = emptyReplica()
+    if (saved === undefined || cached === undefined || invalidCache) yield* saveReplica(replicaDb, replica)
     let closed = false
     const stopped = yield* Deferred.make<void>()
     const live = <A>(stream: Stream.Stream<A>): Stream.Stream<A> =>
@@ -158,6 +160,10 @@ export const open = (options: Options) =>
     const syncMutex = yield* Semaphore.make(1)
     const requested = yield* SubscriptionRef.make(0)
     const state = yield* SubscriptionRef.make<ReadonlyArray<Model.Row>>([])
+    const read = Model.makeReader(options.principal)
+    let publishedJournal: Model.Journal | undefined
+    let publishedReplica: Model.Replica | undefined
+    let rejectPending = false
     const notices = yield* SubscriptionRef.make<ReadonlyArray<Notice>>([])
     const status = yield* SubscriptionRef.make<Status>({
       connection: "idle",
@@ -173,12 +179,14 @@ export const open = (options: Options) =>
         yield* saveJournal(journalDb, next)
         journal = next
       })
-    const publish = (rejectUnsent = false) =>
+    const publish = (rejectUnsent = false, prediction?: ReadonlyArray<Model.Row>) =>
       Effect.gen(function* () {
-        let rows = replica.rows
+        rejectPending ||= rejectUnsent
+        if (!rejectPending && publishedJournal === journal && publishedReplica === replica) return
+        let rows = prediction ?? replica.rows
         const intents: Array<Model.Intent> = []
         for (const intent of journal.intents) {
-          if (intent.phase === "Rejected" || intent.phase === "Unknown") {
+          if (prediction !== undefined || intent.phase === "Rejected" || intent.phase === "Unknown") {
             intents.push(intent)
             continue
           }
@@ -187,13 +195,15 @@ export const open = (options: Options) =>
           if (decision.rejection === null) {
             rows = decision.rows
             intents.push(intent)
-          } else if (rejectUnsent && intent.phase === "Pending") {
+          } else if (rejectPending && intent.phase === "Pending") {
             intents.push({ ...intent, phase: "Rejected", rejection: decision.rejection })
           } else intents.push(intent)
         }
         // Rows derive solely from already durable intents and the current confirmed replica.
         // A failed retirement/notice write must not leave subsequent decisions on stale hot state.
-        yield* SubscriptionRef.set(state, rows)
+        const previous = SubscriptionRef.getUnsafe(state)
+        if (previous.length !== rows.length || !Arr.every(rows, (row, i) => Equal.equals(row, previous[i])))
+          yield* SubscriptionRef.set(state, rows)
         if (!Equal.equals(journal.intents, intents)) yield* writeJournal({ ...journal, intents })
         yield* SubscriptionRef.set(
           notices,
@@ -206,6 +216,10 @@ export const open = (options: Options) =>
           ...s,
           pending: Arr.filter(intents, (i) => i.phase !== "Rejected" && i.phase !== "Unknown").length
         }))
+        // Failed reconciliation must retry, including authoritative rejection persistence.
+        publishedJournal = journal
+        publishedReplica = replica
+        rejectPending = false
       }).pipe((effect) => diagnostics.measure("rebase", effect, () => SubscriptionRef.getUnsafe(state).length))
     yield* publish()
     yield* Effect.addFinalizer(() =>
@@ -234,7 +248,13 @@ export const open = (options: Options) =>
           // Invalidate hot authority before fallible cache I/O; never send old cursors with the new epoch.
           replica = next
           yield* publish()
-          yield* saveReplica(replicaDb, next)
+          yield* saveReplica(replicaDb, next).pipe(
+            Effect.onError(() =>
+              Effect.sync(() => {
+                publishedReplica = undefined
+              })
+            )
+          )
         })
       )
     const pull = Effect.gen(function* () {
@@ -250,6 +270,19 @@ export const open = (options: Options) =>
       yield* locked(
         Effect.gen(function* () {
           const scopes = new Set(Arr.map(response.scopes, (scope) => scope.scope))
+          if (
+            response.epoch === journal.epoch &&
+            response.epoch === replica.epoch &&
+            scopes.size === response.scopes.length &&
+            scopes.size === Record.keys(replica.cursors).length &&
+            Arr.every(
+              response.scopes,
+              (scope) => !scope.reset && scope.entries.length === 0 && replica.cursors[scope.scope] === scope.cursor
+            )
+          ) {
+            yield* publish(true)
+            return
+          }
           // Map insertion order matches filter-then-push: replacements move to the end.
           const rows = new Map<string, Model.Row>()
           const members = new Map<string, Set<string>>()
@@ -424,7 +457,8 @@ export const open = (options: Options) =>
               rejection: yield* attempt(() => Model.decodeRejection(aggregate, decision.rejection))
             } satisfies Outcome<A>
           yield* writeJournal({ ...journal, intents: [...journal.intents, intent] })
-          yield* publish()
+          // The mutex and successful recovery above make this the durable journal's exact next prediction.
+          yield* publish(false, decision.rows)
           yield* SubscriptionRef.update(requested, (n) => n + 1)
           return { _tag: "Pending", id: intent.id } satisfies Outcome
         })
@@ -432,12 +466,12 @@ export const open = (options: Options) =>
     }
     function query<A>(select: (read: Model.Read) => A): A {
       if (closed) throw new ClientClosed()
-      return select(Model.reader(SubscriptionRef.getUnsafe(state), options.principal))
+      return select(read(SubscriptionRef.getUnsafe(state)))
     }
     function subscribe<A>(select: (read: Model.Read) => A): Stream.Stream<A> {
       return live(
         SubscriptionRef.changes(state).pipe(
-          Stream.map((rows) => select(Model.reader(rows, options.principal))),
+          Stream.map((rows) => select(read(rows))),
           Stream.changesWith((a, b) => Equal.equals(a, b))
         )
       )
@@ -465,6 +499,15 @@ export const open = (options: Options) =>
           yield* publish()
         })
       )
+    // Browser connectivity is only a retry hint; the transport still decides whether the attempt works.
+    const retry = Effect.callback<void>((resume) => {
+      const online = () => {
+        globalThis.removeEventListener("online", online)
+        resume(Effect.void)
+      }
+      globalThis.addEventListener("online", online)
+      return Effect.sync(() => globalThis.removeEventListener("online", online))
+    }).pipe(Effect.race(Effect.sleep("1 second")))
     /** Exactly one connection loop belongs to this profile resource. Local execute never waits for it. */
     const connect = Effect.forever(
       Effect.gen(function* () {
@@ -490,7 +533,7 @@ export const open = (options: Options) =>
             })
           )
         )
-        yield* Effect.sleep("1 second")
+        yield* retry
       })
     ).pipe(Effect.catchTag("TransportError", () => Effect.void))
     if (options.autoConnect !== false) yield* Effect.forkScoped(connect)

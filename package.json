@@ -6,6 +6,7 @@
   "exports": {
     "./domain": "./src/domain/index.ts",
     "./domain/testing": "./src/domain/testing/index.ts",
+    "./protocol": "./src/protocol.ts",
     "./server": "./src/server/index.ts",
     "./client": "./src/client/index.ts",
     "./foldkit": "./src/foldkit/index.ts"
@@ -18,6 +19,9 @@
     "test:pg": "ECHO_PG_URL=${ECHO_PG_URL:-postgres://postgres@127.0.0.1:5432/postgres} vitest run src/server test/",
     "fmt": "oxfmt",
     "lsp": "effect-tsgo tsc@7.1.0-beta --lsp --stdio"
+  },
+  "dependencies": {
+    "@effect/sql-pg": "4.0.5"
   },
   "devDependencies": {
     "@effect/tsgo": "0.59.0",

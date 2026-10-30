@@ -1,12 +1,12 @@
 /**
  * `echo/domain`: the building blocks an app's domain package is written against (design §1).
  * Every block is `Domain.<Noun>(...)` and its types live on the same name
- * (`Domain.Event.Any`, `Domain.Aggregate.StateOf<typeof Entry>`), as in Alchemy.
+ * (`Domain.Event.Any`, `Domain.Aggregate.StateOf<typeof Note>`), as in Alchemy.
  *
  * ```ts
  * import * as Domain from "echo/domain"
  *
- * export class EntryDeleted extends Domain.Event("EntryDeleted", {}) {}
+ * export class TagRemoved extends Domain.Event("TagRemoved", {}) {}
  * ```
  *
  * `Policy`, `Batch`, command `authority` and versioning (design §1) arrive with the phases

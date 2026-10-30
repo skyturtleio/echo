@@ -8,7 +8,7 @@ import type { Bivariant } from "./internal/classes.ts"
 import type { Principal, Scope } from "./Scope.ts"
 
 /**
- * The instance type of a domain class: `InstanceOf<typeof TimesOutOfOrder>` is `TimesOutOfOrder`.
+ * The instance type of a domain class: `InstanceOf<typeof DuplicateName>` is `DuplicateName`.
  * Read off the schema's `Type` rather than the constructor, because `Schema.Top` declares a
  * second construct signature that would win the inference. Distributes over a union.
  */

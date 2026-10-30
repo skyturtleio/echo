@@ -30,7 +30,7 @@ export const taggedError = <Self, Tag extends string, F extends Fields>(
 /**
  * A function type whose parameters are checked bivariantly, the way method parameters are.
  * `Aggregate.AnyDefinition` erases an aggregate's state and command types to `unknown`; a
- * handler written for `EntryState` must still be assignable to it so the story runner (and
+ * handler written for `NoteState` must still be assignable to it so the story runner (and
  * later the engine) can call handlers of any aggregate. Only the erased side uses it: the typed
  * `Definition` keeps plain function types, so a handler cannot narrow the state it accepts.
  */

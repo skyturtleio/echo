@@ -24,7 +24,7 @@ export interface Any extends Schema.Top {
 }
 
 /**
- * A business-named fact recorded on one stream (`EntryLogged`, not `EntryUpdated`). Events
+ * A business-named fact recorded on one stream (`NoteWritten`, not `NoteUpdated`). Events
  * carry computed outcomes; `evolve` only applies them. Versioning (design §1) is not part of
  * Phase 0; an event class is its tag alone until it is.
  */

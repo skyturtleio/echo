@@ -13,8 +13,8 @@ one) are the previous design. Do not read them, clone them, or borrow from
 them, even to "check how it was done"; if the design doc needs something they knew, say so in
 your report and the owner decides. The apps' domain packages live in their own repositories
 and pin this one by commit; nothing of a private app's domain (its names, rules or data) goes
-into this public repository. The engine's own phases are built against the stand-in domain in
-`examples/`.
+into this public repository. The engine's own phases are built against the fixture domain in
+`examples/fixture` (design §2 item 14): one story per engine surface, no rules beyond that.
 The inputs for this work are `docs/design.md`, `@alchemy.run/domain` (vocabulary, file
 layout, `decide`/`evolve`, `Story`; read its source, not memory), and the pinned Effect source
 in `node_modules/effect/src/**` and `node_modules/@effect/*`.

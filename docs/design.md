@@ -1,10 +1,10 @@
 # Echo — an aggregate-based, offline-first sync engine for Effect v4 + FoldKit
 
-Status: design, 2026-10-29; cut to its four jobs 2026-10-30 (§2 item 13). This repository
+Status: design, 2026-10-29; cut to its five jobs 2026-10-30 (§2 item 13). This repository
 (`skyturtleio/echo`, package `echo`) replaces `skyturtleio/echo-sync`, whose code and SPEC
 are the previous design and are not references (§5). The vocabulary is `@alchemy.run/domain`'s.
 
-This document has four jobs and nothing else: the **model** (§1, what the engine is), the
+This document has five jobs and nothing else: the **model** (§1, what the engine is), the
 **decisions** (§2, why, with what each was chosen over), the **invariants catalogue** (§3, what
 a rule-abiding engine promises, one scenario test each), the **phases** (§4) and the **working
 rules** (§5). App rules are not described here; they are `Story` tests in each app's domain
@@ -30,7 +30,7 @@ importing only `effect` and `echo/domain`) plus thin server and client wiring. T
 | `Aggregate` | `id`, `state` schema (`null` while the stream has no events), `initial`, `commands`, `scope(state)`, `indexes`, `decide` and `evolve` as one handler per tag (§2 item 7) |
 | `Index` | `Domain.Index(id, state, spec)`, field lists over state, bound to the aggregate and exposed as statics (§2 item 9) |
 | `Scope` | `Principal`, `Scope` (opaque id), `privateScope`, `catalogScope`, the pre-grants rule, and `ScopeForbidden` (§2 item 8) |
-| `Story` | the domain test: *given* events (one stream, or several keyed `Aggregate/id`), *when* command, *as* principal, *then* events or rejection; pure runner in `echo/domain`, vitest binding in `echo/domain/testing` (§2 item 10) |
+| `Story` | the domain test: *given* events (one stream, or several seeded with `Story.stream(Aggregate, id, events)`), *when* command, *as* principal, *then* events or rejection; pure runner in `echo/domain`, vitest binding in `echo/domain/testing` (§2 item 10) |
 | `Policy`, `Batch`, versioning | server-side reaction to events; several commands committed atomically under one id; `(name, version)` on events, state and commands with upcasters. Not built yet (§4) |
 
 `decide` is pure and sees only its stream's state, the command and `ctx = { principal, now,
@@ -244,6 +244,14 @@ behaviour adds or amends an item here in the same branch.
     blocks is `src/domain`. Rejected: a separate `docs/invariants.md` (one more file for the
     same "what the engine promises" question; the catalogue is a section here, §3) and a prose
     spec of app rules (the stories are it).
+14. **The stand-in under `examples/` is a fixture, not an app** (2026-10-30). Two aggregates,
+    `Note` and `Tag`, and one story per engine surface a domain can touch (§4, Phase 0); no
+    rule beyond what a surface needs. The real design pressure comes from the apps' domains,
+    written against a pinned commit in their own repositories, and their friction is the input
+    to the next phase. Rejected: a realistic stand-in app (the first version was a timesheet
+    with three aggregates). It grew business rules nobody needed, those rules were reviewed as
+    if they were a product, and a fixture is far easier to grow than to shrink once the engine
+    phases are built against it.
 
 ## 3. Invariants catalogue
 
@@ -259,19 +267,23 @@ journal, replica, effective state, rebase, outcomes, queries), `SYNC` (end to en
 devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
 
 No invariants yet: Phase 0 has no engine. Phase 1's `SERVER` entries are written before the
-first server code.
+first server code. Known entries to write then: a read over an index returns the matching
+streams in every scope the principal can read, so a uniqueness check in a private scope also
+sees the catalog (the Phase 0 story runner behaves this way; whether a rule wants that is the
+domain's choice); a read by id returns `null` for a stream in a scope the principal cannot read.
 
 ## 4. Phases
 
-0. **Domain building blocks and the first domain, no engine.** Done 2026-10-29: `echo/domain`
-   (`src/domain`) and the stand-in single-user domain `examples/timesheet/domain` with five
-   stories. What the stories established: the `ctx` surface this shape of app needs is
-   `principal`, `now`, `read` by id and `read` by index, nothing else; every rule is decidable
-   on the device; three of five rules need `reads`; the ownership check the previous apps
-   repeated in every handler is engine logic (§2 item 8). No story needed `Policy`, `Batch`,
-   `authority` or versioning, so they are not built. Open on `ws/phase0-domain`: no story
-   asserts an accepted command's events and scope stamp; an amendment can change a reference
-   field without a read; the duplicate-code check spans private and catalog scopes.
+0. **Domain building blocks and the fixture domain, no engine.** Done 2026-10-30: `echo/domain`
+   (`src/domain`) and `examples/fixture/domain` (item 14): `Note` and `Tag`, five stories, one
+   per engine surface a domain can touch (an accepted command and its scope stamp, a read by
+   id across scopes, `ScopeForbidden`, a read over an own index, a read over another
+   aggregate's index). What the single-user app's domain, written against this in its own
+   repository, established: the `ctx` surface it needs is `principal`, `now`, `read` by id and
+   `read` by index, nothing else; every rule is decidable on the device; the ownership check
+   the previous apps repeated in every handler is engine logic (§2 item 8). No story needed
+   `Policy`, `Batch`, `authority` or versioning, so they are not built. Catalogs are seeded in
+   stories by replaying events with a `catalog:` scope; the server-written path is phase 1.
 1. **Server:** streams, events, receipts, scope log with compaction, grants aggregate,
    policies, `Execute`/`Pull`/`Changes` over `effect/rpc`, epoch. `SERVER` invariants first,
    then integration tests against Postgres.

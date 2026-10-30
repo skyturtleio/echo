@@ -21,7 +21,7 @@
         "patterns": [
           {
             "group": ["foldkit", "foldkit/**"],
-            "message": "Only examples may import FoldKit; the engine and its adapter never do (design §11)."
+            "message": "Only examples may import FoldKit; the engine and its adapter never do (design §1)."
           }
         ]
       }
@@ -43,7 +43,7 @@
                 "group": ["**/server", "**/server/**", "echo/server"],
                 "message": "Domain and browser code never import src/server."
               },
-              { "group": ["foldkit", "foldkit/**"], "message": "Only examples may import FoldKit (design §11)." }
+              { "group": ["foldkit", "foldkit/**"], "message": "Only examples may import FoldKit (design §1)." }
             ]
           }
         ]

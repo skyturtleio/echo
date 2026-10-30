@@ -127,11 +127,7 @@ export const make = Effect.fn("Echo.Server.make")(function* (options: {
               return yield* new Wire.ServerError({ message: "Batch id reused with different commands" })
             return { epoch: current.epoch, receipt: yield* Schema.decodeUnknownEffect(Wire.Receipt)(prior[0].receipt) }
           }
-          const stored = yield* sql<Row>`SELECT aggregate,id,scope,seq,state FROM echo_streams`
           const planned = yield* Effect.gen(function* () {
-            const rows: Array<Row> = []
-            for (const row of stored)
-              rows.push({ ...row, state: yield* decode(aggregate(row.aggregate).definition.state, row.state) })
             const events: Array<{ aggregate: string; id: string; seq: number; payload: unknown }> = []
             const touched = new Map<string, Row>()
             const rejected = (rejection: unknown): Wire.Receipt => ({ _tag: "Rejected", batchId: batch.id, rejection })
@@ -145,6 +141,26 @@ export const make = Effect.fn("Echo.Server.make")(function* (options: {
               if (c === undefined) return yield* new Wire.ServerError({ message: "Unknown command" })
               const reads = c.reads
               const command = yield* decode(c, item.command)
+              const readTags = new Set<string>()
+              for (const ref of reads) {
+                const owner = ref.kind === "Aggregate" ? Option.some(ref) : Aggregate.ofIndex(ref)
+                if (Option.isSome(owner)) readTags.add(owner.value.tag)
+              }
+              // Targets include hidden rows for authorization; declared reads include only visible scopes.
+              // Load per command so an earlier rejection still wins over a malformed later command.
+              const stored = yield* sql<Row>`SELECT aggregate,id,scope,seq,state FROM echo_streams
+                WHERE (aggregate=${a.tag} AND id=${command.target})
+                   OR (${sql.in("aggregate", [...readTags])} AND (scope=${privateScope(principal)} OR scope LIKE 'catalog:%'))`
+              const rows: Array<Row> = []
+              for (const storedRow of stored) {
+                if (touched.has(`${storedRow.aggregate.length}:${storedRow.aggregate}${storedRow.id}`)) continue
+                rows.push({
+                  ...storedRow,
+                  state: yield* decode(aggregate(storedRow.aggregate).definition.state, storedRow.state)
+                })
+              }
+              // Earlier commands have not been persisted yet; their state wins over the transaction snapshot.
+              rows.push(...touched.values())
               const row = Option.getOrUndefined(
                 Arr.findFirst(rows, (r) => r.aggregate === a.tag && r.id === command.target)
               )
@@ -219,8 +235,6 @@ export const make = Effect.fn("Echo.Server.make")(function* (options: {
                   }
                 }
                 const next: Row = { aggregate: a.tag, id: command.target, seq, scope, state }
-                if (row) rows.splice(rows.indexOf(row), 1, next)
-                else rows.push(next)
                 touched.set(`${a.tag.length}:${a.tag}${command.target}`, next)
               }
             }

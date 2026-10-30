@@ -151,6 +151,66 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         expect((yield* Effect.exit(invalidServer.execute(alice, request("illegal-import"))))._tag).toBe("Failure")
         expect(yield* sql`SELECT * FROM echo_events WHERE id='illegal-import'`).toHaveLength(0)
         expect(yield* sql`SELECT * FROM echo_receipts WHERE batch_id='illegal-import'`).toHaveLength(0)
+
+        const batch = (id: string, commands: Wire.ExecuteRequest["batches"][number]["commands"]) =>
+          server.execute(alice, { epoch: first.epoch, clientId: "device", batches: [{ id, commands }] })
+        const define = { aggregate: "Tag", command: { _tag: "DefineTag", target: "in-batch", name: "in-batch" } }
+        const write = {
+          aggregate: "Note",
+          command: { _tag: "WriteNote", target: "in-batch-note", tagId: "in-batch", text: "in-batch" }
+        }
+        const removeInBatch = { aggregate: "Tag", command: { _tag: "RemoveTag", target: "in-batch" } }
+        expect((yield* batch("index-overlay", [define, write, removeInBatch])).receipts[0]).toMatchObject({
+          _tag: "Rejected",
+          rejection: { _tag: "TagInUse", notes: 1 }
+        })
+        expect(yield* sql`SELECT * FROM echo_streams WHERE id IN ('in-batch','in-batch-note')`).toHaveLength(0)
+        expect((yield* batch("id-overlay", [define, write])).receipts[0]).toMatchObject({
+          _tag: "Accepted",
+          seqs: [
+            { id: "in-batch", seq: 1 },
+            { id: "in-batch-note", seq: 1 }
+          ]
+        })
+        const ephemeral = {
+          aggregate: "Tag",
+          command: { _tag: "DefineTag", target: "ephemeral", name: "ephemeral" }
+        }
+        expect(
+          (yield* batch("target-overlay", [
+            ephemeral,
+            {
+              aggregate: "Tag",
+              command: { _tag: "RemoveTag", target: "ephemeral" }
+            }
+          ])).receipts[0]
+        ).toMatchObject({ _tag: "Accepted", seqs: [{ id: "ephemeral", seq: 2 }] })
+        expect(yield* sql`SELECT state->'removed' AS removed FROM echo_streams WHERE id='ephemeral'`).toEqual([
+          { removed: true }
+        ])
+        yield* server.execute(alice, request("persisted-overlay"))
+        const removePersisted = {
+          aggregate: "Tag",
+          command: { _tag: "RemoveTag", target: "persisted-overlay" }
+        }
+        expect(
+          (yield* batch("persisted-target-overlay", [removePersisted, removePersisted])).receipts[0]
+        ).toMatchObject({
+          _tag: "Rejected",
+          rejection: { _tag: "NoSuchTag" }
+        })
+        expect(
+          yield* sql`SELECT seq,state->'removed' AS removed FROM echo_streams WHERE id='persisted-overlay'`
+        ).toEqual([{ seq: 1, removed: false }])
+        expect(
+          (yield* batch("rejection-precedence", [
+            define,
+            {
+              aggregate: "Tag",
+              command: { _tag: "UnknownCommand", target: "unreached" }
+            }
+          ])).receipts[0]
+        ).toMatchObject({ _tag: "Rejected", rejection: { _tag: "TagAlreadyDefined" } })
       })
     )
   )
@@ -174,6 +234,21 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           { concurrency: "unbounded" }
         )
         expect(Arr.every(rejected, (r) => r.receipts[0]?._tag === "Rejected")).toBe(true)
+        expect(yield* sql`SELECT * FROM echo_events`).toHaveLength(2)
+        const inBatch = yield* server.execute(alice, {
+          epoch: null,
+          clientId: "device",
+          batches: [
+            {
+              id: "duplicate-in-batch",
+              commands: [
+                { aggregate: "Tag", command: { _tag: "DefineTag", target: "first", name: "same-in-batch" } },
+                { aggregate: "Tag", command: { _tag: "DefineTag", target: "second", name: "same-in-batch" } }
+              ]
+            }
+          ]
+        })
+        expect(inBatch.receipts[0]).toMatchObject({ _tag: "Rejected", rejection: { _tag: "DuplicateName" } })
         expect(yield* sql`SELECT * FROM echo_events`).toHaveLength(2)
       })
     )
@@ -218,6 +293,48 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           _tag: "Failure",
           failure: { _tag: "ServerError", message: "Invalid domain decision or undeclared read" }
         })
+
+        // Removing a tag reads Notes, not other Tags. Unrelated corrupt state must not be decoded.
+        yield* server.execute(alice, request("isolated-target"))
+        yield* sql`INSERT INTO echo_streams VALUES ('Tag','unrelated','catalog:tags',1,'{}'::jsonb)`
+        const removeIsolated: Wire.ExecuteRequest = {
+          epoch: null,
+          clientId: "device",
+          batches: [
+            {
+              id: "remove-isolated",
+              commands: [{ aggregate: "Tag", command: { _tag: "RemoveTag", target: "isolated-target" } }]
+            }
+          ]
+        }
+        expect((yield* server.execute(alice, removeIsolated)).receipts[0]).toMatchObject({
+          _tag: "Accepted",
+          seqs: [{ id: "isolated-target", seq: 2 }]
+        })
+        expect(yield* sql`SELECT state FROM echo_streams WHERE id='unrelated'`).toEqual([{ state: {} }])
+        // The same malformed shape must still fail when it belongs to a declared read aggregate.
+        yield* sql`INSERT INTO echo_streams VALUES ('Note','selected','catalog:notes',1,'{}'::jsonb)`
+        expect(
+          (yield* Effect.result(
+            server.execute(alice, {
+              ...removeIsolated,
+              batches: [
+                {
+                  id: "selected-invalid",
+                  commands: [{ aggregate: "Tag", command: { _tag: "RemoveTag", target: "absent" } }]
+                }
+              ]
+            })
+          ))._tag
+        ).toBe("Failure")
+        expect(yield* sql`SELECT * FROM echo_receipts WHERE batch_id='selected-invalid'`).toHaveLength(0)
+        expect(
+          (yield* server.execute(alice, {
+            epoch: null,
+            clientId: "device",
+            batches: [{ id: "empty", commands: [] }]
+          })).receipts[0]
+        ).toMatchObject({ _tag: "Accepted", seqs: [] })
       })
     )
   )

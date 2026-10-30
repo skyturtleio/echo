@@ -18,7 +18,9 @@ import { createServer } from "node:http"
 import { Note } from "../../examples/fixture/domain/src/Note/Note.aggregate.ts"
 import { DefineTag } from "../../examples/fixture/domain/src/Tag/DefineTag.command.ts"
 import { Tag } from "../../examples/fixture/domain/src/Tag/Tag.aggregate.ts"
-import { Principal } from "../domain/Scope.ts"
+import { TagHistoryImported } from "../../examples/fixture/domain/src/Tag/TagHistoryImported.event.ts"
+import type * as Aggregate from "../domain/Aggregate.ts"
+import { Principal, privateScope } from "../domain/Scope.ts"
 import * as Wire from "../protocol.ts"
 import * as Server from "./index.ts"
 
@@ -104,6 +106,51 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         expect(collision._tag).toBe("Failure")
         const other = yield* server.execute(bob, request("accepted", "bob-tag", "accepted"))
         expect(other.receipts[0]).toMatchObject({ _tag: "Accepted", seqs: [{ id: "bob-tag" }] })
+
+        const imported = new TagHistoryImported({
+          snapshot: { name: "historical", scope: privateScope(alice), removed: false }
+        })
+        const payload = yield* Schema.encodeEffect(Schema.toCodecJson(TagHistoryImported))(imported)
+        const decoded = yield* Schema.decodeEffect(Schema.toCodecJson(TagHistoryImported))(payload)
+        const state = Tag.definition.evolve.TagHistoryImported(Tag.definition.initial, decoded)
+        expect(state).toEqual({ name: "historical", scope: "user:alice", removed: false })
+        yield* sql`INSERT INTO echo_events VALUES ('Tag','imported',1,${sql.json(payload)},'trusted-import','operator',now())`
+        yield* sql`INSERT INTO echo_streams VALUES ('Tag','imported','user:alice',1,${sql.json(state)})`
+        const remove: Wire.ExecuteRequest = {
+          epoch: first.epoch,
+          clientId: "device",
+          batches: [
+            {
+              id: "remove-imported",
+              commands: [{ aggregate: "Tag", command: { _tag: "RemoveTag", target: "imported" } }]
+            }
+          ]
+        }
+        expect((yield* server.execute(alice, remove)).receipts[0]).toMatchObject({
+          _tag: "Accepted",
+          seqs: [{ id: "imported", seq: 2 }]
+        })
+        expect(yield* sql`SELECT state FROM echo_streams WHERE id='imported'`).toEqual([
+          { state: { name: "historical", scope: "user:alice", removed: true } }
+        ])
+        expect(yield* sql`SELECT seq,payload FROM echo_events WHERE id='imported' ORDER BY seq`).toEqual([
+          { seq: 1, payload },
+          { seq: 2, payload: { _tag: "TagRemoved" } }
+        ])
+
+        // An untyped domain returning a registered historical event still cannot bypass command output validation.
+        // oxlint-disable-next-line typescript/no-extraneous-class -- preserve the aggregate constructor contract at the erased domain boundary
+        const invalid: Aggregate.Any = Object.assign(class {}, {
+          kind: Tag.kind,
+          tag: Tag.tag,
+          definition: { ...Tag.definition, decide: { ...Tag.definition.decide, DefineTag: () => [imported] } }
+        })
+        const invalidServer = yield* Server.make({ aggregates: [invalid, Note] }).pipe(
+          Effect.provideService(PgClient.PgClient, sql)
+        )
+        expect((yield* Effect.exit(invalidServer.execute(alice, request("illegal-import"))))._tag).toBe("Failure")
+        expect(yield* sql`SELECT * FROM echo_events WHERE id='illegal-import'`).toHaveLength(0)
+        expect(yield* sql`SELECT * FROM echo_receipts WHERE batch_id='illegal-import'`).toHaveLength(0)
       })
     )
   )

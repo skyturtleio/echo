@@ -1,8 +1,10 @@
+import * as Arr from "effect/Array"
 import type * as DateTime from "effect/DateTime"
 import * as Option from "effect/Option"
 import * as Record from "effect/Record"
 import type * as Schema from "effect/Schema"
 import type * as Command from "./Command.ts"
+import type * as Event from "./Event.ts"
 import type * as Index from "./Indexes.ts"
 import type { Bivariant } from "./internal/classes.ts"
 import type { Principal, Scope } from "./Scope.ts"
@@ -42,7 +44,8 @@ export interface Definition<
   Id extends Index.IdSchema,
   S extends Schema.Top,
   C extends ReadonlyArray<Command.Any>,
-  X extends Index.Spec<S["Type"]>
+  X extends Index.Spec<S["Type"]>,
+  E extends ReadonlyArray<Event.Any> = readonly []
 > {
   /** Schema of the stream id. */
   readonly id: Id
@@ -52,6 +55,8 @@ export interface Definition<
   readonly initial: S["Type"]
   /** Every command this aggregate handles, each declaring the events it records. */
   readonly commands: C
+  /** Additional historical events this aggregate folds, not outputs authorized for any command. */
+  readonly events?: E
   /** Which scope the stream is visible in, from its state; `null` while it has no state (design §1). */
   readonly scope: (state: S["Type"]) => Scope | null
   /** The indexes built over this state, from {@link Index.make}. */
@@ -69,7 +74,10 @@ export interface Definition<
   }
   /** One pure, total handler per event: folds it into state. */
   readonly evolve: {
-    readonly [T in EventsOf<C>["tag"]]: (state: S["Type"], event: InstanceOf<ByTag<EventsOf<C>, T>>) => S["Type"]
+    readonly [T in (EventsOf<C> | E[number])["tag"]]: (
+      state: S["Type"],
+      event: InstanceOf<ByTag<EventsOf<C> | E[number], T>>
+    ) => S["Type"]
   }
 }
 
@@ -79,6 +87,7 @@ export interface AnyDefinition {
   readonly state: Schema.Top
   readonly initial: unknown
   readonly commands: ReadonlyArray<Command.Any>
+  readonly events?: ReadonlyArray<Event.Any>
   readonly scope: Bivariant<[state: unknown], Scope | null>
   readonly indexes: { readonly [name: string]: Index.Any }
   readonly decide: {
@@ -99,7 +108,12 @@ export type IdOf<A extends Any> = A["definition"]["id"]["Type"]
 export type StateOf<A extends Any> = A["definition"]["state"]["Type"]
 export type CommandsOf<A extends Any> = A["definition"]["commands"][number]
 export type CommandInstance<A extends Any> = InstanceOf<CommandsOf<A>>
-export type EventInstance<A extends Any> = InstanceOf<EventsOf<A["definition"]["commands"]>>
+export type EventInstance<A extends Any> = A extends Any
+  ? InstanceOf<
+      | EventsOf<A["definition"]["commands"]>
+      | ("events" extends keyof A["definition"] ? NonNullable<A["definition"]["events"]>[number] : never)
+    >
+  : never
 
 /** The class type returned by {@link make}: the definition plus one static per index (`Note.by_tag`). */
 export type AggregateClass<
@@ -107,11 +121,12 @@ export type AggregateClass<
   Id extends Index.IdSchema,
   S extends Schema.Top,
   C extends ReadonlyArray<Command.Any>,
-  X extends Index.Spec<S["Type"]>
+  X extends Index.Spec<S["Type"]>,
+  E extends ReadonlyArray<Event.Any> = readonly []
 > = {
   readonly kind: "Aggregate"
   readonly tag: Name
-  readonly definition: Definition<Id, S, C, X>
+  readonly definition: Definition<Id, S, C, X, E>
   new (): object
 } & Index.Set<Id, S, X>
 
@@ -126,11 +141,23 @@ export const make = <
   Id extends Index.IdSchema,
   S extends Schema.Top,
   const C extends ReadonlyArray<Command.Any>,
-  const X extends Index.Spec<S["Type"]>
+  const X extends Index.Spec<S["Type"]>,
+  const E extends ReadonlyArray<Event.Any> = readonly []
 >(
   name: Name,
-  definition: Definition<Id, S, C, X>
-): AggregateClass<Name, Id, S, C, X> => {
+  definition: Definition<Id, S, C, X, E>
+): AggregateClass<Name, Id, S, C, X, E> => {
+  const events = new Map<string, Event.Any>()
+  for (const event of [
+    ...Arr.flatMap(definition.commands, (command) => command.events),
+    ...(definition.events ?? [])
+  ]) {
+    const existing = events.get(event.tag)
+    if (existing !== undefined && existing !== event) {
+      throw new Error(`event ${event.tag} has conflicting schemas in ${name}`)
+    }
+    events.set(event.tag, event)
+  }
   // oxlint-disable-next-line typescript/no-extraneous-class -- a class so an app writes `class Note extends Domain.Aggregate(...)`, as with every other block
   class Aggregate {
     static readonly kind = "Aggregate" as const

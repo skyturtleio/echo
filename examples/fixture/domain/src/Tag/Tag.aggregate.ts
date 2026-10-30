@@ -7,6 +7,7 @@ import { NoSuchTag, RemoveTag, TagInUse, TagRemoved } from "./RemoveTag.command.
 import { TagId } from "./Tag.id.ts"
 import { TagIndexes } from "./Tag.indexes.ts"
 import { TagState } from "./Tag.state.ts"
+import { TagHistoryImported } from "./TagHistoryImported.event.ts"
 
 /**
  * One stream per tag, in a member's private scope or in the `catalog:tags` scope the server
@@ -18,6 +19,7 @@ export class Tag extends Domain.Aggregate("Tag", {
   state: TagState,
   initial: null,
   commands: [DefineTag, RemoveTag],
+  events: [TagHistoryImported],
   scope: (state) => state?.scope ?? null,
   indexes: TagIndexes,
   decide: {
@@ -34,6 +36,7 @@ export class Tag extends Domain.Aggregate("Tag", {
     }
   },
   evolve: {
+    TagHistoryImported: (_, event) => event.snapshot,
     TagDefined: (_, { name, scope }) => ({ name, scope, removed: false }),
     TagRemoved: (state) => (state === null ? state : { ...state, removed: true })
   }

@@ -4,10 +4,18 @@ import { idea, ideaAgain, member, noteId, otherNoteId, todo } from "../fixtures.
 import { Note } from "../Note/Note.aggregate.ts"
 import { NoteWritten } from "../Note/WriteNote.command.ts"
 import { DefineTag, DuplicateName, TagDefined } from "./DefineTag.command.ts"
-import { RemoveTag, TagInUse } from "./RemoveTag.command.ts"
+import { RemoveTag, TagInUse, TagRemoved } from "./RemoveTag.command.ts"
 import { Tag } from "./Tag.aggregate.ts"
+import { TagHistoryImported } from "./TagHistoryImported.event.ts"
 
 const { catalogScope, privateScope, ScopeForbidden } = Domain.Scope
+
+Story.make(Tag, "an imported snapshot can be removed by its owner", {
+  given: [new TagHistoryImported({ snapshot: { name: "historical", scope: privateScope(member), removed: false } })],
+  when: new RemoveTag({ target: idea }),
+  as: member,
+  then: [new TagRemoved()]
+})
 
 // A read over the command's own aggregate's index, for a uniqueness check.
 Story.make(Tag, "a second tag with the same name is refused", {

@@ -195,7 +195,8 @@ behaviour adds or amends an item here in the same branch.
    their `events`, so the checker reports a missing or misspelt handler, types each handler's
    command and its return, and the runner and engine look a handler up without evaluating a
    match. Rejected: `Match.valueTags`, which needs the union assembled at the call site and
-   gives one return type for all branches.
+   gives one return type for all branches. Additional aggregate `events` also contribute
+   evolution handlers and historical Story inputs (item 21), never command outputs.
 8. **`ScopeForbidden`, `Principal`, `Scope` and the pre-grants rule live in `echo/domain`**
    (Phase 0, 2026-10-29), not in an engine module. Writing the ownership story showed the check
    is the same for every aggregate and depends only on `scope(state)` and the principal's
@@ -332,6 +333,20 @@ behaviour adds or amends an item here in the same branch.
     Rejected: persistent diagnostic history, payload logging, a telemetry backend, approximate
     byte metrics, and new journal metadata solely for diagnostics.
 
+21. **Aggregates may register additional historical event schemas** (2026-10-30).
+    Optional `events` supplements command-declared events for `evolve`, `EventInstance`
+    and Story seeds; command decisions and Execute still allow only that command's events.
+    The complete codec inventory is both sources. Repeated references to the same schema
+    are allowed; distinct schemas with the same tag in one aggregate fail construction,
+    including command-only collisions. This tightens previously ambiguous declarations.
+    Trusted one-time imports may record a truthful snapshot-import fact at sequence 1,
+    preserving historical audit fields in its payload and actual import actor/time in its
+    envelope; cached state must equal the fold from initial. The app retains the historical
+    codec and evolution handler permanently. Registration supplies neither an importer nor
+    automatic replay/versioning. Rejected: noninitial private state without events, invented
+    historical business actions, and a wire-addressable import command merely to register
+    its event. Catalogs retain their explicit state-only exception.
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -347,6 +362,8 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
 
 - **INV-SERVER-1:** Accepted and rejected batches are atomic and deduplicated under the
   authenticated principal, client id and batch id; retrying cannot append events twice.
+  A stream initialized by a registered historical event accepts subsequent ordinary events;
+  registration alone never authorizes a command to emit that historical event.
 - **INV-SERVER-2:** Concurrent decisions serialize, including declared index reads; two
   claims for the same visible unique value cannot both be accepted.
 - **INV-SERVER-3:** Writes require the principal's private scope; declared reads see private

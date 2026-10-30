@@ -25,7 +25,7 @@ export type Decision<C extends Command.Any> =
   | InstanceOf<C["rejects"][number]>
 
 /**
- * What `decide` sees besides its stream's state and the command (design §4, §15). `read`
+ * What `decide` sees besides its stream's state and the command (design §1). `read`
  * answers from the streams the principal may see: another stream by id (`null` when it does
  * not exist or is not visible) or every visible stream an index holds under a value.
  */
@@ -51,7 +51,7 @@ export interface Definition<
   readonly initial: S["Type"]
   /** Every command this aggregate handles, each declaring the events it records. */
   readonly commands: C
-  /** Which scope the stream is visible in, from its state; `null` while it has no state (design §7). */
+  /** Which scope the stream is visible in, from its state; `null` while it has no state (design §1). */
   readonly scope: (state: S["Type"]) => Scope | null
   /** The indexes built over this state, from {@link Index.make}. */
   readonly indexes: Index.Set<Id, S, X>
@@ -118,7 +118,7 @@ const owners = new WeakMap<Index.Any, Any>()
 
 /**
  * One kind of stream. A stream is `Name/id`; its state is `initial` folded through `evolve`
- * over its events; a command on it runs `decide` against that state (design §4).
+ * over its events; a command on it runs `decide` against that state (design §1).
  */
 export const make = <
   const Name extends string,

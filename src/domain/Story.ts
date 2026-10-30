@@ -74,7 +74,7 @@ const fold = (aggregate: Aggregate.Any, events: ReadonlyArray<SomeEvent>): unkno
   })
 
 /**
- * Runs one story (design §15): folds `given` through `evolve`, checks the principal may write
+ * Runs one story (design §2 item 10): folds `given` through `evolve`, checks the principal may write
  * the target stream's scope, runs `decide` once with a `ctx` that reads only the seeded streams
  * the principal may see, and returns what `decide` (or the scope check) answered. Pure: no
  * clock, no engine, no database.

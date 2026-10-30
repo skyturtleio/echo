@@ -14,6 +14,6 @@ export class RemoveTask extends Domain.Command("RemoveTask", {
   target: TaskId,
   events: [TaskRemoved],
   rejects: [TaskInUse, NoSuchTask],
-  /** In-use is a read over the entries, not a counter the app maintains (design §14 item 2). */
+  /** In-use is a read over the entries, not a counter the app maintains (design §2 item 2). */
   reads: [Entry.by_task]
 }) {}

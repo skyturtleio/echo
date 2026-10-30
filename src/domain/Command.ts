@@ -15,7 +15,7 @@ export type Instance<Tag extends string, Target extends Index.IdSchema, F extend
 
 /**
  * What a command declares it reads besides its own stream: another aggregate by id, or an
- * index of any aggregate, including its own (design §14 item 2). The runner refuses a read
+ * index of any aggregate, including its own (design §2 item 2). The runner refuses a read
  * that is not declared, so the declaration is checked before any engine exists.
  */
 export type Read = Aggregate.Any | Index.Any
@@ -51,7 +51,7 @@ export interface Any extends Schema.Top {
 /**
  * A request to change one stream. It names the stream (`target`), carries its input, and
  * declares the events it may record, the rejections it may return and the other streams its
- * `decide` reads. `authority` (design §4) is not part of Phase 0: every command runs on both
+ * `decide` reads. `authority` (design §1) is not part of Phase 0: every command runs on both
  * the device and the server.
  */
 export const make = <

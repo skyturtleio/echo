@@ -8,7 +8,7 @@ import { CreateProject, DuplicateCode, ProjectAlreadyCreated, ProjectCreated } f
 
 /**
  * One stream per project. A member's own projects live in their private scope; the shared
- * catalog (`catalog:projects`) is written by the server only (design §7).
+ * catalog (`catalog:projects`) is written by the server only (design §1).
  */
 export class Project extends Domain.Aggregate("Project", {
   id: ProjectId,

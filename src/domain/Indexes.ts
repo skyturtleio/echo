@@ -19,7 +19,7 @@ export type Spec<S> = { readonly [name: string]: ReadonlyArray<KeysOf<S>> }
 /**
  * One index over an aggregate's state: the client replica and the server both build it over
  * the named state fields, queries use it, and `decide` reads other streams through it
- * (design §4, §6, §14 item 2).
+ * (design §1, §2 item 2).
  */
 export interface Index<Id extends IdSchema, S extends Schema.Top, Fields extends ReadonlyArray<string>> {
   readonly kind: "Index"

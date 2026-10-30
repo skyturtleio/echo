@@ -12,7 +12,7 @@ import { TimesOutOfOrder } from "./TimesOutOfOrder.rejection.ts"
 /**
  * One stream per timesheet entry, in its member's private scope. Who may amend or delete it is
  * not decided here: the engine refuses a command on a stream whose scope the principal cannot
- * write before `decide` runs (design §15, story 5).
+ * write before `decide` runs (design §2 item 8).
  */
 export class Entry extends Domain.Aggregate("Entry", {
   id: EntryId,

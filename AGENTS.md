@@ -2,8 +2,8 @@
 
 Echo is an aggregate-based, offline-first sync engine for Effect v4 and FoldKit: the UI never
 waits for the network, writes work offline, and the server is authoritative. Read
-`docs/design.md` first; it is the design (why each decision was taken and what was rejected,
-§14) and the phase plan (§15). Its §16 is the working rules summarised here.
+`docs/design.md` first; it is the model (§1), the decisions (§2, why and what was rejected),
+the invariants catalogue (§3), the phase plan (§4) and the working rules (§5) summarised here.
 
 ## Not references
 
@@ -23,7 +23,7 @@ in `node_modules/effect/src/**` and `node_modules/@effect/*`.
 
 - The repository root is the package (`echo`), consumed as a git dependency pinned to a
   commit SHA; it ships TypeScript source, no build step, no npm publish.
-- Planned entry points (design §4, §5, §6, §11): `echo/domain` (the building blocks an app's
+- Planned entry points (design §1): `echo/domain` (the building blocks an app's
   domain package is written against: `Aggregate`, `Command`, `Event`, `Rejection`, `Story`,
   `Policy`, `Batch`), `echo/server` (Postgres, `Execute`/`Pull`/`Changes`), `echo/client`
   (leader worker, journal, replica cache, effective state, rebase, queries),
@@ -46,26 +46,26 @@ in `node_modules/effect/src/**` and `node_modules/@effect/*`.
 
 ## Tests
 
-Two kinds exist, and nothing else (design §16):
+Two kinds exist, and nothing else (design §5):
 
 - A `Story` for a domain rule: *given* events, *when* command (*as* principal), *then* events
   or rejection. Stories live with the aggregate they test. They are the specification of app
   rules; there is no prose version.
 - A scenario for an engine invariant, named after the failure it catches and citing its
-  `INV-<AREA>-<n>` id from the invariants catalogue (`docs/invariants.md`, written per phase
-  before the code). One scenario per invariant. Scenarios are story-shaped where they can be:
+  `INV-<AREA>-<n>` id from the invariants catalogue (design §3, written per phase before the
+  code). One scenario per invariant. Scenarios are story-shaped where they can be:
   seed events on the server, act from a device, assert state after sync or rebase.
 
 No per-function unit tests, no snapshot tests, no test whose expected value was read off the
 implementation. Before keeping a test, name the plausible wrong implementation that fails it;
-if there is none, delete the test. `bun run check` rejects a test block whose name cites no
-`INV` id and is not a `Story`.
+if there is none, delete the test. From phase 1, `bun run check` rejects a test block whose
+name cites no existing `INV` id and is not a `Story`.
 
 ## Workflow
 
 - Work on a `ws/<name>` branch. Commit in logical steps.
-- A change to engine behaviour is a design change: update `docs/design.md` (§14 decision with
-  date, reason and rejected alternative) and the invariants catalogue in the same branch.
+- A change to engine behaviour is a design change: update `docs/design.md` (a §2 decision with
+  date, reason and rejected alternative, and the §3 catalogue) in the same branch.
 - Before merging, get an independent review of the diff (a reviewing subagent or a second
   model), address its findings, and list in your report the `INV` ids and stories you tested.
 - To land: `git fetch`, rebase linearly onto `origin/main`, run `bun run check` and the

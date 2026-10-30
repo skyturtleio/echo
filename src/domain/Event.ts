@@ -25,7 +25,7 @@ export interface Any extends Schema.Top {
 
 /**
  * A business-named fact recorded on one stream (`EntryLogged`, not `EntryUpdated`). Events
- * carry computed outcomes; `evolve` only applies them. Versioning (design §9) is not part of
+ * carry computed outcomes; `evolve` only applies them. Versioning (design §1) is not part of
  * Phase 0; an event class is its tag alone until it is.
  */
 export const make = <const Tag extends string, const F extends Fields>(tag: Tag, fields: F): EventClass<Tag, F> =>

@@ -1,5 +1,5 @@
 /**
- * `echo/domain`: the building blocks an app's domain package is written against (design §4).
+ * `echo/domain`: the building blocks an app's domain package is written against (design §1).
  * Every block is `Domain.<Noun>(...)` and its types live on the same name
  * (`Domain.Event.Any`, `Domain.Aggregate.StateOf<typeof Entry>`), as in Alchemy.
  *
@@ -9,7 +9,7 @@
  * export class EntryDeleted extends Domain.Event("EntryDeleted", {}) {}
  * ```
  *
- * `Policy`, `Batch`, command `authority` and versioning (design §4, §9) arrive with the phases
+ * `Policy`, `Batch`, command `authority` and versioning (design §1) arrive with the phases
  * that need them; no Phase 0 story did.
  */
 import * as AggregateModule from "./Aggregate.ts"
@@ -63,7 +63,7 @@ export declare namespace Aggregate {
 /** One kind of stream: state, scope, indexes, `decide` and `evolve`. See {@link AggregateModule.make}. */
 export const Aggregate = AggregateModule.make
 
-/** Principals, scopes, the Phase 0 grant rule and the engine's `ScopeForbidden` (design §7). */
+/** Principals, scopes, the Phase 0 grant rule and the engine's `ScopeForbidden` (design §1). */
 export * as Scope from "./Scope.ts"
 
 /** The pure story runner; `echo/domain/testing` binds it to vitest. */

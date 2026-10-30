@@ -7,7 +7,7 @@ export { run, StoryError } from "../Story.ts"
 
 /**
  * Registers a story as a vitest test: *given* events, *when* command, *as* principal, *then*
- * events or rejection (design §15, §16). The test fails when `decide` answers something else.
+ * events or rejection (design §1, §5). The test fails when `decide` answers something else.
  */
 export const make = <A extends Aggregate.Any, W extends Aggregate.CommandInstance<A>>(
   aggregate: A,

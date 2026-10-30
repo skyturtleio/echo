@@ -1,766 +1,305 @@
-# Echo — an aggregate-based, offline-first sync engine for Effect + FoldKit
+# Echo — an aggregate-based, offline-first sync engine for Effect v4 + FoldKit
 
-Status: design, 2026-10-29. Greenfield; this repository (`skyturtleio/echo`, package `echo`)
-replaces `skyturtleio/echo-sync`, whose code and SPEC are the previous design and are not
-references for this one (§16).
-Sources were read at these revisions: `alchemy-run/alchemy` 383d8e8 (`packages/domain`,
-`examples/cloudflare-domain`, the local-first and FoldKit docs), `yielded-dev/sync` f32c24a,
-`mac-monet/effect-domain` e0ab708, Effect v4 `effect/eventlog` (4.0.5),
-and the owner's two apps, a shared one and a single-user one (private products whose domains
-stay in their own repositories; stand-ins under `examples/` take their place here, §12).
+Status: design, 2026-10-29; cut to its four jobs 2026-10-30 (§2 item 13). This repository
+(`skyturtleio/echo`, package `echo`) replaces `skyturtleio/echo-sync`, whose code and SPEC
+are the previous design and are not references (§5). The vocabulary is `@alchemy.run/domain`'s.
 
-## 1. The problem, in Alchemy's own terms
+This document has four jobs and nothing else: the **model** (§1, what the engine is), the
+**decisions** (§2, why, with what each was chosen over), the **invariants catalogue** (§3, what
+a rule-abiding engine promises, one scenario test each), the **phases** (§4) and the **working
+rules** (§5). App rules are not described here; they are `Story` tests in each app's domain
+package.
 
-Alchemy's local-first page sorts every approach by two questions: **who decides** whether a
-write is accepted (the device or the server), and **whether the device keeps the server's
-state** locally.
+## 1. Model
 
-| | server state stays on the server | device keeps a copy of server state |
-|---|---|---|
-| **server decides** | optimistic update (Alchemy: `Aggregate.predict`) | **offline-capable, server-authoritative: this engine** |
-| **device decides** | offline intents (Alchemy: queued commands) | device-decides logs: Effect `eventlog`, LiveStore |
+**Who decides.** The server is authoritative and the device keeps a copy of the server's state.
+Every rule is a pure `decide(state, command, ctx) → events | rejection` that runs on **both**
+sides: the device runs it to answer immediately and offline, the server runs it to give the
+final answer, and the device **rebases** its pending intents whenever confirmed state moves.
+Device-decides logs (Effect `eventlog`, LiveStore) cannot refuse a write, and online-first
+engines cannot write before their first sync; this design is the remaining quadrant.
 
-Alchemy ships the top-left and bottom-left and says about the top-right: *"a local copy of
-the server's aggregates … takes a sync engine that keeps the server's state apart from
-pending changes and recomputes everything whenever the server's state moves.
-`@alchemy.run/domain` doesn't include one."* That sentence is this engine's job description.
+**Domain package.** An app is a domain package (one block per file, a folder per aggregate,
+importing only `effect` and `echo/domain`) plus thin server and client wiring. The blocks:
 
-The bottom-right is tempting (Effect's own `eventlog` lives there) but fails the requirements:
-there is no server-side `decide`, so nothing can refuse a write. The shared app needs "a chore
-is claimed by one housemate" and "a household has no more members than seats" to hold even when
-every housemate was offline; the single-user app needs "no two of my reference rows share a code" to hold
-across its own devices. Those are server-authoritative rules.
-`yielded-dev/sync` is top-left and cannot write before its first sync. So: aggregates with a
-pure `decide` that runs on **both** sides, the server's answer is final, and the device
-**rebases** its pending intents whenever confirmed state moves.
-
-In the words of Hologram's [three meanings of local-first](https://hologram.page/blog/local-first-means-three-different-things)
-(speed, offline, ownership): this engine is for **speed and offline with a server in charge**,
-the same choice Hologram, Zero and Jazz make. The UI never waits for the network; ownership
-(the device holds the only real copy, no server could say no) is explicitly not a goal. The
-article's cost list maps onto this design one to one: each client gets a slice (§7 scopes),
-old clients come back (§9 versioned commands and the compatibility floor), browser storage is
-not forever (§6: the journal is the only thing that must survive; the cache is disposable),
-and some actions should wait (`authority: "server"`).
-
-## 2. DDD in five words, with examples from the shared app
-
-You do not need DDD literature for this. You need five nouns and one habit. The examples are
-from the shared app's stand-in (§12): a household of housemates sharing chores, grouped in rooms.
-
-| Word | Meaning | Shared app |
-|---|---|---|
-| **Command** | A request, imperative, can be refused | `ClaimChore { choreId }` |
-| **Event** | A fact, past tense, never refused, never edited | `ChoreClaimed { by, at }` |
-| **Rejection** | A *named* reason a command was refused, part of the contract | `ClaimedByHousemate { by }` |
-| **Aggregate** | The smallest unit of state one rule must protect, with an id; all its commands are decided in order against the same state | `Chore`, `Household`, `Room` |
-| **View** (read model) | Anything computed from facts for reading; disposable, rebuildable | "Today", "Later", room lists |
-
-The habit: `decide(state, command) → events | rejection` holds every rule and is pure;
-`evolve(state, event) → state` applies a fact and is total (never fails). Events carry their
-outcome (`ChoreClaimed.at` is in the event, `evolve` never calls `now()`), so replaying them is
-deterministic.
-
-Why this matters for *sync* specifically, not just for tidiness:
-
-1. **The same pure `decide` runs on the device and the server.** "Offline conflict handling"
-   stops being a merge algorithm bolted on by the engine and becomes your rule, replayed.
-2. **The aggregate is the unit of ordering, idempotency, scope and conflict.** Two devices
-   claiming the same chore is resolved by whichever command the server decides first; no
-   vector clocks.
-3. **Rejections are schemas.** The UI shows "your housemate claimed it first" because it matched
-   `ClaimedByHousemate`, not because it parsed a string. Both apps already keep a table of
-   rejection codes with explanations; here the compiler enforces it.
-4. **Events are the audit log and the migration substrate** (§9).
-
-Both apps already do most of this: every rule sits in one handler shared by device and server,
-and the only server-only decisions are grant changes (create/join household, provisioning) and
-uniqueness checks that are authoritative only inside the server transaction. v2 gives that
-structure names and per-aggregate ordering; the rules themselves transfer almost verbatim.
-
-## 3. The model in one paragraph
-
-An app is a **domain package** (Alchemy's layout: one block per file, a folder per aggregate,
-imports only `effect` and the engine's `domain` entry) plus thin server and client wiring. Every
-write is a **batch** of commands, each addressed to one aggregate instance (a **stream**). The
-device decides the batch provisionally against *confirmed state ⊕ pending batches*, appends it
-to a durable **intent journal**, updates in-memory **effective state**, and re-emits affected
-queries. The server decides the same batch in one serializable transaction, appends the
-resulting events to each stream, writes a **receipt** keyed by the batch id (accepted *or*
-rejected), and publishes the events to the **scope log** of every scope the touched streams
-belong to. Devices pull scope logs by cursor; on every confirmed change the leader **rebases**:
-confirmed state advances, pending batches are re-decided in order (dropping ones whose receipt
-says rejected), effective state is recomputed and queries re-emit. Presence is a separate
-ephemeral channel keyed by scope.
-
-The sequence diagram in the thread reply shows this for two housemates claiming one chore.
-
-## 4. Building blocks (the domain package)
-
-Vocabulary and shapes are Alchemy's. The sketch below is what Phase 0 implemented in
-`src/domain` (2026-10-29) against the pinned Effect v4 source: `Domain.Event` and
-`Domain.Command` are `Schema.TaggedClass`, `Domain.Rejection` is `Schema.TaggedError`, every
-block carries `kind` and `tag` statics, and `decide`/`evolve` are objects of one handler per tag
-(§14 item 8). The `version` argument on events and `Command.authority` are not implemented yet;
-no Phase 0 story needed them (§9, phase 3b).
-
-```ts
-// Chore/ChoreClaimed.event.ts
-export class ChoreClaimed extends Domain.Event("ChoreClaimed", { by: UserId, at: Instant }) {}
-
-// Chore/ClaimedByHousemate.rejection.ts
-export class ClaimedByHousemate extends Domain.Rejection("ClaimedByHousemate", { by: UserId }) {}
-
-// Chore/ClaimChore.command.ts
-export class ClaimChore extends Domain.Command("ClaimChore", {
-  target: ChoreId,
-  events: [ChoreClaimed],
-  rejects: [ClaimedByHousemate, NotShared],
-  reads: [Room],                       // other streams `decide` may read (§8, §14 item 2)
-}) {}
-
-// Chore/Chore.indexes.ts — declared apart from the aggregate so a command can name one in `reads`
-export const ChoreIndexes = Domain.Index(ChoreId, ChoreState, { by_room: ["roomId"], by_day: ["scheduledDay"] })
-
-// Chore/Chore.aggregate.ts
-export class Chore extends Domain.Aggregate("Chore", {
-  id: ChoreId,
-  state: ChoreState,                       // Schema; `null` while the stream has no events
-  initial: null,
-  commands: [CreateChore, EditChore, ClaimChore, ReleaseClaim, CompleteChore, MoveChore, DeleteChore],
-  scope: (state) => state?.accessScopeId ?? null,  // which scope this stream is visible in (§7)
-  indexes: ChoreIndexes,                   // also reachable as `Chore.by_room`
-  decide: {                               // one pure handler per command; the checker lists a missing one
-    ClaimChore: (state, cmd, ctx) =>
-      state.visibility !== "shared" ? new NotShared() :
-      state.claimedBy !== null && state.claimedBy !== ctx.principal ? new ClaimedByHousemate({ by: state.claimedBy }) :
-      [new ChoreClaimed({ by: ctx.principal, at: ctx.now })],
-    ...
-  },
-  evolve: {                               // one total handler per event
-    ChoreClaimed: (state, { by }) => ({ ...state, claimedBy: by }),
-    ...
-  },
-}) {}
-```
-
-`NotYourChore` is not in the sketch on purpose: who may write a stream is decided once by the
-engine from `scope(state)` and the principal's grants, and a story asserts
-`Domain.Scope.ScopeForbidden` (§15, story 5; §14 item 9). `Domain.Scope` also holds `Principal`,
-`Scope`, `privateScope`, `catalogScope` and the Phase 0 grant rule (own private scope: read and
-write; `catalog:*`: read), which the grants aggregate replaces in phase 3b.
-
-What is **kept from Alchemy** unchanged: `Event`, `Rejection`, `Command`
-(`target/input/events/rejects/reply`), `Aggregate` (`decide/evolve/initial`), `Envelope`
-(`id, stream, seq, at, commandId, correlationId`), `RequestContext` (a schema-encoded principal
-that travels with the command into `decide`), `Policy` (server-side reaction to events), and
-`Story` tests (*given* events, *when* command, *then* events or rejection), which run the same
-code the device and server run and are the proof that "same rule everywhere" holds.
-
-What is **added**, because Alchemy stops at the server boundary:
-
-| Addition | Why |
+| Block | Shape |
 |---|---|
-| `Aggregate.scope(state)` | Visibility is a property of the stream, derived from state, so "move a chore to the household" is an ordinary event (§7). |
-| `Aggregate.indexes` | The client replica and the server both build these over state fields; queries use them (§6). |
-| `Command.authority: "both" \| "server"` | A few commands may run only on the server (grants, invites, provisioning). The device journals them without predicting. |
-| `ctx.read` in `decide` | Read-only access to *other* streams' current state in the same batch, for uniqueness and in-use checks (§8). Alchemy would model each as its own aggregate; we allow reads because the server transaction is serializable and the device re-decides on every rebase anyway. |
-| `Batch` | Several commands committed atomically with one id. The shared app's rank renormalisation touches many rows; its `changes.apply` is a batch. |
-| `version` on events, state and commands, with upcasters | Alchemy has none; we need a non-painful migration story (§9). |
-| Receipts for **rejected** batches | Alchemy stores none; yielded's lesson is that a retried command must get the same answer it got the first time. |
-| Client-side `rebase` | The thing Alchemy says it doesn't include. |
+| `Event` | `Schema.TaggedClass`; a fact, past tense, carries its computed outcome (`at` is in the event, `evolve` never calls `now()`) |
+| `Rejection` | `Schema.TaggedError`; a *named* reason a command was refused, part of the contract, matched by the UI, never a string |
+| `Command` | `Schema.TaggedClass` with `target` (stream id), `input`, the `events` it may produce, the rejections it may `reject` with, the other streams or indexes `decide` may `read` (§2 item 2), and later `authority: "both" \| "server"` |
+| `Aggregate` | `id`, `state` schema (`null` while the stream has no events), `initial`, `commands`, `scope(state)`, `indexes`, `decide` and `evolve` as one handler per tag (§2 item 7) |
+| `Index` | `Domain.Index(id, state, spec)`, field lists over state, bound to the aggregate and exposed as statics (§2 item 9) |
+| `Scope` | `Principal`, `Scope` (opaque id), `privateScope`, `catalogScope`, the pre-grants rule, and `ScopeForbidden` (§2 item 8) |
+| `Story` | the domain test: *given* events (one stream, or several keyed `Aggregate/id`), *when* command, *as* principal, *then* events or rejection; pure runner in `echo/domain`, vitest binding in `echo/domain/testing` (§2 item 10) |
+| `Policy`, `Batch`, versioning | server-side reaction to events; several commands committed atomically under one id; `(name, version)` on events, state and commands with upcasters. Not built yet (§4) |
 
-Rules of the domain package, copied from Alchemy's skill because they are exactly the ones a
-sync engine needs: `decide` is pure, `evolve` is total, events carry computed outcomes,
-events are business-named (`ChoreClaimed`, not `ChoreUpdated`), no `now()` or random ids inside
-`evolve`, cross-aggregate invariants get their own aggregate keyed by what they protect (or,
-here, a `ctx.read` plus the server transaction).
+`decide` is pure and sees only its stream's state, the command and `ctx = { principal, now,
+read }`; `evolve` is total; events are business-named; nothing in `evolve` reads a clock or
+makes an id. `ctx.now` is the server's clock on the server and the device's on the device; the
+confirmed event's `at` is what everyone converges on, so no rule orders by `now`.
 
-## 5. Server
+**Write path.** Every write is a **batch** of commands, each addressed to one **stream**
+(aggregate instance). The device decides the batch against *confirmed state ⊕ pending
+batches*, appends it to a durable **journal**, updates in-memory **effective state** and
+re-emits affected queries, without consulting connectivity. The server decides the same batch
+in one `SERIALIZABLE` transaction, appends the events to each stream, writes a **receipt**
+keyed by batch id (accepted *or* rejected), and publishes to the **scope log** of each touched
+scope. Devices pull scope logs by cursor; on every confirmed change the leader rebases:
+confirmed state advances, pending batches are re-decided in journal order (a batch that now
+rejects becomes a notice), effective state is recomputed, queries re-emit. Because `decide` is
+pure and pending batches are few, full replay is the whole algorithm; no merge logic lives in
+the engine.
 
-Postgres, one schema. Tables (sketch; `jsonb` payloads encoded with the Effect schemas):
+**Server (Postgres, one schema).**
 
 | Table | Key | Holds |
 |---|---|---|
-| `streams` | `(aggregate, id)` | `scope`, `seq`, `state`, `state_version` — a cache of `fold(evolve, events)` |
-| `events` | `(aggregate, id, seq)` | `name`, `version`, `payload`, `batch_id`, `principal`, `at` — append-only |
-| `receipts` | `(client_id, batch_id)` | `Accepted {seqs}` or `Rejected {rejection}` or expired; `expires_at` |
+| `streams` | `(aggregate, id)` | `scope`, `seq`, `state`, `state_version`: a cache of `fold(evolve, events)` |
+| `events` | `(aggregate, id, seq)` | `name`, `version`, `payload`, `batch_id`, `principal`, `at`; append-only |
+| `receipts` | `(client_id, batch_id)` | `Accepted {seqs}` \| `Rejected {rejection}` \| expired; `expires_at` |
 | `scope_log` | `(scope, position)` | `Upsert {stream, seq, state}` \| `Event {stream, seq, event}` \| `Gone {stream}` |
-| `grants` | `(scope, principal)` | `reader \| writer \| owner` |
-| `policy_outbox` | `(event ref)` | events awaiting server-side policies, at-least-once |
-| `engine` | singleton | `epoch` (authority generation, see below) |
+| `grants` | `(scope, principal)` | `reader \| writer \| owner`, derived from the `Scope` aggregate's events |
+| `policy_outbox` | `(event ref)` | events awaiting policies, at-least-once |
+| `engine` | singleton | `epoch` |
 
-**Execute** (`Rpc Execute { clientId, batches: [{ batchId, commands }] }`), per batch, one
-`SERIALIZABLE` transaction, retried on serialization failure:
+`Execute { clientId, batches }`, per batch, one serializable transaction retried on
+serialization failure: resolve the principal from the session (an app-provided layer; nothing
+in the body is trusted for identity); return the existing receipt if `(clientId, batchId)` has
+one; for each command load the stream, require a writer grant on `scope(state)` (or the
+creation scope of a new stream) and that `authority` allows the server, run `decide`, on a
+rejection abort the batch and write a `Rejected` receipt, else `evolve`, bump `seq`, append;
+then write `streams`, write `Gone`+`Upsert` when the scope changed or the events otherwise,
+write the `Accepted` receipt, queue for policies, poke connected devices holding a touched
+scope.
 
-1. Resolve the principal from the session (an app-provided layer; Logto for both apps) into a
-   `RequestContext`. Nothing from the client body is trusted for identity.
-2. If `receipts(clientId, batchId)` exists, return it. Idempotent under retry, including for
-   rejections.
-3. For each command in order: load the stream (`state`, `seq`); require a `writer`/`owner`
-   grant on `scope(state)` (or the command's declared creation scope for a new stream) and that
-   `authority` allows the server; run `decide` with `ctx = { principal, now, read }`; on a
-   rejection, abort the whole batch and write a `Rejected` receipt. On events: `evolve`, bump
-   `seq`, append to `events`.
-4. Write `streams`; if `scope(before) ≠ scope(after)` write `Gone` to the old scope's log and
-   `Upsert` to the new one, else write the events to the scope's log. Write the `Accepted`
-   receipt. Queue the events for policies.
-5. Reply with the receipt and poke every connected device whose grants cover a touched scope.
+`Pull { cursors }` returns, for every scope the principal holds, entries after the cursor; an
+unseen scope starts at 0. The scope log is compacted: below a moving watermark only the latest
+`Upsert` per stream survives, so a fresh device gets snapshot + tail, never history, and a
+device whose cursor fell below the watermark re-pulls from 0 with its journal untouched.
 
-**Pull** (`Rpc Pull { cursors: { [scope]: position } }` and a long-lived `Changes` stream for
-pokes): for every scope the principal is granted, return entries after the cursor. A scope the
-device has never seen starts at 0. The scope log is **compacted** like a log-compacted topic:
-below a moving watermark only the latest `Upsert` per stream survives, so a fresh device (or a
-catalog of tens of thousands of rows) gets *snapshot + tail*, never history. A device whose cursor fell
-below the watermark re-pulls from 0; its journal is untouched.
+**Transport** is plain HTTP over `effect/rpc`: `Execute` and `Pull` are request/response;
+`Changes` is one long-lived streaming response per leader carrying only pokes and presence,
+never data, with an inert server keepalive about every 25 s and client reconnect after about
+twice that. Correctness lives in cursors and `Pull`; the stream only shortens latency. No
+WebSockets, no client polling (§2 item 6).
 
-**Transport.** Plain HTTP, no WebSockets: `Execute` and `Pull` are request/response, and
-`Changes` is one long-lived streaming response per leader (the server-sent-events pattern;
-over `effect/rpc` with NDJSON it is the same thing without the `EventSource` API, and it runs
-in a worker). The stream carries only *pokes* ("something changed in a scope you hold") and
-presence fan-out; it never carries data, so losing it loses nothing. Correctness lives in
-cursors and `Pull`; the stream only shortens latency, which is what makes flaky networks
-harmless: a dropped stream reconnects and its first poke triggers a pull from the cursor. One
-stream per leader, not per tab, keeps HTTP/1.1's six-connection limit out of the picture.
+**Authority epoch.** `engine.epoch` changes on restore-from-backup or operator reset. Every
+reply carries it; a device holding another epoch gets `ResyncRequired`, discards cache and
+cursors, keeps its journal, re-pulls and rebases.
 
-The stream needs a liveness signal because a TCP connection that died silently behind a proxy
-looks exactly like "nothing changed", and idle proxies close connections after about a
-minute. The server therefore writes a tiny keepalive (an SSE comment line or a `Heartbeat`
-element) every ~25 s on each open stream. This is the one periodic thing in the design and it
-is deliberately inert: a server-side timer tick that writes a few bytes, no database access, no
-client request, and it never wakes the sync loop. A client that has not seen a byte for about
-twice that interval reconnects. There is no client polling anywhere.
-
-**Authority generation** (from yielded): `engine.epoch` changes on restore-from-backup or any
-operator reset. Every reply carries it; a device holding a different epoch gets
-`ResyncRequired`, discards its confirmed cache and cursors, keeps its journal, re-pulls, and
-rebases. This replaces today's `require_epoch` ritual with a protocol rule.
-
-**Policies** run only on the server, from the outbox, at least once; they issue commands with
-deterministic batch ids (`policy:<event ref>`) so a redelivery is a no-op via receipts. The shared app:
-`HouseholdJoined` → `Scope.Grant` per shared scope; `HouseholdLeft` → `Scope.Revoke`.
-
+**Policies** run only on the server, from the outbox, at least once, issuing commands under
+deterministic batch ids (`policy:<event ref>`) so redelivery is a no-op via receipts.
 **Grants are an aggregate** (`Scope`, commands `Grant`/`Revoke`, `authority: "server"`), so
-every change to who can see what is itself an event in the log; the server derives `grants`
-from it. Apps never write grant rows by hand.
+every change to who sees what is an event; apps never write grant rows.
 
-Why Postgres makes this easier than Alchemy's Durable Object model: a batch may span aggregates
-and still be one transaction, and receipts can live outside any single aggregate partition.
+**Client.** One **leader** per profile (a `SharedWorker` with election and a dedicated-worker
+fallback) and any number of **tabs**. The leader owns a durable journal (OPFS SQLite
+`journal.db`: batches with phase `Pending | Sent | Confirmed(seqs) | Rejected(r) | Unknown`,
+`epoch`, notices), a disposable durable cache (`replica.db`: confirmed stream rows with
+generated columns for indexes, scope cursors) and hot memory (effective rows, indexes, the
+subscription set). Journal and cache are separate files on purpose: a reset, an epoch change or
+a state-version bump may delete the cache; the journal is deleted only by a confirmed receipt
+or the user's explicit consent (sign-out with pending batches asks). A command with
+`authority: "server"` is journaled without prediction and shows as pending. Nothing on the
+execute → re-emit path touches disk synchronously; the journal append is write-ahead.
 
-## 6. Client
+**Outcomes as data.** A batch sent without an answer is `Unknown`; the leader retries under the
+same `batchId` until the receipt says `Accepted | Rejected`, or the server says the receipt
+expired, in which case the batch becomes an `Unknown` notice and is never re-sent under a new
+id.
 
-One **leader** per profile (a `SharedWorker`, with election and a dedicated-worker fallback for
-browsers without it) and any number of **tabs**. The engine is framework-free; the FoldKit
-adapter (§11) is a translation of the tab API.
+**Queries** are pure functions over a `Read` interface (`get(aggregate, id)`,
+`index(aggregate, name).range(...)`, `scan(aggregate)`), registered in the domain package. The
+leader runs them over effective rows, records what they touched, re-runs on change and streams
+results to tabs with structural equality so unchanged results do not re-emit.
 
-The leader owns three kinds of state:
+**Scopes.** A scope is an opaque id (`user:<id>`, a shared id, `catalog:<name>`). Every stream
+is in exactly one scope at a time, given by `Aggregate.scope(state)`. A grant on a scope
+delivers every stream in it; `writer` may command them; `owner` may also grant. No per-row ACL
+and no field-level filter: a field some readers must not see is its own aggregate in its own
+scope. A scope change is an ordinary event; the server turns it into `Gone` for the old
+scope's readers and `Upsert` for the new scope's (a reader who gains a scope gets the current
+state, never the history they were not entitled to, §2 item 3). The engine enforces grants
+once, generically, before `decide` (`ScopeForbidden`); `decide` enforces what the principal
+may *say*. Catalogs are scopes with a `*` reader grant and server-only writes: an import writes
+`Upsert` entries plus one `CatalogReleased { release }` event per release, not a stream per
+row (§2 item 4).
 
-| Kind | Where | Content |
-|---|---|---|
-| **Durable, must survive anything** | OPFS SQLite (`journal.db`) | `journal`: batches with phase `Pending \| Sent \| Confirmed(seqs) \| Rejected(r) \| Unknown`, plus `epoch`, `notices` |
-| **Durable cache, disposable** | OPFS SQLite (`replica.db`) | `confirmed` stream rows `(aggregate, id, scope, seq, state, state_version)` with generated columns for `Aggregate.indexes`; scope cursors |
-| **Hot** | leader memory | **effective** rows = `confirmed ⊕ replay(pending batches)`; in-memory indexes; the subscription set |
+**Conflicts are rules.** Every conflict is one of four shapes, each expressed in the domain,
+not the engine: an *exclusive claim* (`decide` rejects the second claimant; the loser rebases
+and sees the rejection); *independent fields* (the command carries a change set, the event
+records it, `evolve` merges; same-field edits are last-writer-wins by server order); a *stale
+base* (opt-in `expectedSeq`, `decide` returns `Stale`); a *vanished target or lost access*
+(`NotFound` / `ScopeForbidden` from the server, surfaced as notices). Uniqueness and in-use
+checks are `ctx.read` over an index inside `decide`: authoritative on the server because the
+transaction is serializable, optimistic on the device and corrected by the rebase (§2 item 2).
 
-Journal and cache are separate files on purpose (yielded's split): resetting a profile, an
-epoch change or a state-version bump may delete the cache; the journal is deleted only by a
-confirmed receipt or by the user's explicit consent.
+**Schema evolution.** Events are immutable and versioned: a shape change is a new version plus
+an `upcast` registered next to it; `evolve` sees only the latest. State is a derived cache with
+a version: the server rebuilds a stream whose `state_version` is older by replay on first touch
+and in a background sweep; the device treats a mismatch as "discard cache, re-pull", keeping
+the journal; a periodic `Snapshot` event bounds replay. Read models are rebuilt from state. No
+app-level DDL runs against event or state data; the only DDL is engine schema and index
+promotion. Journaled commands are versioned too: one with no upcaster becomes an `Unknown`
+notice. The server rejects clients below a `CompatibilityFloor`.
 
-**Execute from a tab.** The tab sends the batch to the leader. The leader (a) decides it against
-effective state (`decide` + `evolve`, pure, in memory), rejecting locally with the same
-rejection the server would give for everything it can know; (b) on local acceptance, appends it
-to the journal (ordered write-ahead; the UI is not blocked on the disk), updates effective rows
-and re-emits every subscribed query whose dependencies changed; (c) pushes `Sent` batches to
-the server in journal order whenever online. A command with `authority: "server"` skips (a) and
-is journaled with no prediction; the tab sees it as pending.
+**Presence** is ephemeral: a room is a scope; `join(room, state)` and `track(state)` are small
+requests; the server fans out `{ principal, clientId, state }` to the room's members over the
+same `Changes` stream and expires the entry when that stream ends. One connection per leader
+whether or not the app uses presence.
 
-Online or offline is never consulted on this path. The decision, the journal append and the
-re-emit happen the same way with or without a network; connectivity only changes how soon
-step (c) runs. When online, the receipt arrives tens of milliseconds later and almost always
-agrees with the provisional decision, so nothing visible changes; a tab can observe
-`Pending → Accepted` if it wants to show it. The engine never "checks with the server first"
-except for `authority: "server"` commands, which is the article's "some actions should wait".
+**FoldKit adapter.** `echo/foldkit` is a translation of the tab API and imports nothing from the
+framework: `Echo.subscribe(query, args)` → `Subscription<Msg>` of `Settled<A>`;
+`Echo.execute(batch)` → `Command<Msg>` resolving to `Accepted | Rejected(r) | Pending`;
+`Echo.status`; `Echo.notices` / `Echo.dismiss`; `Echo.presence` / `Echo.track`;
+`Echo.resource` wiring the leader for the app's lifetime.
 
-**Rebase.** Whenever the confirmed cache moves (a pull, a receipt, an epoch reset), the leader
-rebuilds effective state for the touched streams: start from confirmed, re-run each pending
-batch in journal order through `decide`/`evolve`, drop a batch that now rejects (it becomes a
-notice with its rejection), and re-emit affected queries. Because `decide` is pure and pending
-batches are few (tens, not thousands), full replay is the simplest correct algorithm; no
-per-field merge logic lives in the engine.
+**Non-goals for v1:** collaborative text (CRDT) fields, per-row ACLs inside a scope, partial
+replication of a scope, multi-region servers, transactions beyond one Postgres.
 
-**Outcomes as data** (from yielded): a batch whose request was sent but got no answer is
-`Unknown`; the leader retries with the same `batchId` until the receipt says
-`Accepted | Rejected`, or the server says the receipt expired, in which case the batch becomes
-an `Unknown` notice and is never re-sent under a new id (the single-user app's "a new mutate
-call is a new intent" rule, now engine policy).
+## 2. Decisions
 
-**Queries.** A query is a pure function over a `Read` interface (`get(aggregate, id)`,
-`index(aggregate, name).range(...)`, `scan(aggregate)`) returning a value; it is registered in
-the domain package like Alchemy's `Aggregate.read`. The leader runs it over effective rows,
-records which aggregates (later: which keys) it touched, re-runs it when any of them changes,
-and streams results to tabs with structural equality so unchanged results do not re-emit.
-The shared app's one whole-replica query that re-emits everything becomes several small queries
-with cheap invalidation; the single-user app's cursor pagination, sums per period and search are
-`index(...).range` plus aggregate helpers on the `Read` interface.
+Each item names what was taken, when, why, and what it was chosen over. A change to engine
+behaviour adds or amends an item here in the same branch.
 
-**Next frame.** A tab→leader→tab round trip over a `MessagePort` is well under a millisecond;
-what blows a frame budget is disk. So the rule is: nothing on the execute→re-emit path touches
-OPFS synchronously. Effective state and indexes are in memory, the journal append is
-write-ahead and asynchronous, and queries run in memory. The replica is loaded into memory at
-leader start (the single-user app's largest table is thousands of rows; its large reference
-catalog is kept on disk and served by index queries only). The durability window is the few milliseconds between
-the UI update and the journal flush; a crash in that window loses that one batch, which is the
-same trade every local-first app makes. Tab-side `predict` (running `decide`/`evolve` in the
-tab before the leader answers) is possible because the functions are pure, but is not needed
-for v1.
-
-**Profiles and sign-out.** The replica is keyed by profile (a hash of the principal), so two
-accounts on one browser never share a cache. Sign-out with pending batches requires consent to
-discard them (the shared app's sign-out consent gate), now engine behaviour.
-
-## 7. Scopes, grants and visibility
-
-A **scope** is an opaque id (`user:<id>`, `household:<id>`, `household:<id>:ro:<owner>`,
-`catalog:projects`). Every stream is in exactly one scope at a time, given by
-`Aggregate.scope(state)`. A principal with a grant on a scope receives every stream in it;
-`writer` may send commands to those streams; `owner` may also grant. There is no per-row ACL
-and no field-level filter: a field some readers must not see (the shared app's room notes in the
-read-only scope) is its own aggregate in its own scope. This is exactly how both apps model
-sharing today, so their scope functions port unchanged.
-
-A scope change is a normal event (`ChoreMoved { to }`); the server turns it into `Gone` for the
-old scope's readers and `Upsert` for the new scope's readers (§5), so a housemate who loses
-access sees the row vanish on the next pull and a housemate who gains it gets a snapshot, never
-the history they were not entitled to.
-
-`decide` sees `ctx.principal` and may enforce ownership (`NotYourChore`) and self-claims; the
-engine enforces grants. The split is the same as today: grants decide *whether you may talk
-to this stream*, the rule decides *what you may say*.
-
-Catalogs are scopes with a `*` reader grant and only server-authority writes (the single-user
-app's reference catalogs). A catalog import writes `Upsert` entries directly
-with one `CatalogReleased { release }` event per release rather than one event per row.
-Every other stream (an entry, a member's own project, a chore) is ordinary: each command's events
-are appended to that stream and delivered as events. A new catalog release reaches a device
-that already holds the catalog as `Upsert` entries for the rows that changed in that release,
-not as the whole catalog again; only a device with no cursor loads the full snapshot.
-
-## 8. Conflicts are rules, not merge strategies
-
-Every conflict that actually occurs in the two apps falls into one of four shapes, and each is
-expressed in `decide` or `evolve`, not in the engine:
-
-| Shape | Example | Expression |
-|---|---|---|
-| Exclusive claim | both housemates claim one chore offline | `decide` rejects the second with `ClaimedByHousemate`; the loser's device rebases, drops it, shows the rejection |
-| Independent fields | phone edits an entry's notes, laptop edits its times | the command carries the *change set* (`AmendEntry { changes }`), the event records it, `evolve` merges; same-field edits are last-writer-wins by server order, visibly and deliberately |
-| Stale base | "I edited what I saw, don't clobber a newer version" | opt-in: the command carries `expectedSeq`; `decide` returns `Stale` when `state.seq` moved; the app chooses which commands opt in |
-| Target vanished / access lost | housemate deleted the chore; owner made it private | `NotFound` / `Forbidden` rejections from the server, surfaced as notices; the device already shows the server's version after rebase |
-
-Uniqueness and in-use checks (duplicate project codes, "reassign entries before removing this
-task") use `ctx.read` over the relevant index inside `decide`. The server's
-serializable transaction makes the read authoritative; the device's read makes the optimistic
-answer right in the common case and the rebase corrects it otherwise. If a check ever needs to
-be bulletproof across concurrent *creates* of the same unique value, the Alchemy answer still
-applies: a `Code` aggregate keyed by the value, claimed in the same batch.
-
-`ctx.now` is the server's clock on the server and the device's clock on the device; the
-confirmed event's `at` is what everyone converges on. Apps never use `now` for ordering.
-
-## 9. Schema evolution without pain
-
-Three layers, each with a different lifetime:
-
-1. **Events are immutable and versioned.** An event class is `(name, version)`. Changing an
-   event's shape means a new version plus an `upcast(v1) → v2` function registered next to it;
-   `evolve` only ever sees the latest version. Old events are never rewritten.
-2. **State is a derived cache with a version.** `Aggregate.state` may change freely; bump
-   `stateVersion`. The server rebuilds a stream whose stored `state_version` is older by
-   replaying its events on first touch (and in a background sweep). The device treats a
-   version mismatch as "discard the cache, re-pull snapshot + tail" (§5); the journal is kept.
-   Streams get a periodic `Snapshot` event so replay is bounded.
-3. **Read models are rebuildable.** Queries are functions; indexes are regenerated from state.
-   No app-level `ALTER TABLE` ever runs against event or state data; the only DDL is engine
-   schema and index promotion (a generated column for a field that needs an index).
-
-Commands in the journal are versioned too: a pending batch whose command version has no
-upcaster becomes an `Unknown` notice instead of being sent under a shape the server no longer
-accepts. The server rejects commands and events from a client whose domain package version is
-older than a declared floor (`CompatibilityFloor`), a gap the previous engine left open.
-
-What this gives the two apps: the shared app's "engine swap + backfill" migration becomes an import
-that emits `Upsert`s and one `Imported` event per stream; the single-user app's many numeric
-columns are fields of one state schema and gaining one more is a state-version bump with a
-default, no backfill.
-
-## 10. Presence
-
-Ephemeral, never journaled, never persisted. A **room** is a scope; a tab `join(room, state)`s
-and `track(state)`s; the server fans out `{ principal, clientId, state }` to the room's
-members over the same long-lived `Changes` stream used for pokes, and expires on disconnect or
-a missed heartbeat. State is an app schema (`HousematePresence { editingChoreIds }`). The
-single-user app has no presence and pays nothing. This is the one part of `echo-sync` whose shape carries
-over as is, with one transport change: today the leader opens a second long-lived stream per
-joined room (`echo-sync` SPEC §10.2 `room(join)`), each with its own heartbeat and idle timeout. Here
-`join` and `track` are ordinary small requests carrying `{ room, state, revision }`, the
-server keys the member's entry to the leader's `Changes` stream, and the entry expires when
-that stream ends. One long-lived connection per leader, whether or not the app uses presence;
-an offline tab's `track` is a local no-op and its entry ages out on the housemate's side.
-
-## 11. FoldKit adapter
-
-`echo/foldkit` is a thin translation of the tab API and imports nothing from the framework;
-`echo/core`, `client` and `server` stay UI-agnostic. Surface:
-
-| | Shape | Backed by |
-|---|---|---|
-| `Echo.subscribe(query, args)` | `Subscription<Msg>` emitting `Settled<A>` (`Loading \| Value \| Failure`) | query stream, diffed |
-| `Echo.execute(batch)` | `Command<Msg>` resolving to `Accepted \| Rejected(r) \| Pending` (server-authority) | execute |
-| `Echo.status` | `Subscription` of `{ online, pending, lastError, epoch }` | leader status |
-| `Echo.notices` / `Echo.dismiss` | retained rejections and unknown outcomes | journal |
-| `Echo.presence(room, state)` / `Echo.track` | `Subscription` of members | presence |
-| `Echo.resource` | `ManagedResource` wiring the leader for the app's lifetime | client |
-
-The shared app's hand-written adapter runs to hundreds of lines because `echo-sync`'s rejection, reset
-and exit-gate streams had to be mapped one by one; with typed rejections per command and the
-outcome-as-data journal, the adapter above is the whole mapping.
-
-## 12. v1 is defined by the two apps
-
-Both apps are private products: each domain package lives in its own repository, pins this
-one by commit, and none of their names, rules or data appear here. The engine's phases are
-built against stand-ins with the same shapes. `examples/timesheet/domain` stands in for the
-single-user app (one record aggregate, two reference aggregates, a catalog scope, no sharing).
-`examples/chores/domain`, written in phase 3b, stands in for the shared app: a household of
-housemates, chores claimed by one housemate and grouped in rooms, room notes only their owner
-sees, private and shared scopes, presence. Its vocabulary is used for the sketches in §2 and §4.
-
-| Requirement | Shared app | Single-user app | Engine feature |
-|---|---|---|---|
-| Aggregates | `Member`, `Household`, `Chore`, `Room`, `RoomNotes`, `ChoreRank` | one record aggregate, several reference aggregates; catalogs | §4 |
-| Atomic multi-stream writes | rank renormalisation, create-chore-with-rank, leave-household | restore from backup | `Batch` |
-| Server-only commands | create/join household, provisioning | provisioning, catalog release | `authority: "server"`, `Scope` aggregate, policies |
-| Scope moves | private ↔ shared ↔ visible | none | `scope(state)`, `Gone`/`Upsert` |
-| Exclusive-claim conflict | `ClaimedByHousemate` | none | rejection + rebase |
-| Field-level merge across devices | shared chore edits | two devices editing one record | change-set events |
-| Cross-stream checks in `decide` | room usable, household full | duplicates, in-use, reference validity | `ctx.read` |
-| Reactive queries | today/later/room lists, counts | lists by date cursor, totals per period, search | `Read` + index queries |
-| Large read-only data | none | a reference catalog of tens of thousands of rows | compacted scope log, on-disk index queries |
-| Presence | housemate editing | none | §10 |
-| Notices | rejected/unknown with explanation | recovery list | journal phases |
-| Auth | Logto session → principal | Logto session → principal | `RequestContext` layer |
-
-Non-goals for v1: collaborative text (CRDT) fields, per-row ACLs inside a scope, partial
-replication of a scope (a device gets a whole scope or nothing), multi-region servers,
-cross-aggregate transactions beyond one server (one Postgres).
-
-## 13. What was borrowed from whom
-
-| From | Taken | Left behind |
-|---|---|---|
-| Alchemy `@alchemy.run/domain` | the whole vocabulary and file layout; `decide/evolve`; `Envelope`; `RequestContext`; `Policy`; `Story` tests; "events carry outcomes"; "cross-aggregate invariant → own aggregate" | Cloudflare DO partitioning; no versioning; no client replica; no receipt for rejections |
-| `yielded-dev/sync` | authority epoch + `ResyncRequired`; outcome-as-data (`Found/Unknown/Expired`, never retry under a new id); journal separate from cache; atomic `{expected, head, events, receipt}` commit | online-first; one state blob per source; no local queries |
-| Effect `eventlog` / LiveStore | client-side rebase by replay; versioned event names; materialise into local SQLite | device-decides (no server rejection); LWW by UUIDv7 clock |
-| `mac-monet/effect-domain` | `Settled` as the FoldKit model slot; hashed invocation keys for subscriptions | the GraphQL-style selection layer |
-| `echo-sync` (the previous engine) | scope/grant model, presence rooms, Postgres + leader-worker topology as a known-good shape, the browser scenario harness as a testing approach | the table/mutation/`dataHash` design, the SPEC |
-
-## 14. Decisions
-
-Each open item names the recommended option first and the alternative it was chosen over,
-with the reason. "Confirm" means the recommendation stands unless vetoed.
-
-**Taken (2026-10-29):** the server keeps an **events table**, not state only. Reason: the
-server is authoritative, so its log is the audit trail, the replay substrate for state-version
-migrations (§9) and the feed for policies. Cost: a periodic `Snapshot` event per stream so
-replay stays bounded.
-
-**Taken (2026-10-29), with the alternative each was chosen over:**
-
-2. **Cross-stream checks use `ctx.read` in `decide`**, declared per command
-   (`reads: [ProjectIndexes.by_code]`, item 10), not Alchemy's rule of an aggregate per protected
-   value. How `CreateProject` learns another project has this code, or
-   `RemoveTask` that entries still reference it: `decide` reads other streams' current
-   state through the indexes. On the server the read is inside the SERIALIZABLE transaction, so
-   two concurrent creates of one code cannot both commit (Postgres SSI aborts one; its
-   retry sees the other); on the device it reads effective state and the rebase re-decides.
-   This is what both apps do today. Rejected: a `Code` stream keyed by
-   `user:<id>/<value>` with `Claim`/`Release` in the same batch, and counter aggregates for
-   in-use checks; pure and shardable, but it exists because Durable Objects cannot share a
-   transaction, and one Postgres with no sharding plans already gives the guarantee.
-3. **A reader who gains a scope receives snapshots, not history.** When B joins the household
-   or A shares a chore, B gets the stream's current state (`Upsert`). Those events happened
-   while B was not entitled to them, and snapshot-only lets the scope log compact. The server
-   is authoritative and keeps every event, so this is reversible; an activity feed would be a
-   per-scope event window later. Rejected: delivering past events on join.
-4. **Catalogs are state-only rows plus one `CatalogReleased` event per release.** Tens of
-   thousands of reference rows nobody commands against do not get a stream each; every other
-   aggregate does. Rejected: a stream per catalog row (tens of thousands of events for no reader).
-5. **The optimistic result is computed in the leader only.** One effective state exists;
-   the tab asks over a `MessagePort` (sub-millisecond). Rejected for v1: tab-side `predict`,
-   which saves the round trip at the cost of a second state copy per tab; cheap to add later
-   because the functions are pure.
-7. **Transport is plain HTTP with one streaming response per leader** (§5 Transport), no
-   WebSockets, no client polling; the only periodic traffic is the server's inert keepalive on
-   the open stream. Rejected: WebSockets (bidirectional and lower per-message overhead, but an
-   upgrade handshake, proxy and hibernation concerns, and ping/pong anyway; nothing here needs
-   the client-to-server direction at stream latency) and polling (the "request every 15 s"
-   shape; latency equals the interval and most requests return nothing).
-8. **`decide` and `evolve` are objects with one handler per tag** (`decide: { LogEntry:
-   (state, cmd, ctx) => ... }`), not one function dispatching with `Match.valueTags` as the
-   first §4 sketch had. Reason (Phase 0, 2026-10-29): the tags are known from `commands` and
+1. **The server keeps an events table, not state only** (2026-10-29). Its log is the audit
+   trail, the replay substrate for state-version migrations and the feed for policies. Cost: a
+   periodic `Snapshot` event per stream. Rejected: state-only rows.
+2. **Cross-stream checks are `ctx.read` in `decide`, declared per command** (`reads: [...]`,
+   2026-10-29), not Alchemy's rule of an aggregate per protected value. On the server the read
+   is inside the SERIALIZABLE transaction, so two concurrent creates of one unique value cannot
+   both commit (SSI aborts one; its retry sees the other); on the device it reads effective
+   state and the rebase re-decides. Rejected: a stream per unique value with `Claim`/`Release`
+   in the same batch, and counter aggregates for in-use checks; pure and shardable, but they
+   exist because Durable Objects cannot share a transaction, and one Postgres already gives the
+   guarantee. If a check ever needs to be bulletproof across concurrent creates, that answer
+   still applies.
+3. **A reader who gains a scope receives snapshots, not history** (2026-10-29). Those events
+   happened while the reader was not entitled to them, and snapshot-only lets the scope log
+   compact. Reversible, since the server keeps every event. Rejected: delivering past events on
+   join.
+4. **Catalogs are state-only rows plus one `CatalogReleased` event per release** (2026-10-29).
+   Tens of thousands of reference rows nobody commands against do not get a stream each.
+   Rejected: a stream per catalog row.
+5. **The optimistic result is computed in the leader only** (2026-10-29); the tab asks over a
+   `MessagePort`. Rejected for v1: tab-side `predict`, a second state copy per tab; cheap to add
+   later because the functions are pure.
+6. **Transport is plain HTTP with one streaming response per leader** (2026-10-29), no
+   WebSockets, no client polling; the only periodic traffic is the server's keepalive on the
+   open stream. Rejected: WebSockets (upgrade handshake, proxy and hibernation concerns,
+   ping/pong anyway; nothing needs the client-to-server direction at stream latency) and
+   polling (latency equals the interval, most requests return nothing).
+7. **`decide` and `evolve` are objects with one handler per tag** (Phase 0, 2026-10-29), not
+   one function dispatching with `Match.valueTags`. The tags are known from `commands` and
    their `events`, so the checker reports a missing or misspelt handler, types each handler's
-   command and its return (`Decision` of that command's own events and rejections), and the
-   story runner and engine look a handler up by tag without evaluating a match. Rejected:
-   `Match.valueTags`, which needs the union assembled at the call site and gives one return
-   type for all branches.
-9. **`ScopeForbidden`, `Principal`, `Scope` and the Phase 0 grant rule live in `echo/domain`
-   (`Domain.Scope`)**, not in an `Engine` module. Reason: story 5 asserts the rejection, so the
-   domain package must name it, and domain code never imports the engine. The story runner
-   applies the same check (writer grant on `scope(state)`) before `decide`; the engine will
-   apply it the same way. The grant rule (own private scope: read and write; `catalog:*`: read)
-   is what exists before the grants aggregate of phase 3b replaces it. Rejected: an `Engine`
-   namespace the stories import from.
-10. **Indexes are declared with `Domain.Index(id, state, spec)` and bound to their aggregate by
-   `Aggregate.make`**, which also exposes them as statics (`Entry.by_task`). Reason: a
-   command must be able to name an index of its own aggregate in `reads`
-   (`CreateProject` reads `Project.by_code`), and the aggregate imports its commands,
-   so an index declared only inside the aggregate would be an import cycle. A command of
-   another aggregate may use the static. Rejected: `indexes: {...}` inline only (the §4
-   sketch), which would make own-aggregate `reads` strings or late-bound thunks.
-11. **The story runner is pure and lives in `echo/domain` (`Domain.Story.run`); `echo/domain/testing`
-   binds it to vitest.** `given` is a list (the target stream) or a record keyed `Aggregate/id`
-   (several streams); seeded streams must belong to the aggregate under test or to a declared
-   read, `ctx.read` answers only declared reads and only streams the principal may see, and an
-   undeclared read fails the story with a `StoryError` naming the read. Reason: the `reads` declaration is
-   then checked by the stories, before any engine enforces it. Rejected: a runner that reads
-   any seeded stream (hides a missing `reads`), and one that depends on vitest (an app's domain
-   package would import a test runner).
+   command and its return, and the runner and engine look a handler up without evaluating a
+   match. Rejected: `Match.valueTags`, which needs the union assembled at the call site and
+   gives one return type for all branches.
+8. **`ScopeForbidden`, `Principal`, `Scope` and the pre-grants rule live in `echo/domain`**
+   (Phase 0, 2026-10-29), not in an engine module. Writing the ownership story showed the check
+   is the same for every aggregate and depends only on `scope(state)` and the principal's
+   grants, so it is the engine's job; a story asserts the rejection, so the domain package must
+   name it, and domain code never imports the engine. The story runner applies the same check
+   before `decide`, as the engine will. The pre-grants rule (own private scope: read and write;
+   `catalog:*`: read) is what exists until the grants aggregate of phase 3b. Rejected: an
+   `own()` check repeated in every handler (the previous apps' shape); an `Engine` namespace
+   the stories import from.
+9. **Indexes are declared with `Domain.Index(id, state, spec)` and bound by `Aggregate.make`**,
+   which exposes them as statics (Phase 0, 2026-10-29). A command must be able to name an index
+   of its own aggregate in `reads`, and the aggregate imports its commands, so an index declared
+   only inside the aggregate would be an import cycle. Rejected: `indexes: {...}` inline only,
+   which would make own-aggregate `reads` strings or late-bound thunks.
+10. **The story runner is pure and lives in `echo/domain`; `echo/domain/testing` binds it to
+    vitest** (Phase 0, 2026-10-29). `given` is a list (the target stream) or a record keyed
+    `Aggregate/id`; seeded streams must belong to the aggregate under test or to a declared
+    read; `ctx.read` answers only declared reads and only streams the principal may see; an
+    undeclared read fails the story with a `StoryError` naming it, so `reads` is checked by the
+    stories before any engine enforces it. Rejected: a runner that reads any seeded stream
+    (hides a missing `reads`), and one that depends on vitest (an app's domain package would
+    import a test runner).
+11. **Own building blocks, Alchemy-shaped, not a dependency on `@alchemy.run/domain`**
+    (2026-10-29, built in Phase 0). The package (`2.0.0-beta.84` at alchemy 383d8e8) peer-depends
+    on `alchemy`, the IaC package, at runtime; its kernel hands `decide` exactly one stream's
+    state and its `HandleInput.context` is plain JSON, so `reads` (item 2) would be an extension
+    of the kernel, not of a platform. Vocabulary, file layout, `decide`/`evolve`, `Envelope`,
+    `RequestContext`, `Policy` and `Story` are kept as Alchemy has them, so a domain that never
+    uses `reads` is portable by an import rename. Rejected: being an Alchemy platform (a beta
+    API and the `alchemy` dependency in a browser worker, and no `reads`). Revisit if a domain
+    ever has to run on Alchemy's platform.
+12. **Domain packages before any engine code** (2026-10-29, done). Aggregate boundaries are the
+    risky part and stories make them cheap to try; the engine's additions exist only because
+    the apps need them, and the list of what the stories needed *is* the required `ctx` surface
+    (§4, Phase 0). Rejected: building the engine against a toy domain first.
+13. **This document holds the model, decisions, invariants, phases and rules, and nothing
+    else** (2026-10-30). The first version also carried a DDD primer, a survey of other
+    engines, worked examples in two private apps' vocabulary, a requirements table per app and
+    inlined copies of the Phase 0 code and stories. The examples drifted from the code within a
+    day, and the app names had to be purged from the public history twice. App rules are
+    `Story` tests, engine behaviour is the invariants catalogue, and the reference for the
+    blocks is `src/domain`. Rejected: a separate `docs/invariants.md` (one more file for the
+    same "what the engine promises" question; the catalogue is a section here, §3) and a prose
+    spec of app rules (the stories are it).
 
-**Open:**
+## 3. Invariants catalogue
 
-1. **Depend on `@alchemy.run/domain`, or ship our own blocks with the same shape?**
-   Facts (alchemy 383d8e8): the package is `2.0.0-beta.84`, peer-depends on `effect ^4.0.5`
-   *and* on `alchemy` (the IaC package; `Aggregate.ts` and `Saga.ts` import from it at
-   runtime), and has an explicit platform seam (`Platform.ts`: `AggregateStore`, `ViewStore`,
-   `HandleInput { id, state, version, command, commandId, context, now }`); the Cloudflare
-   platform is a separate package. Two platforms exist today, `InMemory` (in the domain
-   package, used by the story runner) and Cloudflare Durable Objects
-   (`@alchemy.run/cloudflare/Domain`); nothing in the domain package requires Durable Objects,
-   so a Postgres platform is an implementation of `AggregateStore` (`send`, `schedule`,
-   `state`, `changes`, `tail`) that nobody has written. Its kernel hands `decide` exactly one
-   stream's state, and `HandleInput.context` is plain JSON, so a platform cannot smuggle a
-   reader in through it; `reads` would be an extension of the kernel, not of a platform.
-   Alchemy's own live reads use a WebSocket where the platform offers `connect`, and fall back
-   to streamed HTTP responses otherwise.
-   Item 2 therefore closes the Alchemy door only for the commands that declare `reads`: a
-   command without `reads` runs on either engine unchanged, and a domain that never uses
-   `reads` is fully portable. Duplication arises only if the *same* domain must run on both
-   engines; a different project with its own domain on Alchemy shares nothing with this one.
-   - *Own blocks, Alchemy-shaped (drafted in §4).* No beta or IaC dependency in a browser
-     worker; we own versioning and `reads`. Moving a domain to Alchemy later is an import
-     rename for portable commands plus rewriting the `reads` ones as own aggregates.
-   - *Be an Alchemy platform.* The domain package is pure Alchemy; our engine implements its
-     `Platform` seam on Postgres plus the client replica, with the sync additions in a sidecar
-     `Sync.aggregate(Chore, {...})`. Cost: a beta API, the `alchemy` peer dependency in the
-     client bundle (unverified how much it drags in), and no `reads`.
-   Recommended for v1: own blocks. Revisit if a domain ever has to run on Alchemy's platform.
-6. **Sequencing: model the apps' domains before any engine code (Phase 0)?** Not a design
-   fork, a proposal: aggregate boundaries are the risky part (is `ChoreRank` its own aggregate?
-   is membership on `Household` or `Member`? is `RoomNotes` a stream?), `Story` tests make
-   them cheap to try, and the engine's additions in §4 exist only because the apps need them.
-   Alternative: build the engine against a toy domain first and port the apps after.
+The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
+two sentences each, with exactly one scenario test per invariant named after the failure it
+catches and citing the id. The catalogue for a phase is written here as part of designing that
+phase, before its code; a behaviour not listed is not promised, and an entry without its test
+is a known gap and is marked as such. Scenarios are story-shaped where they can be: seed events
+on the server, act from a device, assert state after sync or rebase.
 
-## 15. Phases
+Areas: `SERVER` (execute, receipts, scope log, grants, policies, epoch), `CLIENT` (leader,
+journal, replica, effective state, rebase, outcomes, queries), `SYNC` (end to end across
+devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
 
-0. **Domain packages first, no engine.** Rewrite each app's rules as aggregates, commands,
-   events and rejections with `Story` tests. This costs nothing in infrastructure and is where
-   the DDD learning happens; if an aggregate boundary is wrong it shows here.
+No invariants yet: Phase 0 has no engine. Phase 1's `SERVER` entries are written before the
+first server code.
 
-   A `Story` (Alchemy's name) is a test in three parts: *given* the events that already
-   happened to a stream, *when* this command arrives, *then* these events are recorded or this
-   rejection is returned. It folds `given` through `evolve`, runs `decide` once, and compares.
-   Nothing else is involved, so the stories run in milliseconds with no database or browser:
+## 4. Phases
 
-   ```ts
-   Story.make(Chore, "a shared chore claimed by a housemate cannot be claimed again", {
-     given: [new ChoreCreated({ owner: A, scope: household }), new ChoreClaimed({ by: B, at })],
-     when: new ClaimChore({ target: choreId }),
-     as: A,
-     then: new ClaimedByHousemate({ by: B }),
-   })
-   ```
-
-   The stories do not fail because the engine is missing; they pass when the rule is right.
-   What they tell us is different. First, whether a rule is expressible with that aggregate's
-   own state plus what `ctx` provides; when it is not (claiming needs the principal, creating
-   a chore in a room needs the room's state, leaving a household touches several streams), the
-   missing piece is either an engine requirement (`ctx.principal`, `ctx.read`, `Batch`,
-   `Policy`) or a boundary mistake (membership was on `Member` when `HouseholdFull` needs it on
-   `Household`). The list of what the stories needed *is* the engine's required `ctx` surface.
-   Second, they are the executable contract that "the device answers the way the server
-   would": the same `decide` runs in both places, so a story is proof, not hope. Third, when
-   the engine exists, the same stories become the fixtures for its own tests (push these
-   `given` events through the server, send `when` from an offline device, assert `then`
-   after rebase).
-
-   **The single-user shape goes first** (owner's choice, 2026-10-29), through the stand-in
-   domain `examples/timesheet/domain` (§12): entries booked on tasks within projects, each
-   stream in its member's private scope, projects also in a server-written catalog. It has
-   no sharing, no presence and no grant-changing commands, so Phase 0 and the first engine
-   slice exercise the core (streams, journal, rebase, `reads`, indexes, catalogs, cursor
-   queries) without the multi-principal parts; those arrive with the shared shape in phase 3b. What
-   the timesheet stories look like, and what each one forces the engine to provide:
-
-   ```ts
-   // Entry/Entry.aggregate.ts — one stream per entry, scope = its member's private scope
-   export class Entry extends Domain.Aggregate("Entry", {
-     id: EntryId,
-     state: EntryState, initial: null,                                     // EntryState = NullOr(row)
-     commands: [LogEntry, AmendEntry, DeleteEntry],
-     scope: (state) => state?.scope ?? null,
-     indexes: EntryIndexes,  // Domain.Index(EntryId, EntryState, { by_day: ["scope", "day"], by_task: ["taskId"], by_project: ["projectId"] })
-     decide: {
-       LogEntry: (state, { data }, ctx) => {
-         if (state !== null) return new EntryAlreadyLogged()
-         const project = ctx.read(Project, data.projectId)                // reads: [Project] declared on the command
-         if (project === null) return new UnknownProject({ id: data.projectId })
-         if (!inOrder(data)) return new TimesOutOfOrder()
-         return [new EntryLogged({ ...data, scope: privateScope(ctx.principal) })]
-       },
-       AmendEntry: (state, { changes }) => {
-         if (state === null || state.deleted) return new NoSuchEntry()
-         if (!inOrder({ ...state, ...changes })) return new TimesOutOfOrder()  // sparse patch, rule on the merged row
-         return [new EntryAmended({ changes })]
-       },
-       DeleteEntry: (state) => state === null || state.deleted ? new NoSuchEntry() : [new EntryDeleted()],
-     },
-     evolve: {
-       EntryLogged: (_, e) => ({ day: e.day, ..., scope: e.scope, deleted: false }),
-       EntryAmended: (state, { changes }) => state === null ? state : { ...state, ...changes },
-       EntryDeleted: (state) => state === null ? state : { ...state, deleted: true },
-     },
-   }) {}
-   ```
-
-   The code is `examples/timesheet/domain` (2026-10-29): one folder per aggregate with its
-   `*.id.ts`, `*.state.ts`, `*.indexes.ts`, `*.command.ts` (each command with the events and
-   rejections only it produces), `*.aggregate.ts` and `*.story.test.ts`. Writing the three
-   aggregates added rejections the five stories do not cover, because `decide` must answer on
-   every state: `EntryAlreadyLogged`, `NoSuchEntry`, `TaskAlreadyAdded`, `NoSuchTask`,
-   `ProjectAlreadyCreated`. They are the "stream exists / does not exist" answers; each needs a
-   story before it counts as a rule.
-
-   ```ts
-   // Entry/Entry.story.test.ts
-   Story.make(Entry, "an amendment that ends an entry before it starts is refused on the merged row", {
-     given: [new EntryLogged({ ...mondayMorning, startedAt: t("10:00"), endedAt: t("10:45"), scope: privateScope(member) })],
-     when: new AmendEntry({ target: entryId, changes: { endedAt: t("09:50") } }),
-     as: member,
-     then: new TimesOutOfOrder(),
-   })
-   // → needs nothing beyond this stream's state. Confirms sparse patches are decided on the merged row.
-
-   Story.make(Entry, "an entry against a project the member cannot see is refused", {
-     given: { [`Project/${acme}`]: [new ProjectCreated({ code: "ACME", name: "Acme Corp", scope: privateScope(otherMember) })] },
-     when: new LogEntry({ target: entryId, data: { ...mondayMorning, projectId: acme } }),
-     as: member,
-     then: new UnknownProject({ id: acme }),
-   })
-   // → forces: `reads` on LogEntry, `ctx.read` scoped to the streams the principal may see
-   //   (so the catalog scope works and another member's private project does not), and a
-   //   story runner whose `given` can seed other streams. The runner only lets `given` seed
-   //   streams of the aggregate under test or of a declared read, and throws on an undeclared
-   //   `ctx.read`, so a missing `reads` entry fails before any engine exists.
-
-   Story.make(Project, "a second project with the same code is refused", {
-     given: { [`Project/${acme}`]: [new ProjectCreated({ code: "ACME", scope: privateScope(member) })] },
-     when: new CreateProject({ target: acmeAgain, data: { code: " acme ", name: "Acme Corporation" } }),
-     as: member,
-     then: new DuplicateCode({ existing: acme }),
-   })
-   // → forces: an index read (`by_code`) in `decide`, normalisation inside `decide`
-   //   (" acme " matches "ACME"), the server-side SSI guarantee of §14 item 2, and an index a
-   //   command of the same aggregate can name in `reads` (§14 item 10).
-
-   Story.make(Task, "a task with entries cannot be removed", {
-     given: { [`Task/${review}`]: [new TaskAdded({...})], [`Entry/${entryId}`]: [new EntryLogged({ ...mondayMorning, taskId: review, scope: privateScope(member) })] },
-     when: new RemoveTask({ target: review }),
-     as: member,
-     then: new TaskInUse({ entries: 1 }),
-   })
-   // → forces: `reads` over the `Entry.by_task` index, and that an index read returns
-   //   the matching streams' state (`decide` skips deleted entries). Confirms decision 2:
-   //   in-use is a read, not a counter aggregate the app must maintain.
-
-   Story.make(Entry, "another member cannot amend my entry", {
-     given: [new EntryLogged({ ...mondayMorning, scope: privateScope(member) })],
-     when: new AmendEntry({ target: entryId, changes: { notes: "x" } }),
-     as: otherMember,
-     then: new Domain.Scope.ScopeForbidden({ scope: privateScope(member) }),
-   })
-   // → the interesting one: this rule is the apps' `own()` check, copied into every handler
-   //   today. The first draft of this story said `then: new NotYourEntry()` and put the check
-   //   in `decide`; writing it showed the check is the same for every aggregate and depends
-   //   only on `scope(state)` and the principal's grants, so it is the engine's job. The story
-   //   stays, asserting the engine's generic rejection, and `own()` disappears from the domain.
-   //   The rejection lives in `echo/domain`, not an `Engine` module, because the story (and
-   //   so the domain package) names it and domain code never imports the engine (§14 item 9);
-   //   the story runner performs the same check before `decide`, as the engine will.
-   ```
-
-   What this batch of stories told us (run 2026-10-29, all five pass): the `ctx` surface
-   this shape of app needs is `principal`, `now`, `read` by id and `read` by index, nothing
-   else (`now` is supplied but no timesheet rule uses it); every rule is decidable on the
-   device; three of five rules need `reads` (stories 2, 3 and 4: `Project` by id,
-   `Project.by_code`, `Entry.by_task`), which settles item 2 for this shape; and one rule the
-   apps thought was domain logic is engine logic. No story needed `Policy`, `Batch`,
-   `authority` or versioning. Stories do not cover the queries (`entries.list` by day cursor,
-   `entries.totals`); those are read models over the indexes and get their own tests in
-   phase 2.
-1. **Server:** streams, events, receipts, scope log with compaction, grants aggregate, policies,
-   `Execute`/`Pull`/`Changes` over `effect/rpc`, epoch. Integration tests against Postgres.
+0. **Domain building blocks and the first domain, no engine.** Done 2026-10-29: `echo/domain`
+   (`src/domain`) and the stand-in single-user domain `examples/timesheet/domain` with five
+   stories. What the stories established: the `ctx` surface this shape of app needs is
+   `principal`, `now`, `read` by id and `read` by index, nothing else; every rule is decidable
+   on the device; three of five rules need `reads`; the ownership check the previous apps
+   repeated in every handler is engine logic (§2 item 8). No story needed `Policy`, `Batch`,
+   `authority` or versioning, so they are not built. Open on `ws/phase0-domain`: no story
+   asserts an accepted command's events and scope stamp; an amendment can change a reference
+   field without a read; the duplicate-code check spans private and catalog scopes.
+1. **Server:** streams, events, receipts, scope log with compaction, grants aggregate,
+   policies, `Execute`/`Pull`/`Changes` over `effect/rpc`, epoch. `SERVER` invariants first,
+   then integration tests against Postgres.
 2. **Client:** leader election, journal, replica cache, effective state, rebase, queries,
-   outcome phases. Browser scenarios for offline/rebase/rejection/epoch, in the style of the
-   `echo-sync` browser harness (a shell script driving Chromium through `agent-browser` against a real server, printing PASS/FAIL and evidence).
-3. **Apps.** (a) FoldKit adapter and the single-user app's port, in its own repository:
-   catalogs, `reads`, cursor and aggregate queries, multi-device rebase, migrations from the
-   current data. (b) The shared shape, through `examples/chores/domain` and then the shared
-   app's port in its own repository: adds the multi-principal parts, which are the only engine work
-   the single-user shape does not need: grants aggregate, `Batch`, `Policy`,
-   `authority: "server"` commands, scope moves and presence. Phase 1 and 2 build these
-   interfaces but may stub them until 3b.
+   outcome phases. `CLIENT` and `SYNC` invariants; browser scenarios (a script driving Chromium
+   through `agent-browser` against a real server, printing PASS/FAIL and evidence) for
+   offline, rebase, rejection and epoch.
+3. **Apps.** (a) FoldKit adapter and the single-user app's port in its own repository:
+   catalogs, `reads`, cursor and aggregate queries, multi-device rebase, import of its current
+   data. (b) The shared shape, through a stand-in under `examples/` written then and the shared
+   app's port in its own repository: grants aggregate, `Batch`, `Policy`, `authority: "server"`
+   commands, scope moves, presence. Phases 1 and 2 build these interfaces but may stub them.
 4. **Migrations tooling:** upcasters, state-version rebuild sweep, compatibility floor, import.
 
-## 16. Working rules for the rewrite
+## 5. Working rules
 
-**Clean start.** The rewrite is this repository, `skyturtleio/echo`, not a branch of
-`echo-sync`. The old engine stays frozen there for the current apps until each is ported,
-so nothing in it has to keep working for the new one. This repository started with this
-document, a fresh `AGENTS.md`, the environment scripts (`.agents/setup`, `.agents/resume`,
-`.amp/services.yaml`) and the toolchain configuration, which are generic. Nothing else was
-copied; the browser harness is reproduced from its *approach* (a scenario script that drives
-Chromium against a real server and prints evidence), not its code. `AGENTS.md` says in its
-first lines that the old engine, its SPEC and the current apps' sync code are not references
-and are not to be read; the only inputs are this document, Alchemy's `domain` package and the
-pinned Effect source.
+**Clean start.** This repository is not a branch of `echo-sync`; the old engine stays frozen
+for the current apps until each is ported. Nothing was copied from it but the environment
+scripts and toolchain configuration, which are generic. The old engine, its SPEC and the
+apps' sync code are not references and are not read (`AGENTS.md`); the inputs are this
+document, Alchemy's `domain` package and the pinned Effect source. The apps are private
+products: their domain packages live in their own repositories, pin this one by commit, and
+none of their names, rules or data appear here; the engine's phases are built against
+stand-ins under `examples/`.
 
-**Three documents, each with one job, written before the code they govern.** This design
-document says *why* (decisions and rejected alternatives, §14). The domain packages say *what
-the apps do* as `Story` tests; there is no separate prose spec for app rules, the stories are
-it. The engine has an **invariants catalogue**: a numbered list (`INV-<AREA>-<n>`) of the
-behaviours a rule-abiding engine must show, one or two sentences each, with exactly one named
-scenario test per invariant. It is written as part of designing each phase, not derived from
-code afterwards; a behaviour not in the catalogue is not promised, and a catalogue entry
-without its test is a known gap, listed as such. `echo-sync`'s SPEC is the
-opposite shape (3 200 lines derived from the code after the fact, 158 invariants, about 430
-test blocks across 50 files, one of which names the invariant it covers) and is the thing
-this rule exists to avoid.
+**Three artefacts, each with one job, written before the code they govern.** This document
+says *why* (§2) and *what is promised* (§3). The domain packages say *what the apps do* as
+`Story` tests; there is no prose version of an app rule. The engine's scenarios prove §3, one
+per invariant.
 
 **Tests are of two kinds only.** A `Story` for a domain rule, in the domain package, and a
-scenario for an engine invariant, in the engine, named after the failure it catches and
-citing its `INV` id in the test name. No per-function unit tests, no snapshot tests, no test
-whose expected value was read off the implementation. A scenario is story-shaped where it
-can be (seed events on the server, act from a device, assert state after sync or rebase); the
-browser scenarios are the same shape with a real browser. `bun run check` fails on a test
-block whose name does not cite an existing `INV` id or `Story`, the same kind of lightweight
-syntactic gate that `echo-sync` used for its telemetry entry points; review still asks of every test
-"which plausible wrong implementation fails this".
+scenario for an engine invariant, named after the failure it catches and citing its `INV` id.
+No per-function unit tests, no snapshot tests, no test whose expected value was read off the
+implementation. Before keeping a test, name the plausible wrong implementation that fails it;
+if there is none, delete the test. `bun run check` gains, with the first scenario in phase 1, a
+gate that rejects a test block whose name cites no existing `INV` id and is not a `Story`.

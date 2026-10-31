@@ -1,0 +1,72 @@
+--- a/src/PgConnection.ts
++++ b/src/PgConnection.ts
+@@ -762,13 +762,21 @@
+ 
+   // Only the waits are interruptible, so a caller can bound how long it waits
+   // for the connection without leaking the `owner` permit.
+-  private readonly pinExclusive: Effect.Effect<PinnedPgConnection, never, Scope.Scope> = Effect.acquireRelease(
++  private readonly pinExclusive: Effect.Effect<PinnedPgConnection, never, Scope.Scope> = Effect.uninterruptibleMask(
++    (restore) => Effect.flatMap(Effect.scope, (parent) =>
++      Effect.flatMap(Scope.fork(parent), (scope) => Effect.onError(
++        restore(Scope.provide(this.pinScoped, scope)),
++        (cause) => Scope.close(scope, Exit.failCause(cause))
++      )))
++  )
++
++  private readonly pinScoped: Effect.Effect<PinnedPgConnection, never, Scope.Scope> = Effect.acquireRelease(
+     Effect.uninterruptibleMask((restore) =>
+-      Effect.flatMap(restore(this.owner.take(1)), () =>
++      Effect.flatMap(restore(this.owner.takeScoped(1)), () =>
+         // Holding `owner` stops new submissions; a pipeline already on the wire
+         // still has to drain before this fiber owns the connection.
+         Effect.map(
+-          Effect.onInterrupt(restore(this.waitPipelineIdle), () => this.owner.release(1)),
++          restore(this.waitPipelineIdle),
+           () => {
+             this.pinned = true
+             return new PinnedPgConnection(this)
+@@ -799,7 +807,7 @@
+               "PgConnection: Pinned connection released in an aborted transaction"
+             ))
+           }
+-          return idle ? Effect.andThen(this.wire.release(1), this.owner.release(1)) : this.owner.release(1)
++          return idle ? this.wire.release(1) : Effect.void
+         }
+       ),
+     { interruptible: true }
+--- a/dist/PgConnection.js
++++ b/dist/PgConnection.js
+@@ -406,10 +406,15 @@
+   });
+   // Only the waits are interruptible, so a caller can bound how long it waits
+   // for the connection without leaking the `owner` permit.
+-  pinExclusive = /*#__PURE__*/Effect.acquireRelease(/*#__PURE__*/Effect.uninterruptibleMask(restore => Effect.flatMap(restore(this.owner.take(1)), () =>
++  pinExclusive = Effect.uninterruptibleMask(restore => Effect.flatMap(Effect.scope, parent =>
++    Effect.flatMap(Scope.fork(parent), scope => Effect.onError(
++      restore(Scope.provide(this.pinScoped, scope)),
++      cause => Scope.close(scope, Exit.failCause(cause))
++    ))));
++  pinScoped = /*#__PURE__*/Effect.acquireRelease(/*#__PURE__*/Effect.uninterruptibleMask(restore => Effect.flatMap(restore(this.owner.takeScoped(1)), () =>
+   // Holding `owner` stops new submissions; a pipeline already on the wire
+   // still has to drain before this fiber owns the connection.
+-  Effect.map(Effect.onInterrupt(restore(this.waitPipelineIdle), () => this.owner.release(1)), () => {
++  Effect.map(restore(this.waitPipelineIdle), () => {
+     this.pinned = true;
+     return new PinnedPgConnection(this);
+   }))), view => Effect.flatMap(Effect.suspend(() => {
+@@ -427,7 +432,7 @@
+       // statement failing. A transaction open before the pin is its caller's.
+       this.fatal(connectionQueryError(new Error("Pinned connection released in an aborted transaction"), "PgConnection: Pinned connection released in an aborted transaction"));
+     }
+-    return idle ? Effect.andThen(this.wire.release(1), this.owner.release(1)) : this.owner.release(1);
++    return idle ? this.wire.release(1) : Effect.void;
+   }), {
+     interruptible: true
+   });
+@@ -1737,4 +1742,4 @@
+     operation
+   });
+ };
+-//# sourceMappingURL=PgConnection.js.map
+\ No newline at end of file
++//# sourceMappingURL=PgConnection.js.map

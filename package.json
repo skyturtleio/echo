@@ -40,5 +40,8 @@
     "vitest": {
       "optional": true
     }
+  },
+  "patchedDependencies": {
+    "@effect/sql-pg@4.1.1": "patches/sql-pg-4.1.1.patch"
   }
 }

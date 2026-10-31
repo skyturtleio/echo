@@ -26,6 +26,9 @@
       ],
     },
   },
+  "patchedDependencies": {
+    "@effect/sql-pg@4.1.1": "patches/sql-pg-4.1.1.patch",
+  },
   "packages": {
     "@effect/sql-pg": ["@effect/sql-pg@4.1.1", "", { "peerDependencies": { "effect": "^4.1.1" } }, "sha512-NiCzHPTFyI85/fbRdGhQgSa3QpuvByqVv8QaENSBuCFavvuWemIdSbWpKPQXESXU3yYq6PUR0KHY8fFfmWrXlA=="],
 

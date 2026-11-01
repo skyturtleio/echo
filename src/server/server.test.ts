@@ -1,6 +1,7 @@
 import * as PgClient from "@effect/sql-pg/PgClient"
 import { describe, expect, it } from "@effect/vitest"
 import * as Arr from "effect/Array"
+import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
@@ -19,8 +20,10 @@ import { Note } from "../../examples/fixture/domain/src/Note/Note.aggregate.ts"
 import { DefineTag } from "../../examples/fixture/domain/src/Tag/DefineTag.command.ts"
 import { Tag } from "../../examples/fixture/domain/src/Tag/Tag.aggregate.ts"
 import { TagHistoryImported } from "../../examples/fixture/domain/src/Tag/TagHistoryImported.event.ts"
+import { MoveTag, RelocateTag } from "../../examples/fixture/domain/src/Tag/MoveTag.command.ts"
+import { TagId } from "../../examples/fixture/domain/src/Tag/Tag.id.ts"
 import type * as Aggregate from "../domain/Aggregate.ts"
-import { Principal, privateScope } from "../domain/Scope.ts"
+import { Principal, privateScope, Scope as VisibilityScope, Grant } from "../domain/Scope.ts"
 import * as Wire from "../protocol.ts"
 import * as Server from "./index.ts"
 
@@ -34,7 +37,7 @@ class UndeclaredCommand extends DefineTag {
 class UndeclaredTag extends Tag {
   static override readonly definition: typeof Tag.definition = {
     ...Tag.definition,
-    commands: [UndeclaredCommand, Tag.definition.commands[1]]
+    commands: [UndeclaredCommand, Tag.definition.commands[1], Tag.definition.commands[2], Tag.definition.commands[3]]
   }
 }
 const request = (id: string, target = id, name = id): Wire.ExecuteRequest => ({
@@ -55,7 +58,8 @@ const note = (id: string, tagId: string): Wire.ExecuteRequest => ({
 let nextSchema = 0
 const scenario = <A, E>(
   body: (server: Server.Server, sql: PgClient.PgClient) => Effect.Effect<A, E, Scope.Scope>,
-  maxConnections = 12
+  maxConnections = 12,
+  actions: ReadonlyArray<Server.Action.Action> = []
 ) =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -70,13 +74,214 @@ const scenario = <A, E>(
         yield* sql`CREATE SCHEMA ${sql(schema)}`
         yield* Effect.addFinalizer(() => sql`DROP SCHEMA ${sql(schema)} CASCADE`.pipe(Effect.orDie))
         yield* Server.migrate
-        return yield* body(yield* Server.make({ aggregates: [Tag, Note] }), sql)
+        return yield* body(yield* Server.make({ aggregates: [Tag, Note], actions }), sql)
         // oxlint-disable-next-line effecttsgo/strict-effect-provide -- each scenario is a standalone runtime entry point
       }).pipe(Effect.scoped, Effect.provide(layer))
     })
   )
 
 describe.skipIf(url === undefined)("Postgres server", () => {
+  it.effect("INV-SERVER-7 reader grants cannot write and moves evict old readers", () =>
+    scenario(
+      Effect.fnUntraced(function* (server) {
+        const shared = VisibilityScope.make("shared:room")
+        const id = TagId.make("shared-tag")
+        yield* server.importStreams({
+          id: "seed",
+          principal: alice,
+          streams: [
+            Server.importedStream(Tag, id, [
+              new TagHistoryImported({ snapshot: { name: "shared", scope: shared, removed: false } })
+            ])
+          ],
+          grants: [
+            { scope: shared, principal: alice, role: "writer" },
+            { scope: shared, principal: bob, role: "reader" }
+          ]
+        })
+        const before = yield* server.pull(bob, { epoch: null, cursors: {} })
+        expect(entries(before)).toHaveLength(1)
+        expect((yield* server.execute(bob, note("read", id))).receipts[0]?._tag).toBe("Accepted")
+        const move = {
+          epoch: null,
+          clientId: "device",
+          batches: [
+            {
+              id: "move",
+              commands: [{ aggregate: "Tag", command: new MoveTag({ target: id, scope: privateScope(alice) }) }]
+            }
+          ]
+        }
+        expect((yield* server.execute(bob, move)).receipts[0]?._tag).toBe("Rejected")
+        expect((yield* server.execute(alice, move)).receipts[0]?._tag).toBe("Accepted")
+        const after = yield* server.pull(bob, { epoch: null, cursors: cursors(before) })
+        expect(Arr.findFirst(after.scopes, (scope) => scope.scope === shared)).toMatchObject({
+          value: { reset: true, entries: [] }
+        })
+        expect(yield* server.get(bob, Tag, id)).toBeNull()
+        expect(yield* server.get(alice, Tag, id)).toMatchObject({ scope: privateScope(alice) })
+      })
+    )
+  )
+
+  it.effect("INV-SERVER-8 rejected membership actions cannot leak grants or privileged moves", () => {
+    const shared = VisibilityScope.make("shared:atomic")
+    const id = TagId.make("atomic")
+    const action = Server.Action.make({
+      name: "transition",
+      input: Schema.Struct({ fail: Schema.Boolean }),
+      reads: [Tag],
+      decide: ({ fail }, ctx) => {
+        if (ctx.principal !== alice || ctx.read.get(Tag, id) === null) return { rejection: { _tag: "Denied" } }
+        return {
+          operations: [
+            Server.Action.grant({ scope: shared, principal: bob, role: "reader" }),
+            Server.Action.command(Tag, new RelocateTag({ target: id, scope: shared })),
+            ...(fail
+              ? [Server.Action.command(Tag, new RelocateTag({ target: TagId.make("absent"), scope: shared }))]
+              : []),
+            Server.Action.revoke(shared, alice)
+          ]
+        }
+      }
+    })
+    return scenario(
+      Effect.fnUntraced(function* (server, sql) {
+        yield* server.execute(alice, request(id))
+        const raw = {
+          epoch: null,
+          clientId: "device",
+          batches: [
+            { id: "raw", commands: [{ aggregate: "Tag", command: new RelocateTag({ target: id, scope: shared }) }] }
+          ]
+        }
+        expect((yield* server.execute(alice, raw)).receipts[0]?._tag).toBe("Rejected")
+        const rejected = {
+          epoch: null,
+          clientId: "device",
+          batches: [{ id: "bad", commands: [], action: { name: "transition", input: { fail: true } } }]
+        }
+        expect((yield* server.execute(alice, rejected)).receipts[0]?._tag).toBe("Rejected")
+        expect(yield* sql`SELECT * FROM echo_grants`).toHaveLength(0)
+        expect(yield* server.get(alice, Tag, id)).toMatchObject({ scope: privateScope(alice) })
+        const accepted = {
+          ...rejected,
+          batches: [{ id: "good", commands: [], action: { name: "transition", input: { fail: false } } }]
+        }
+        const result = yield* server.execute(alice, accepted)
+        expect(result.receipts[0]?._tag).toBe("Accepted")
+        expect(yield* server.execute(alice, accepted)).toEqual(result)
+        expect(yield* server.get(alice, Tag, id)).toBeNull()
+        expect(yield* server.get(bob, Tag, id)).toMatchObject({ scope: shared })
+        expect(yield* sql`SELECT * FROM echo_events WHERE id=${id}`).toHaveLength(2)
+        const pulled = yield* server.pull(alice, { epoch: null, cursors: {} })
+        const receipt = result.receipts[0]
+        expect(receipt?._tag === "Accepted" && pulled.revision >= receipt.revision).toBe(true)
+      }),
+      12,
+      [action]
+    )
+  })
+
+  it.effect("INV-SERVER-9 imports replay truthful events and roll back with the enclosing migration", () =>
+    scenario(
+      Effect.fnUntraced(function* (server, sql) {
+        const stream = Server.importedStream(Tag, TagId.make("imported"), [
+          new TagHistoryImported({ snapshot: { name: "historical", scope: privateScope(alice), removed: false } })
+        ])
+        const input = { id: "history", principal: alice, streams: [stream] }
+        yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* sql`SELECT 1`
+              yield* server.importStreams(input)
+              return yield* Effect.fail("rollback")
+            })
+          )
+          .pipe(Effect.flip)
+        expect(yield* server.get(alice, Tag, TagId.make("imported"))).toBeNull()
+        yield* server.importStreams(input)
+        yield* server.importStreams(input)
+        expect(yield* sql`SELECT payload,principal FROM echo_events`).toMatchObject([
+          { principal: "alice", payload: { _tag: "TagHistoryImported", snapshot: { name: "historical" } } }
+        ])
+        expect((yield* server.importStreams({ ...input, id: "conflict" }).pipe(Effect.flip))._tag).toBe("ServerError")
+        expect(yield* server.get(alice, Tag, TagId.make("imported"))).toMatchObject({ name: "historical" })
+      })
+    )
+  )
+
+  it.effect("INV-PRESENCE-1 forged connections and revoked rooms cannot disclose presence", () => {
+    const room = VisibilityScope.make("shared:presence")
+    const revoke = Server.Action.make({
+      name: "revoke",
+      input: Grant,
+      reads: [],
+      decide: (grant) => ({ operations: [Server.Action.revoke(grant.scope, grant.principal)] })
+    })
+    return scenario(
+      Effect.fnUntraced(function* (server, sql) {
+        yield* server.importStreams({
+          id: "members",
+          principal: alice,
+          streams: [],
+          grants: [
+            { scope: room, principal: alice, role: "owner" },
+            { scope: room, principal: bob, role: "reader" }
+          ]
+        })
+        const queue = yield* Queue.unbounded<Wire.Change>()
+        const fiber = yield* server.changes(bob).pipe(
+          Stream.runForEach((frame) => Queue.offer(queue, frame)),
+          Effect.forkScoped
+        )
+        const initial = yield* Queue.take(queue)
+        const connectionId = initial.connectionId ?? "missing"
+        expect(
+          (yield* server.presence(alice, { connectionId, room, clientId: "tab", state: {} }).pipe(Effect.flip))._tag
+        ).toBe("ServerError")
+        yield* server.presence(bob, { connectionId, room, clientId: "tab", state: { active: true } })
+        expect((yield* Queue.take(queue)).presence).toMatchObject([{ principal: "bob", state: { active: true } }])
+        // Simulate a crashed participant's elapsed lease while its shared connection stays alive.
+        yield* sql`UPDATE echo_presence SET expires_at=now()-interval '1 second' WHERE client_id='tab'`
+        yield* server.presence(bob, { connectionId, room, clientId: "living", state: {} })
+        expect((yield* Queue.take(queue)).presence).toMatchObject([{ clientId: "living" }])
+        for (let i = 1; i < 64; i++) {
+          yield* server.presence(bob, { connectionId, room, clientId: `living-${i}`, state: {} })
+          yield* Queue.take(queue)
+        }
+        expect(
+          (yield* server.presence(bob, { connectionId, room, clientId: "overflow", state: {} }).pipe(Effect.flip))._tag
+        ).toBe("ServerError")
+        yield* server.presence(bob, { connectionId, room, clientId: "living", state: { updated: true } })
+        expect((yield* Queue.take(queue)).presence).toContainEqual({
+          room,
+          principal: bob,
+          clientId: "living",
+          state: { updated: true }
+        })
+        yield* server.execute(alice, {
+          epoch: null,
+          clientId: "device",
+          batches: [
+            {
+              id: "revoke",
+              commands: [],
+              action: { name: "revoke", input: { scope: room, principal: bob, role: "reader" } }
+            }
+          ]
+        })
+        expect((yield* Queue.take(queue)).presence).toEqual([])
+        expect(
+          (yield* server.presence(bob, { connectionId, room, clientId: "tab", state: {} }).pipe(Effect.flip))._tag
+        ).toBe("ServerError")
+        yield* Fiber.interrupt(fiber)
+      }),
+      12,
+      [revoke]
+    )
+  })
+
   it.effect("INV-SERVER-1 retrying accepted or rejected batches cannot append or leak partial state", () =>
     scenario(
       Effect.fnUntraced(function* (server, sql) {
@@ -97,9 +302,19 @@ describe.skipIf(url === undefined)("Postgres server", () => {
             }
           ]
         }
-        const refusal = yield* server.execute(alice, rejected)
+        const rejections: Array<Server.RejectedOutcome> = []
+        const observed = yield* Server.make({
+          aggregates: [Tag, Note],
+          onRejected: (outcome) =>
+            Effect.sync(() => {
+              rejections.push(outcome)
+              throw new Error("broken diagnostic sink")
+            })
+        }).pipe(Effect.provideService(PgClient.PgClient, sql))
+        const refusal = yield* observed.execute(alice, rejected)
         expect(refusal.receipts[0]).toMatchObject({ _tag: "Rejected", rejection: { _tag: "DuplicateName" } })
-        expect(yield* server.execute(alice, rejected)).toEqual(refusal)
+        expect(yield* observed.execute(alice, rejected)).toEqual(refusal)
+        expect(rejections).toEqual([{ operation: "Batch", rejectionTag: "DuplicateName" }])
         expect(entries(yield* server.pull(alice, { epoch: first.epoch, cursors: {} }))).toHaveLength(1)
         expect(yield* sql`SELECT * FROM echo_events`).toHaveLength(1)
         const collision = yield* Effect.result(server.execute(alice, request("accepted", "other", "changed")))
@@ -286,13 +501,21 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         expect(
           Arr.some(entries(yield* server.pull(alice, { epoch: null, cursors: {} })), (e) => e.id === "hidden")
         ).toBe(false)
-        const invalid = yield* Server.make({ aggregates: [UndeclaredTag, Note] }).pipe(
-          Effect.provideService(PgClient.PgClient, sql)
-        )
+        const diagnostics: string[] = []
+        const invalid = yield* Server.make({
+          aggregates: [UndeclaredTag, Note],
+          onFailure: (operation, cause) =>
+            Effect.sync(() => {
+              diagnostics.push(`${operation}: ${Cause.pretty(cause)}`)
+              throw new Error("broken diagnostic sink")
+            })
+        }).pipe(Effect.provideService(PgClient.PgClient, sql))
         expect(yield* Effect.result(invalid.execute(alice, request("undeclared")))).toMatchObject({
           _tag: "Failure",
-          failure: { _tag: "ServerError", message: "Invalid domain decision or undeclared read" }
+          failure: { _tag: "ServerError", message: "Echo storage operation failed" }
         })
+        expect(diagnostics).toHaveLength(1)
+        expect(diagnostics[0]).toContain("undeclared read")
 
         // Removing a tag reads Notes, not other Tags. Unrelated corrupt state must not be decoded.
         yield* server.execute(alice, request("isolated-target"))

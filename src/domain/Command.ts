@@ -35,6 +35,7 @@ export interface CommandClass<
   readonly events: Events
   readonly rejects: Rejects | readonly []
   readonly reads: Reads | readonly []
+  readonly authority: "both" | "server"
 }
 
 /** Structural constraint satisfied by every class produced by {@link make}. */
@@ -45,14 +46,15 @@ export interface Any extends Schema.Top {
   readonly events: ReadonlyArray<Event.Any>
   readonly rejects: ReadonlyArray<Rejection.Any>
   readonly reads: ReadonlyArray<Read>
+  readonly authority: "both" | "server"
   readonly Type: { readonly _tag: string; readonly target: string }
 }
 
 /**
  * A request to change one stream. It names the stream (`target`), carries its input, and
  * declares the events it may record, the rejections it may return and the other streams its
- * `decide` reads. `authority` (design §1) is not part of Phase 0: every command runs on both
- * the device and the server.
+ * `decide` reads. Server-authority commands run only inside registered trusted actions;
+ * ordinary commands run on both device and server.
  */
 export const make = <
   const Tag extends string,
@@ -69,6 +71,7 @@ export const make = <
     readonly events: Events
     readonly rejects?: Rejects
     readonly reads?: Reads
+    readonly authority?: "both" | "server"
   }
 ): CommandClass<Tag, Target, F, Events, Rejects, Reads> => {
   // `input` may be absent (then `F` is `{}`); `Object.assign` keeps the generic where a spread of an optional loses it.
@@ -79,6 +82,7 @@ export const make = <
     target: options.target,
     events: options.events,
     rejects: options.rejects ?? ([] as const),
-    reads: options.reads ?? ([] as const)
+    reads: options.reads ?? ([] as const),
+    authority: options.authority ?? "both"
   })
 }

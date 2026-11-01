@@ -1,3 +1,5 @@
+import * as Arr from "effect/Array"
+import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import * as Str from "effect/String"
 import * as Rejection from "./Rejection.ts"
@@ -19,15 +21,29 @@ export const privateScope = (principal: Principal): Scope => Scope.make(`user:${
 /** A catalog scope: every principal reads it, only the server writes it (design §1). */
 export const catalogScope = (name: string): Scope => Scope.make(`catalog:${name}`)
 
-/**
- * The grants a principal holds before there is a grants aggregate (phase 3b): their private
- * scope as writer and every catalog as reader. Shared scopes need the grants
- * aggregate, which arrives in phase 3b.
- */
-export const canRead = (principal: Principal, scope: Scope): boolean =>
-  scope === privateScope(principal) || Str.startsWith("catalog:")(scope)
+export const Role = Schema.Literals(["reader", "writer", "owner"])
+export type Role = typeof Role.Type
+export const Grant = Schema.Struct({ scope: Scope, principal: Principal, role: Role })
+export type Grant = typeof Grant.Type
 
-export const canWrite = (principal: Principal, scope: Scope): boolean => scope === privateScope(principal)
+/** Private ownership and public catalog reads are intrinsic, never transferable by grants. */
+export const role = (principal: Principal, scope: Scope, grants: ReadonlyArray<Grant> = []): Role | null => {
+  if (scope === privateScope(principal)) return "owner"
+  if (Str.startsWith("catalog:")(scope)) return "reader"
+  if (Str.startsWith("user:")(scope)) return null
+  return (
+    Option.getOrUndefined(Arr.findFirst(grants, (grant) => grant.scope === scope && grant.principal === principal))
+      ?.role ?? null
+  )
+}
+
+export const canRead = (principal: Principal, scope: Scope, grants: ReadonlyArray<Grant> = []): boolean =>
+  role(principal, scope, grants) !== null
+
+export const canWrite = (principal: Principal, scope: Scope, grants: ReadonlyArray<Grant> = []): boolean => {
+  const permission = role(principal, scope, grants)
+  return permission === "writer" || permission === "owner"
+}
 
 /**
  * The engine's answer when a principal commands a stream whose scope they hold no writer grant

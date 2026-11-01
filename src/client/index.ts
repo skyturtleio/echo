@@ -1,3 +1,5 @@
+/* BroadcastChannel.postMessage has no targetOrigin parameter. */
+/* oxlint-disable unicorn/require-post-message-target-origin */
 import * as Arr from "effect/Array"
 import * as Clock from "effect/Clock"
 import * as Data from "effect/Data"
@@ -8,13 +10,14 @@ import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Record from "effect/Record"
 import * as Schema from "effect/Schema"
+import type * as EffectScope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as SubscriptionRef from "effect/SubscriptionRef"
 import { FetchHttpClient, HttpClient } from "effect/http"
 import { RpcClient, RpcSerialization } from "effect/rpc"
 import type * as Aggregate from "../domain/Aggregate.ts"
-import type { Principal } from "../domain/Scope.ts"
+import type { Principal, Scope } from "../domain/Scope.ts"
 import * as Protocol from "../protocol.ts"
 import * as Storage from "./BrowserStorage.ts"
 import * as Diagnostics from "./Diagnostics.ts"
@@ -24,6 +27,7 @@ export { ProfileBusy, StorageError } from "./BrowserStorage.ts"
 export type { Diagnostics, DiagnosticOperation } from "./Diagnostics.ts"
 export type { Read } from "./Model.ts"
 export class ClientClosed extends Data.TaggedError("ClientClosed") {}
+export class PendingIntents extends Data.TaggedError("PendingIntents")<{ readonly count: number }> {}
 export class ProfileMismatch extends Data.TaggedError("ProfileMismatch") {}
 export class ClientError extends Data.TaggedError("ClientError")<{ readonly cause: unknown }> {}
 export class TransportError extends Data.TaggedError("TransportError")<{
@@ -39,6 +43,7 @@ export interface Transport {
     request: Protocol.PullRequest
   ) => Effect.Effect<Protocol.PullResponse, TransportError | Protocol.ResyncRequired>
   readonly changes: Stream.Stream<Protocol.Change, TransportError>
+  readonly presence?: (request: Protocol.PresenceRequest) => Effect.Effect<void, TransportError>
 }
 export interface Options {
   /** Stable namespace including authority and domain identity, not just a user-facing label. */
@@ -50,7 +55,7 @@ export interface Options {
   readonly autoConnect?: boolean
 }
 export interface Status {
-  readonly connection: "idle" | "syncing" | "offline" | "error" | "auth" | "oversized"
+  readonly connection: "idle" | "syncing" | "offline" | "error" | "auth" | "oversized" | "reset"
   readonly pending: number
   readonly lastSynced: number | null
   readonly error: unknown
@@ -59,6 +64,27 @@ export type Notice = Model.Intent
 export type Outcome<A extends Aggregate.Any = Aggregate.Any> =
   | { readonly _tag: "Pending"; readonly id: string }
   | { readonly _tag: "Rejected"; readonly rejection: Model.DomainRejection<A> }
+
+export interface CommandEntry {
+  readonly aggregate: Aggregate.Any
+  readonly command: { readonly _tag: string; readonly target: string }
+}
+export const command = <A extends Aggregate.Any>(aggregate: A, value: Aggregate.CommandInstance<A>): CommandEntry => ({
+  aggregate,
+  command: value
+})
+export type BatchOutcome =
+  | { readonly _tag: "Pending"; readonly id: string }
+  | { readonly _tag: "Rejected"; readonly rejection: unknown }
+
+export type PresenceMember = Protocol.PresenceMember
+/** Null is reserved for leaving a room on the wire. */
+export type PresenceState = Exclude<Schema.Json, null>
+export interface PresenceRoom {
+  readonly members: Stream.Stream<ReadonlyArray<PresenceMember>>
+  readonly track: (state: PresenceState) => Effect.Effect<void, ClientClosed | ClientError | TransportError>
+  readonly leave: Effect.Effect<void, TransportError>
+}
 
 const failure = (cause: unknown): TransportError => {
   const oversized = Schema.is(
@@ -107,19 +133,53 @@ export const httpTransport = (url: string, requestInit: RequestInit = { credenti
           Effect.timeout("30 seconds"),
           Effect.mapError((error) => (error._tag === "ResyncRequired" ? error : failure(error)))
         ),
-      changes: rpc.Changes({}).pipe(Stream.mapError(failure))
+      changes: rpc.Changes({}).pipe(Stream.mapError(failure)),
+      presence: (request) => rpc.Presence(request).pipe(Effect.timeout("30 seconds"), Effect.mapError(failure))
     } satisfies Transport
   })
 
 const attempt = <A>(body: () => A) => Effect.try({ try: body, catch: (cause) => new ClientError({ cause }) })
-const emptyReplica = (): Model.Replica => ({ epoch: null, cursors: {}, rows: [] })
+const emptyReplica = (): Model.Replica => ({ epoch: null, revision: 0, grants: [], cursors: {}, rows: [] })
 // Length-prefix the aggregate so separators in either string cannot alias identities.
 const streamKey = (aggregate: string, id: string) => `${aggregate.length}:${aggregate}${id}`
 const covered = (intent: Model.Intent, replica: Model.Replica): boolean =>
-  intent.receipt?._tag === "Accepted" &&
-  Arr.every(intent.receipt.seqs, (ref) =>
-    Arr.some(replica.rows, (row) => row.aggregate === ref.aggregate && row.id === ref.id && row.seq >= ref.seq)
+  intent.receipt?._tag === "Accepted" && replica.epoch !== null && replica.revision >= intent.receipt.revision
+
+const profileNamespace = (options: { readonly profile: string; readonly principal: Principal }) =>
+  `${encodeURIComponent(options.profile)}:${encodeURIComponent(options.principal)}`
+
+export const resetProfile = Effect.fn("Echo.resetProfile")(function* (options: {
+  readonly profile: string
+  readonly principal: Principal
+  readonly discardPending?: boolean
+}) {
+  const namespace = profileNamespace(options)
+  yield* Storage.withLock(
+    `${namespace}:sync`,
+    Storage.withLock(
+      namespace,
+      Effect.gen(function* () {
+        const journalDb = yield* Storage.openDatabase(`echo:journal:${namespace}`)
+        const replicaDb = yield* Storage.openDatabase(`echo:replica:${namespace}`)
+        const saved = yield* Storage.load(journalDb)
+        const journal = saved === undefined ? undefined : yield* Schema.decodeUnknownEffect(Model.Journal)(saved)
+        const count = Arr.filter(journal?.intents ?? [], (intent) => intent.phase !== "Rejected").length
+        if (count > 0 && options.discardPending !== true) return yield* new PendingIntents({ count })
+        // Erasing identity first fences stale peers even if replica erasure fails.
+        yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            yield* Storage.save(journalDb, undefined)
+            const channel = new BroadcastChannel(`echo:${namespace}`)
+            // Peers check durable identity rather than withdrawing a newly opened generation.
+            channel.postMessage("replica")
+            channel.close()
+          })
+        )
+        yield* Storage.save(replicaDb, undefined)
+      })
+    )
   )
+})
 
 /** Hydrates before returning. All resources, connection work and ownership end with the caller's Scope. */
 export const open = (options: Options) =>
@@ -129,38 +189,53 @@ export const open = (options: Options) =>
       diagnostics.measure("journal", Storage.save(db, value), () => value.intents.length)
     const saveReplica = (db: IDBDatabase, value: Model.Replica) =>
       diagnostics.measure("replica", Storage.save(db, value), () => value.rows.length)
-    const namespace = `${encodeURIComponent(options.profile)}:${encodeURIComponent(options.principal)}`
-    yield* Storage.ownProfile(namespace)
+    const namespace = profileNamespace(options)
+    const channel = yield* Effect.acquireRelease(
+      Effect.sync(() => new BroadcastChannel(`echo:${namespace}`)),
+      (value) => Effect.sync(() => value.close())
+    )
     const journalDb = yield* Storage.openDatabase(`echo:journal:${namespace}`)
     const replicaDb = yield* Storage.openDatabase(`echo:replica:${namespace}`)
-    const saved = yield* Storage.load(journalDb)
-    const clientId = yield* Storage.randomId
-    let journal: Model.Journal = yield* saved === undefined
-      ? Effect.succeed({
-          principal: options.principal,
-          clientId,
-          epoch: null,
-          intents: []
-        })
-      : Schema.decodeUnknownEffect(Model.Journal)(saved)
-    if (journal.principal !== options.principal) return yield* Effect.fail(new ProfileMismatch())
-    yield* saveJournal(journalDb, journal)
-    const cached = yield* Storage.load(replicaDb)
-    let replica = yield* saved === undefined || cached === undefined
-      ? Effect.succeed(emptyReplica())
-      : Schema.decodeUnknownEffect(Model.Replica)(cached)
-    const invalidCache = replica.epoch !== journal.epoch
-    if (invalidCache) replica = emptyReplica()
-    if (saved === undefined || cached === undefined || invalidCache) yield* saveReplica(replicaDb, replica)
+    const hydrated = yield* Storage.withLock(
+      namespace,
+      Effect.gen(function* () {
+        const saved = yield* Storage.load(journalDb)
+        const clientId = yield* Storage.randomId
+        let journal: Model.Journal = yield* saved === undefined
+          ? Effect.succeed({
+              principal: options.principal,
+              clientId,
+              epoch: null,
+              intents: []
+            })
+          : Schema.decodeUnknownEffect(Model.Journal)(saved)
+        if (journal.principal !== options.principal) return yield* Effect.fail(new ProfileMismatch())
+        yield* saveJournal(journalDb, journal)
+        const cached = yield* Storage.load(replicaDb)
+        let replica = yield* saved === undefined || cached === undefined
+          ? Effect.succeed(emptyReplica())
+          : Schema.decodeUnknownEffect(Model.Replica)(cached)
+        const invalidCache = replica.epoch !== journal.epoch
+        if (invalidCache) replica = emptyReplica()
+        if (saved === undefined || cached === undefined || invalidCache) yield* saveReplica(replicaDb, replica)
+        return { journal, replica }
+      })
+    )
+    let journal = hydrated.journal
+    let replica = hydrated.replica
     let closed = false
     const stopped = yield* Deferred.make<void>()
+    const resourceStopped = yield* Deferred.make<void>()
     const live = <A>(stream: Stream.Stream<A>): Stream.Stream<A> =>
-      Stream.suspend(() => (closed ? Stream.empty : stream.pipe(Stream.interruptWhen(Deferred.await(stopped)))))
+      Stream.suspend(() => (closed ? Stream.empty : stream.pipe(Stream.interruptWhen(Deferred.await(resourceStopped)))))
     const mutex = yield* Semaphore.make(1)
     const syncMutex = yield* Semaphore.make(1)
     const requested = yield* SubscriptionRef.make(0)
+    let isNetworkOwner = false
+    const frame = yield* SubscriptionRef.make<Protocol.Change>({ _tag: "Keepalive", epoch: "" })
     const state = yield* SubscriptionRef.make<ReadonlyArray<Model.Row>>([])
-    const read = Model.makeReader(options.principal)
+    let read = Model.makeReader(options.principal, replica.grants)
+    const snapshotReaders = new WeakMap<ReadonlyArray<Model.Row>, ReturnType<typeof Model.makeReader>>()
     let publishedJournal: Model.Journal | undefined
     let publishedReplica: Model.Replica | undefined
     let rejectPending = false
@@ -172,12 +247,51 @@ export const open = (options: Options) =>
       error: null
     })
     const guard = Effect.suspend(() => (closed ? Effect.fail(new ClientClosed()) : Effect.void))
+    const withdraw = Effect.gen(function* () {
+      closed = true
+      yield* SubscriptionRef.set(state, [])
+      yield* SubscriptionRef.set(notices, [])
+      yield* SubscriptionRef.set(frame, { _tag: "Keepalive", epoch: "" })
+      yield* SubscriptionRef.set(status, { connection: "reset", pending: 0, lastSynced: null, error: null })
+      yield* Deferred.succeed(stopped, undefined)
+    })
+    const refresh = Effect.gen(function* () {
+      const saved = yield* Storage.load(journalDb)
+      if (saved === undefined) {
+        yield* withdraw
+        return yield* new ClientClosed()
+      }
+      const nextJournal = yield* Schema.decodeUnknownEffect(Model.Journal)(saved)
+      if (nextJournal.clientId !== journal.clientId) {
+        yield* withdraw
+        return yield* new ClientClosed()
+      }
+      const cached = yield* Storage.load(replicaDb)
+      const nextReplica =
+        cached === undefined ? emptyReplica() : yield* Schema.decodeUnknownEffect(Model.Replica)(cached)
+      if (!Equal.equals(journal, nextJournal)) journal = nextJournal
+      if (!Equal.equals(replica, nextReplica))
+        replica = nextReplica.epoch === journal.epoch ? nextReplica : emptyReplica()
+    })
     const locked = <A, E>(effect: Effect.Effect<A, E>) =>
-      mutex.withPermit(Effect.uninterruptible(Effect.andThen(guard, effect)))
+      mutex.withPermit(
+        Storage.withLock(
+          namespace,
+          Effect.uninterruptible(
+            Effect.gen(function* () {
+              yield* guard
+              yield* refresh
+              return yield* effect
+            })
+          )
+        )
+      )
     const writeJournal = (next: Model.Journal) =>
       Effect.gen(function* () {
+        if (Equal.equals(journal, next)) return
         yield* saveJournal(journalDb, next)
         journal = next
+        channel.postMessage("changed")
       })
     const publish = (rejectUnsent = false, prediction?: ReadonlyArray<Model.Row>) =>
       Effect.gen(function* () {
@@ -191,7 +305,9 @@ export const open = (options: Options) =>
             continue
           }
           if (covered(intent, replica)) continue
-          const decision = yield* attempt(() => Model.decide(options.aggregates, rows, options.principal, intent))
+          const decision = yield* attempt(() =>
+            Model.decide(options.aggregates, rows, options.principal, intent, replica.grants)
+          )
           if (decision.rejection === null) {
             rows = decision.rows
             intents.push(intent)
@@ -202,8 +318,17 @@ export const open = (options: Options) =>
         // Rows derive solely from already durable intents and the current confirmed replica.
         // A failed retirement/notice write must not leave subsequent decisions on stale hot state.
         const previous = SubscriptionRef.getUnsafe(state)
-        if (previous.length !== rows.length || !Arr.every(rows, (row, i) => Equal.equals(row, previous[i])))
+        const grantsChanged = publishedReplica?.grants !== replica.grants
+        if (grantsChanged) read = Model.makeReader(options.principal, replica.grants)
+        if (
+          grantsChanged ||
+          previous.length !== rows.length ||
+          !Arr.every(rows, (row, i) => Equal.equals(row, previous[i]))
+        ) {
+          rows = [...rows]
+          snapshotReaders.set(rows, read)
           yield* SubscriptionRef.set(state, rows)
+        }
         if (!Equal.equals(journal.intents, intents)) yield* writeJournal({ ...journal, intents })
         yield* SubscriptionRef.set(
           notices,
@@ -221,12 +346,13 @@ export const open = (options: Options) =>
         publishedReplica = replica
         rejectPending = false
       }).pipe((effect) => diagnostics.measure("rebase", effect, () => SubscriptionRef.getUnsafe(state).length))
-    yield* publish()
+    yield* locked(publish())
     yield* Effect.addFinalizer(() =>
       mutex.withPermit(
         Effect.gen(function* () {
           closed = true
           yield* Deferred.succeed(stopped, undefined)
+          yield* Deferred.succeed(resourceStopped, undefined)
         })
       )
     )
@@ -273,6 +399,8 @@ export const open = (options: Options) =>
           if (
             response.epoch === journal.epoch &&
             response.epoch === replica.epoch &&
+            response.revision === replica.revision &&
+            Equal.equals(response.grants, replica.grants) &&
             scopes.size === response.scopes.length &&
             scopes.size === Record.keys(replica.cursors).length &&
             Arr.every(
@@ -332,9 +460,16 @@ export const open = (options: Options) =>
           }
           // Journal epoch first: a crash here invalidates the old replica on the next open.
           yield* writeJournal({ ...journal, epoch: response.epoch })
-          const next = { epoch: response.epoch, rows: [...rows.values()], cursors }
+          const next = {
+            epoch: response.epoch,
+            revision: response.revision,
+            grants: response.grants,
+            rows: [...rows.values()],
+            cursors
+          }
           yield* saveReplica(replicaDb, next)
           replica = next
+          channel.postMessage("replica")
           yield* publish(true)
         })
       )
@@ -352,7 +487,13 @@ export const open = (options: Options) =>
             return {
               epoch: journal.epoch,
               clientId: journal.clientId,
-              batches: [{ id: intent.id, commands: [{ aggregate: intent.aggregate, command: intent.command }] }]
+              batches: [
+                {
+                  id: intent.id,
+                  commands: intent.commands,
+                  ...(intent.action === undefined ? {} : { action: intent.action })
+                }
+              ]
             }
           })
         )
@@ -389,29 +530,32 @@ export const open = (options: Options) =>
       })
     const sync = syncMutex
       .withPermit(
-        Effect.gen(function* () {
-          yield* guard
-          yield* SubscriptionRef.update(status, (s): Status => ({ ...s, connection: "syncing", error: null }))
-          // Recover lost receipts BEFORE applying any newer snapshot: otherwise a non-idempotent prediction doubles.
-          const sent = yield* locked(Effect.sync(() => Arr.filter(journal.intents, (i) => i.phase === "Sent")))
-          for (const intent of sent) yield* send(intent)
-          yield* pull
-          while (true) {
-            const intent = yield* locked(
-              Effect.sync(() => Option.getOrUndefined(Arr.findFirst(journal.intents, (i) => i.phase === "Pending")))
-            )
-            if (intent === undefined) break
-            yield* send(intent)
+        Storage.withLock(
+          `${namespace}:sync`,
+          Effect.gen(function* () {
+            yield* guard
+            yield* SubscriptionRef.update(status, (s): Status => ({ ...s, connection: "syncing", error: null }))
+            // Recover lost receipts BEFORE applying any newer snapshot: otherwise a non-idempotent prediction doubles.
+            const sent = yield* locked(Effect.sync(() => Arr.filter(journal.intents, (i) => i.phase === "Sent")))
+            for (const intent of sent) yield* send(intent)
             yield* pull
-          }
-          const now = yield* Clock.currentTimeMillis
-          yield* SubscriptionRef.update(status, (s): Status => ({
-            ...s,
-            connection: "idle",
-            lastSynced: now,
-            error: null
-          }))
-        })
+            while (true) {
+              const intent = yield* locked(
+                Effect.sync(() => Option.getOrUndefined(Arr.findFirst(journal.intents, (i) => i.phase === "Pending")))
+              )
+              if (intent === undefined) break
+              yield* send(intent)
+              yield* pull
+            }
+            const now = yield* Clock.currentTimeMillis
+            yield* SubscriptionRef.update(status, (s): Status => ({
+              ...s,
+              connection: "idle",
+              lastSynced: now,
+              error: null
+            }))
+          })
+        )
       )
       .pipe(
         Effect.catch((error) =>
@@ -427,20 +571,28 @@ export const open = (options: Options) =>
         )
       )
 
-    function execute<A extends Aggregate.Any>(aggregate: A, command: Aggregate.CommandInstance<A>) {
+    function enqueue(
+      entries: ReadonlyArray<CommandEntry>,
+      action?: { readonly name: string; readonly input: unknown }
+    ) {
       return locked(
         Effect.gen(function* () {
           // A prior sync may have durably advanced the replica before journal reconciliation failed.
           // Recover from that state before deciding another local command, rather than using stale hot rows.
           yield* publish()
-          const commandClass = Option.getOrUndefined(
-            Arr.findFirst(aggregate.definition.commands, (c) => c.tag === command._tag)
+          const commands = yield* attempt(() =>
+            Arr.map(entries, ({ aggregate, command: value }) => {
+              const schema = Option.getOrUndefined(
+                Arr.findFirst(aggregate.definition.commands, (c) => c.tag === value._tag)
+              )
+              if (schema === undefined) throw new Error("Unknown command")
+              return { aggregate: aggregate.tag, command: Model.encode(schema, value) }
+            })
           )
-          if (commandClass === undefined) return yield* Effect.fail(new ClientError({ cause: "Unknown command" }))
           const intent: Model.Intent = {
             id: yield* Storage.randomId,
-            aggregate: aggregate.tag,
-            command: yield* attempt(() => Model.encode(commandClass, command)),
+            commands,
+            ...(action === undefined ? {} : { action }),
             now: yield* Clock.currentTimeMillis,
             attemptEpoch: null,
             dismissed: false,
@@ -449,20 +601,37 @@ export const open = (options: Options) =>
             rejection: null
           }
           const decision = yield* attempt(() =>
-            Model.decide(options.aggregates, SubscriptionRef.getUnsafe(state), options.principal, intent)
+            Model.decide(
+              options.aggregates,
+              SubscriptionRef.getUnsafe(state),
+              options.principal,
+              intent,
+              replica.grants
+            )
           )
           if (decision.rejection !== null)
             return {
               _tag: "Rejected",
-              rejection: yield* attempt(() => Model.decodeRejection(aggregate, decision.rejection))
-            } satisfies Outcome<A>
+              rejection: decision.rejection
+            } satisfies BatchOutcome
           yield* writeJournal({ ...journal, intents: [...journal.intents, intent] })
           // The mutex and successful recovery above make this the durable journal's exact next prediction.
           yield* publish(false, decision.rows)
           yield* SubscriptionRef.update(requested, (n) => n + 1)
-          return { _tag: "Pending", id: intent.id } satisfies Outcome
+          return { _tag: "Pending", id: intent.id } satisfies BatchOutcome
         })
       )
+    }
+    function execute<A extends Aggregate.Any>(aggregate: A, value: Aggregate.CommandInstance<A>) {
+      return Effect.gen(function* () {
+        const result = yield* enqueue([command(aggregate, value)])
+        return result._tag === "Pending"
+          ? result
+          : ({
+              _tag: "Rejected",
+              rejection: yield* attempt(() => Model.decodeRejection(aggregate, result.rejection))
+            } satisfies Outcome<A>)
+      })
     }
     function query<A>(select: (read: Model.Read) => A): A {
       if (closed) throw new ClientClosed()
@@ -471,19 +640,23 @@ export const open = (options: Options) =>
     function subscribe<A>(select: (read: Model.Read) => A): Stream.Stream<A> {
       return live(
         SubscriptionRef.changes(state).pipe(
-          Stream.map((rows) => select(read(rows))),
+          Stream.map((rows) => select((snapshotReaders.get(rows) ?? read)(rows))),
           Stream.changesWith((a, b) => Equal.equals(a, b))
         )
       )
     }
     const resetReplica = syncMutex.withPermit(
-      locked(
-        Effect.gen(function* () {
-          const next = emptyReplica()
-          yield* saveReplica(replicaDb, next)
-          replica = next
-          yield* publish()
-        })
+      Storage.withLock(
+        `${namespace}:sync`,
+        locked(
+          Effect.gen(function* () {
+            const next = emptyReplica()
+            yield* saveReplica(replicaDb, next)
+            replica = next
+            yield* publish()
+            channel.postMessage("changed")
+          })
+        )
       )
     )
     const dismiss = (id: string) =>
@@ -515,6 +688,12 @@ export const open = (options: Options) =>
           SubscriptionRef.changes(requested).pipe(Stream.map(() => undefined)),
           options.transport.changes.pipe(
             Stream.timeout("55 seconds"),
+            Stream.tap((change) =>
+              Effect.gen(function* () {
+                yield* SubscriptionRef.set(frame, change)
+                channel.postMessage(change)
+              })
+            ),
             Stream.filter((change) => change._tag === "Poke" || change.epoch !== journal.epoch),
             Stream.map(() => undefined)
           ),
@@ -536,9 +715,114 @@ export const open = (options: Options) =>
         yield* retry
       })
     ).pipe(Effect.catchTag("TransportError", () => Effect.void))
-    if (options.autoConnect !== false) yield* Effect.forkScoped(connect)
+    yield* Stream.fromEventListener<MessageEvent>(channel, "message").pipe(
+      Stream.runForEach((event) => {
+        const value: unknown = event.data
+        if (Schema.is(Protocol.Change)(value)) return SubscriptionRef.set(frame, value)
+        if (value === "hello")
+          return Effect.sync(() => {
+            if (isNetworkOwner) channel.postMessage(SubscriptionRef.getUnsafe(frame))
+          })
+        return locked(
+          Effect.gen(function* () {
+            yield* publish()
+            if (value !== "replica") yield* SubscriptionRef.update(requested, (n) => n + 1)
+          })
+        )
+      }),
+      Effect.race(Deferred.await(stopped)),
+      Effect.catch(() => Effect.void),
+      Effect.forkScoped
+    )
+    if (options.autoConnect !== false)
+      yield* Effect.forkScoped(
+        Storage.withLock(
+          `${namespace}:leader`,
+          Effect.gen(function* () {
+            isNetworkOwner = true
+            yield* connect
+          }).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                isNetworkOwner = false
+              })
+            )
+          )
+        ).pipe(Effect.race(Deferred.await(stopped)))
+      )
+    channel.postMessage("hello")
+    const presence = Effect.fn("Echo.Client.presence")(function* (
+      room: Scope,
+      initial: PresenceState
+    ): Effect.fn.Return<PresenceRoom, ClientClosed | ClientError, EffectScope.Scope> {
+      yield* guard
+      if (initial === null) return yield* new ClientError({ cause: "Null presence state is reserved for leave" })
+      const sendPresence = options.transport.presence
+      if (sendPresence === undefined) return yield* new ClientError({ cause: "Transport does not support presence" })
+      const clientId = yield* Storage.randomId
+      let current = initial
+      let left = false
+      let connectionId: string | undefined
+      const roomStopped = yield* Deferred.make<void>()
+      const track = (value: PresenceState) =>
+        Effect.gen(function* () {
+          yield* guard
+          if (value === null) return yield* new ClientError({ cause: "Null presence state is reserved for leave" })
+          if (left || connectionId === undefined) return yield* new ClientError({ cause: "Presence is disconnected" })
+          current = value
+          yield* sendPresence({ room, clientId, connectionId, state: value })
+        })
+      const leave = Effect.gen(function* () {
+        if (left) return
+        left = true
+        yield* Deferred.succeed(roomStopped, undefined)
+        if (connectionId !== undefined) yield* sendPresence({ room, clientId, connectionId, state: null })
+      })
+      yield* Effect.addFinalizer(() => leave.pipe(Effect.catch(() => Effect.void)))
+      yield* SubscriptionRef.changes(frame).pipe(
+        Stream.runForEach((change) =>
+          Effect.gen(function* () {
+            if (!left && !closed && change.connectionId !== undefined && change.connectionId !== connectionId) {
+              connectionId = change.connectionId
+              yield* sendPresence({ room, clientId, connectionId, state: current }).pipe(
+                Effect.catch(() => Effect.void)
+              )
+            }
+          })
+        ),
+        Effect.race(Deferred.await(stopped)),
+        Effect.race(Deferred.await(roomStopped)),
+        Effect.forkScoped
+      )
+      yield* Effect.forever(
+        Effect.gen(function* () {
+          yield* Effect.sleep("20 seconds")
+          if (!left && connectionId !== undefined) yield* track(current).pipe(Effect.catch(() => Effect.void))
+        })
+      ).pipe(Effect.race(Deferred.await(stopped)), Effect.race(Deferred.await(roomStopped)), Effect.forkScoped)
+      return {
+        track,
+        leave,
+        members: live(
+          SubscriptionRef.changes(frame).pipe(
+            Stream.map((change) => Arr.filter(change.presence ?? [], (member) => member.room === room)),
+            Stream.changesWith((a, b) => Equal.equals(a, b))
+          )
+        )
+      }
+    })
     return {
       execute,
+      presence,
+      batch: (entries: ReadonlyArray<CommandEntry>) => enqueue(entries),
+      action: (name: string, input: unknown) => enqueue([], { name, input }),
+      pending: locked(Effect.sync(() => Arr.filter(journal.intents, (intent) => intent.phase !== "Rejected"))),
+      requestSync: Effect.andThen(
+        guard,
+        Effect.sync(() => {
+          channel.postMessage("sync")
+        })
+      ).pipe(Effect.andThen(SubscriptionRef.update(requested, (n) => n + 1))),
       query,
       subscribe,
       sync,

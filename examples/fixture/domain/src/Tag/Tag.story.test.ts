@@ -7,8 +7,25 @@ import { DefineTag, DuplicateName, TagDefined } from "./DefineTag.command.ts"
 import { RemoveTag, TagInUse, TagRemoved } from "./RemoveTag.command.ts"
 import { Tag } from "./Tag.aggregate.ts"
 import { TagHistoryImported } from "./TagHistoryImported.event.ts"
+import { MoveTag, TagMoved } from "./MoveTag.command.ts"
 
 const { catalogScope, privateScope, ScopeForbidden } = Domain.Scope
+
+const shared = Domain.Scope.Scope.make("shared:fixture")
+Story.make(Tag, "a writer can move a private tag into a granted scope", {
+  given: [new TagDefined({ name: "move", scope: privateScope(member) })],
+  when: new MoveTag({ target: idea, scope: shared }),
+  as: member,
+  grants: [{ scope: shared, principal: member, role: "writer" }],
+  then: [new TagMoved({ scope: shared })]
+})
+Story.make(Tag, "a reader cannot move a private tag into a shared scope", {
+  given: [new TagDefined({ name: "move", scope: privateScope(member) })],
+  when: new MoveTag({ target: idea, scope: shared }),
+  as: member,
+  grants: [{ scope: shared, principal: member, role: "reader" }],
+  then: new ScopeForbidden({ scope: shared })
+})
 
 Story.make(Tag, "an imported snapshot can be removed by its owner", {
   given: [new TagHistoryImported({ snapshot: { name: "historical", scope: privateScope(member), removed: false } })],

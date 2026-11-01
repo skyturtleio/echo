@@ -92,6 +92,8 @@ const check = (condition: boolean, message: string) =>
   })
 const snapshot = (amount: number, seq = 1, epoch = "one"): PullResponse => ({
   epoch,
+  revision: seq,
+  grants: [],
   scopes: [
     {
       scope: `user:${principal}`,
@@ -184,6 +186,7 @@ const lostReceipt = (profile: string) =>
               receipts: Arr.map(request.batches, (batch) => ({
                 _tag: "Accepted",
                 batchId: batch.id,
+                revision: 1,
                 seqs: [{ aggregate: "Counter", id: "one", seq: 1 }]
               }))
             }
@@ -292,7 +295,8 @@ const rebaseAndEpoch = (profile: string) =>
           Arr.some(
             uncertain.value,
             (notice) =>
-              notice.phase === "Unknown" && Schema.is(Schema.Struct({ amount: Schema.Literal(1) }))(notice.command)
+              notice.phase === "Unknown" &&
+              Schema.is(Schema.Struct({ amount: Schema.Literal(1) }))(notice.commands[0]?.command)
           ),
         "epoch lost uncertain command"
       )
@@ -332,7 +336,7 @@ const rebaseAndEpoch = (profile: string) =>
         const recovery = yield* Client.open(
           options(`${profile}-recovery-${accepted}`, {
             changes: Stream.never,
-            pull: () => Effect.succeed(snapshot(remoteValue)),
+            pull: () => Effect.succeed(snapshot(remoteValue, remoteValue === 0 ? 0 : 1)),
             execute: (request) =>
               Effect.sync(() => {
                 remoteValue = 3
@@ -344,6 +348,7 @@ const rebaseAndEpoch = (profile: string) =>
                       ({
                         _tag: "Accepted",
                         batchId: batch.id,
+                        revision: 1,
                         seqs: [{ aggregate: "Counter", id: "one", seq: 1 }]
                       }) satisfies Receipt
                   )
@@ -405,6 +410,8 @@ const rebaseAndEpoch = (profile: string) =>
       })
       let reply: PullResponse = {
         epoch: "catalog",
+        revision: 1,
+        grants: [],
         scopes: [
           {
             scope: catalog,
@@ -440,6 +447,8 @@ const rebaseAndEpoch = (profile: string) =>
       // from the old scope must not delete a stream that moved to the other scope.
       reply = {
         epoch: "catalog",
+        revision: 2,
+        grants: [],
         scopes: [
           {
             scope: catalog,
@@ -489,6 +498,8 @@ const rebaseAndEpoch = (profile: string) =>
       )
       reply = {
         epoch: "catalog",
+        revision: 3,
+        grants: [],
         scopes: [
           // Move twice before resetting the old scope in this same Pull: rebuilding the
           // index on a later sync would hide stale membership left behind by replacement.
@@ -507,6 +518,8 @@ const rebaseAndEpoch = (profile: string) =>
       )
       reply = {
         epoch: "catalog",
+        revision: 4,
+        grants: [],
         scopes: [
           {
             scope: other,
@@ -527,7 +540,12 @@ const rebaseAndEpoch = (profile: string) =>
           catalogClient.query((read) => read.get(Counter, "b"))?.value === 20,
         "invalid overwritten entry escaped validation or partially published"
       )
-      reply = { epoch: "catalog", scopes: [{ scope: catalog, cursor: 6, reset: false, entries: [] }] }
+      reply = {
+        epoch: "catalog",
+        revision: 5,
+        grants: [],
+        scopes: [{ scope: catalog, cursor: 6, reset: false, entries: [] }]
+      }
       yield* catalogClient.sync
       yield* check(
         cursors[other] === 1 && catalogClient.query((read) => read.scan(Counter)).length === 0,
@@ -573,8 +591,12 @@ const lifetime = (profile: string) =>
       { concurrency: "unbounded" }
     ).pipe(Effect.forkChild)
     yield* add(first, 2)
-    const busy = yield* Effect.scoped(Client.open(options(profile))).pipe(Effect.flip)
-    yield* check(busy._tag === "ProfileBusy", "second opener did not fail ProfileBusy")
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const peer = yield* Client.open(options(profile))
+        yield* check(value(peer) === 2, "second tab lost durable effective state")
+      })
+    )
     yield* Effect.scoped(
       Effect.gen(function* () {
         const other = yield* Client.open({
@@ -630,6 +652,8 @@ const queries = (profile: string) =>
       const catalog = "catalog:query"
       let response: PullResponse = {
         epoch: "query",
+        revision: 1,
+        grants: [],
         scopes: [
           {
             scope: catalog,
@@ -680,7 +704,12 @@ const queries = (profile: string) =>
           Effect.forkScoped
         )
       yield* Effect.yieldNow
-      response = { epoch: "query", scopes: [{ scope: catalog, cursor: 1, reset: false, entries: [] }] }
+      response = {
+        epoch: "query",
+        revision: 1,
+        grants: [],
+        scopes: [{ scope: catalog, cursor: 1, reset: false, entries: [] }]
+      }
       const savedBefore = Arr.filter(
         (yield* references.diagnostics).operations,
         (op) => op.operation === "replica" || op.operation === "journal"
@@ -695,6 +724,8 @@ const queries = (profile: string) =>
       )
       response = {
         epoch: "query",
+        revision: 2,
+        grants: [],
         scopes: [
           {
             scope: catalog,
@@ -1336,9 +1367,191 @@ const diagnostics = (profile: string) =>
     })
   )
 
+const batches = (profile: string) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const client = yield* Client.open(options(profile))
+      const rejected = yield* client.batch([
+        Client.command(Counter, new Add({ target: "one", amount: 4 })),
+        Client.command(Counter, new Add({ target: "one", amount: 8 }))
+      ])
+      yield* check(
+        rejected._tag === "Rejected" && value(client) === 0 && (yield* client.pending).length === 0,
+        "batch published partial prediction"
+      )
+      const accepted = yield* client.batch([
+        Client.command(Counter, new Add({ target: "one", amount: 2 })),
+        Client.command(Counter, new Add({ target: "one", amount: 3 }))
+      ])
+      yield* check(
+        accepted._tag === "Pending" && value(client) === 5 && (yield* client.pending).length === 1,
+        "batch did not journal one ordered prediction"
+      )
+      yield* client.action("membership-transition", { destination: "private" })
+      const pending = yield* client.pending
+      yield* check(
+        value(client) === 5 && pending.length === 2 && pending[1]?.action?.name === "membership-transition",
+        "action predicted or lost identity"
+      )
+      const peer = yield* Client.open(options(profile))
+      yield* check(value(peer) === 5 && (yield* peer.pending).length === 2, "journal hydration lost action or batch")
+      return "PASS INV-CLIENT-7 atomic rollback/ordered prediction; one durable batch; unpredicted action survives reopen"
+    })
+  )
+
+const ownership = (profile: string) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const first = yield* Client.open(options(profile))
+      const second = yield* Client.open(options(profile))
+      yield* Effect.all([add(first, 2), add(second, 3)], { concurrency: "unbounded" })
+      yield* second
+        .subscribe((read) => read.get(Counter, "one")?.value)
+        .pipe(
+          Stream.filter((amount) => amount === 5),
+          Stream.runHead,
+          Effect.timeout("3 seconds")
+        )
+      yield* check((yield* first.pending).length === 2, "concurrent tabs lost a durable intent")
+      const refused = yield* Client.resetProfile({ profile, principal }).pipe(Effect.flip)
+      yield* check(
+        refused._tag === "PendingIntents" && refused.count === 2,
+        "reset did not count peer's unresolved intents"
+      )
+      const resetStatus = yield* second.status.pipe(
+        Stream.filter((status) => status.connection === "reset"),
+        Stream.runHead,
+        Effect.forkScoped
+      )
+      const withdrawn = yield* second
+        .subscribe((read) => read.scan(Counter))
+        .pipe(
+          Stream.filter((rows) => rows.length === 0),
+          Stream.runHead,
+          Effect.forkScoped
+        )
+      const transaction = IDBDatabase.prototype.transaction
+      Object.defineProperty(IDBDatabase.prototype, "transaction", {
+        configurable: true,
+        writable: true,
+        value: function (this: IDBDatabase, ...args: Parameters<typeof transaction>) {
+          const tx = transaction.call(this, ...args)
+          if (Str.startsWith("echo:replica:")(this.name) && args[1] === "readwrite") queueMicrotask(() => tx.abort())
+          return tx
+        }
+      })
+      yield* Client.resetProfile({ profile, principal, discardPending: true }).pipe(
+        Effect.flip,
+        Effect.ensuring(
+          Effect.sync(() => {
+            IDBDatabase.prototype.transaction = transaction
+          })
+        )
+      )
+      yield* Fiber.join(resetStatus).pipe(Effect.timeout("3 seconds"))
+      yield* Fiber.join(withdrawn).pipe(Effect.timeout("3 seconds"))
+      yield* check(
+        (yield* add(first, 1).pipe(Effect.flip))._tag === "ClientClosed",
+        "stale peer repopulated reset journal"
+      )
+      const fresh = yield* Client.open(options(profile))
+      yield* check(value(fresh) === 0 && (yield* fresh.pending).length === 0, "reset retained data")
+
+      const ownerScope = yield* Scope.make()
+      const followerScope = yield* Scope.make()
+      let active = 0
+      let max = 0
+      let amount = 4
+      let blocked = false
+      const pulling = yield* Deferred.make<void>()
+      const releasePull = yield* Deferred.make<void>()
+      const pokes = yield* SubscriptionRef.make<Change>({ _tag: "Poke", epoch: "one" })
+      const transport: Client.Transport = {
+        ...disconnected,
+        pull: () =>
+          Effect.gen(function* () {
+            if (blocked) {
+              yield* Deferred.succeed(pulling, undefined)
+              yield* Deferred.await(releasePull)
+            }
+            return snapshot(amount)
+          }),
+        changes: Stream.unwrap(
+          Effect.acquireRelease(
+            Effect.sync(() => {
+              active++
+              max = Math.max(max, active)
+            }),
+            () =>
+              Effect.sync(() => {
+                active--
+              })
+          ).pipe(Effect.as(SubscriptionRef.changes(pokes)))
+        )
+      }
+      const owner = yield* Client.open({ ...options(`${profile}-network`, transport), autoConnect: true }).pipe(
+        Effect.provideService(Scope.Scope, ownerScope)
+      )
+      const follower = yield* Client.open({ ...options(`${profile}-network`, transport), autoConnect: true }).pipe(
+        Effect.provideService(Scope.Scope, followerScope)
+      )
+      yield* follower
+        .subscribe((read) => read.get(Counter, "one")?.value)
+        .pipe(
+          Stream.filter((n) => n === 4),
+          Stream.runHead,
+          Effect.timeout("3 seconds")
+        )
+      blocked = true
+      const inflight = yield* owner.sync.pipe(Effect.forkScoped)
+      yield* Deferred.await(pulling).pipe(Effect.timeout("3 seconds"))
+      let resetFinished = false
+      const reset = yield* follower.resetReplica.pipe(
+        Effect.tap(() =>
+          Effect.sync(() => {
+            resetFinished = true
+          })
+        ),
+        Effect.forkScoped
+      )
+      yield* Effect.sleep("50 millis")
+      yield* check(!resetFinished, "follower reset raced an in-flight owner Pull")
+      blocked = false
+      yield* Deferred.succeed(releasePull, undefined)
+      yield* Fiber.join(inflight)
+      yield* Fiber.join(reset)
+      amount = 7
+      yield* SubscriptionRef.update(pokes, (change) => ({ ...change }))
+      yield* owner.requestSync
+      yield* follower
+        .subscribe((read) => read.get(Counter, "one")?.value)
+        .pipe(
+          Stream.filter((n) => n === 7),
+          Stream.runHead,
+          Effect.timeout("3 seconds")
+        )
+      yield* Scope.close(followerScope, Exit.void).pipe(Effect.timeout("3 seconds"))
+      const successor = yield* Client.open({ ...options(`${profile}-network`, transport), autoConnect: true })
+      yield* Scope.close(ownerScope, Exit.void).pipe(Effect.timeout("3 seconds"))
+      amount = 8
+      yield* successor.requestSync
+      yield* successor
+        .subscribe((read) => read.get(Counter, "one")?.value)
+        .pipe(
+          Stream.filter((n) => n === 8),
+          Stream.runHead,
+          Effect.timeout("3 seconds")
+        )
+      yield* check(max === 1, "competing network owners")
+      return "PASS INV-CLIENT-8 concurrent journals, replica broadcasts, follower close, owner takeover, pending refusal and reset fencing"
+    })
+  )
+
 const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect)
 Object.assign(globalThis, {
   echoScenarios: {
+    batches: (profile: string) => run(batches(profile)),
+    ownership: (profile: string) => run(ownership(profile)),
     diagnostics: (profile: string) => run(diagnostics(profile)),
     largeCatalog: (profile: string, reload = false) => run(largeCatalog(profile, reload)),
     oversizedCatalog: (profile: string) => run(oversizedCatalog(profile)),

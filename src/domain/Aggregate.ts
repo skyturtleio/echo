@@ -7,7 +7,7 @@ import type * as Command from "./Command.ts"
 import type * as Event from "./Event.ts"
 import type * as Index from "./Indexes.ts"
 import type { Bivariant } from "./internal/classes.ts"
-import type { Principal, Scope } from "./Scope.ts"
+import type { Grant, Principal, Scope } from "./Scope.ts"
 
 /**
  * The instance type of a domain class: `InstanceOf<typeof DuplicateName>` is `DuplicateName`.
@@ -35,6 +35,7 @@ export type Decision<C extends Command.Any> =
 export interface DecideContext {
   readonly principal: Principal
   readonly now: DateTime.Utc
+  readonly grants: ReadonlyArray<Grant>
   read<A extends Any>(aggregate: A, id: IdOf<A>): StateOf<A> | null
   read<I extends Index.Any>(index: I, value: Index.Value<I>): ReadonlyArray<Index.Entry<I>>
 }

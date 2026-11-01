@@ -18,6 +18,13 @@ import * as EventModule from "./Event.ts"
 import * as IndexModule from "./Indexes.ts"
 import * as RejectionModule from "./Rejection.ts"
 
+export type { EventClass, Fields } from "./Event.ts"
+export type { CommandClass, InputFields } from "./Command.ts"
+export type { AggregateClass, Definition, AnyDefinition, ByTag, EventsOf, InstanceOf, Decision } from "./Aggregate.ts"
+export type { RejectionClass } from "./Rejection.ts"
+export type { IdSchema, Spec, Set, KeysOf, FieldType, Indexed } from "./Indexes.ts"
+export type { Bivariant } from "./internal/classes.ts"
+
 export declare namespace Event {
   export type Any = EventModule.Any
   export type Instance<Tag extends string, F extends EventModule.Fields> = EventModule.Instance<Tag, F>

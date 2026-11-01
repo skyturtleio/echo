@@ -4,6 +4,7 @@ import * as Option from "effect/Option"
 import { NoteIndexes } from "../Note/Note.indexes.ts"
 import { DefineTag, DuplicateName, TagAlreadyDefined, TagDefined } from "./DefineTag.command.ts"
 import { NoSuchTag, RemoveTag, TagInUse, TagRemoved } from "./RemoveTag.command.ts"
+import { MoveTag, RelocateTag, TagMoved } from "./MoveTag.command.ts"
 import { TagId } from "./Tag.id.ts"
 import { TagIndexes } from "./Tag.indexes.ts"
 import { TagState } from "./Tag.state.ts"
@@ -18,11 +19,13 @@ export class Tag extends Domain.Aggregate("Tag", {
   id: TagId,
   state: TagState,
   initial: null,
-  commands: [DefineTag, RemoveTag],
+  commands: [DefineTag, RemoveTag, MoveTag, RelocateTag],
   events: [TagHistoryImported],
   scope: (state) => state?.scope ?? null,
   indexes: TagIndexes,
   decide: {
+    MoveTag: (state, { scope }) => (state === null ? new NoSuchTag() : [new TagMoved({ scope })]),
+    RelocateTag: (state, { scope }) => (state === null ? new NoSuchTag() : [new TagMoved({ scope })]),
     DefineTag: (state, { name }, ctx) => {
       if (state !== null) return new TagAlreadyDefined()
       const existing = Arr.head(ctx.read(TagIndexes.by_name, name))
@@ -36,6 +39,7 @@ export class Tag extends Domain.Aggregate("Tag", {
     }
   },
   evolve: {
+    TagMoved: (state, { scope }) => (state === null ? state : { ...state, scope }),
     TagHistoryImported: (_, event) => event.snapshot,
     TagDefined: (_, { name, scope }) => ({ name, scope, removed: false }),
     TagRemoved: (state) => (state === null ? state : { ...state, removed: true })

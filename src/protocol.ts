@@ -1,5 +1,6 @@
 import * as Schema from "effect/Schema"
 import { Rpc, RpcGroup } from "effect/rpc"
+import { Grant } from "./domain/Scope.ts"
 
 export const StreamRef = Schema.Struct({ aggregate: Schema.String, id: Schema.String })
 export const Position = Schema.Int.check(
@@ -9,11 +10,12 @@ export const Position = Schema.Int.check(
 export const StreamSeq = Schema.Struct({ ...StreamRef.fields, seq: Position })
 export const Batch = Schema.Struct({
   id: Schema.String,
-  commands: Schema.Array(Schema.Struct({ aggregate: Schema.String, command: Schema.Unknown }))
+  commands: Schema.Array(Schema.Struct({ aggregate: Schema.String, command: Schema.Unknown })),
+  action: Schema.optional(Schema.Struct({ name: Schema.String, input: Schema.Unknown }))
 })
 export type Batch = typeof Batch.Type
 export const Receipt = Schema.Union([
-  Schema.TaggedStruct("Accepted", { batchId: Schema.String, seqs: Schema.Array(StreamSeq) }),
+  Schema.TaggedStruct("Accepted", { batchId: Schema.String, revision: Position, seqs: Schema.Array(StreamSeq) }),
   Schema.TaggedStruct("Rejected", { batchId: Schema.String, rejection: Schema.Unknown })
 ])
 export type Receipt = typeof Receipt.Type
@@ -42,6 +44,8 @@ export type PullRequest = typeof PullRequest.Type
  */
 export const PullResponse = Schema.Struct({
   epoch: Schema.String,
+  revision: Position,
+  grants: Schema.Array(Grant),
   scopes: Schema.Array(
     Schema.Struct({
       scope: Schema.String,
@@ -52,7 +56,26 @@ export const PullResponse = Schema.Struct({
   )
 })
 export type PullResponse = typeof PullResponse.Type
-export const Change = Schema.Struct({ _tag: Schema.Literals(["Poke", "Keepalive"]), epoch: Schema.String })
+export const PresenceMember = Schema.Struct({
+  room: Schema.String,
+  principal: Schema.String,
+  clientId: Schema.String,
+  state: Schema.Json
+})
+export type PresenceMember = typeof PresenceMember.Type
+export const PresenceRequest = Schema.Struct({
+  connectionId: Schema.String,
+  room: Schema.String,
+  clientId: Schema.String,
+  state: Schema.NullOr(Schema.Json)
+})
+export type PresenceRequest = typeof PresenceRequest.Type
+export const Change = Schema.Struct({
+  _tag: Schema.Literals(["Poke", "Keepalive"]),
+  epoch: Schema.String,
+  connectionId: Schema.optional(Schema.String),
+  presence: Schema.optional(Schema.Array(PresenceMember))
+})
 export type Change = typeof Change.Type
 export class ResyncRequired extends Schema.TaggedError<ResyncRequired, { readonly brand: unique symbol }>()(
   "ResyncRequired",
@@ -68,5 +91,10 @@ export const EchoRpcs = RpcGroup.make(
     error: Schema.Union([ResyncRequired, ServerError])
   }),
   Rpc.make("Pull", { payload: PullRequest, success: PullResponse, error: Schema.Union([ResyncRequired, ServerError]) }),
-  Rpc.make("Changes", { payload: {}, success: Change, error: ServerError, stream: true })
+  Rpc.make("Changes", { payload: {}, success: Change, error: ServerError, stream: true }),
+  Rpc.make("Presence", {
+    payload: PresenceRequest,
+    success: Schema.Void,
+    error: Schema.Union([ResyncRequired, ServerError])
+  })
 )

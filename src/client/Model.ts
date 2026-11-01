@@ -10,8 +10,8 @@ import * as Schema from "effect/Schema"
 import * as Aggregate from "../domain/Aggregate.ts"
 import type * as Command from "../domain/Command.ts"
 import type * as Index from "../domain/Indexes.ts"
-import { canRead, canWrite, type Principal, ScopeForbidden } from "../domain/Scope.ts"
-import { Receipt } from "../protocol.ts"
+import { canRead, canWrite, Grant, type Principal, ScopeForbidden } from "../domain/Scope.ts"
+import { Batch, Receipt } from "../protocol.ts"
 
 export const Row = Schema.Struct({
   aggregate: Schema.String,
@@ -22,9 +22,7 @@ export const Row = Schema.Struct({
 })
 export type Row = typeof Row.Type
 export const Intent = Schema.Struct({
-  id: Schema.String,
-  aggregate: Schema.String,
-  command: Schema.Unknown,
+  ...Batch.fields,
   now: Schema.Number,
   attemptEpoch: Schema.NullOr(Schema.String),
   dismissed: Schema.Boolean,
@@ -42,6 +40,8 @@ export const Journal = Schema.Struct({
 export type Journal = typeof Journal.Type
 export const Replica = Schema.Struct({
   epoch: Schema.NullOr(Schema.String),
+  revision: Schema.Number,
+  grants: Schema.Array(Grant),
   cursors: Schema.Record(Schema.String, Schema.Number),
   rows: Schema.Array(Row)
 })
@@ -77,13 +77,15 @@ export const decodeRejection = <A extends Aggregate.Any>(aggregate: A, value: un
 }
 
 /** One cache per client principal. Engine rows and domain definitions are immutable once installed. */
-export const makeReader = (principal: Principal) => {
+export const makeReader = (principal: Principal, grants: ReadonlyArray<Grant> = []) => {
   // Weak row keys let old snapshots go; aggregate identity includes both codec and scope semantics.
   const entry = memoize((aggregate: Aggregate.Any) =>
     memoize((row: Row) => {
       const state = decode(aggregate.definition.state, row.state)
       const scope = aggregate.definition.scope(state)
-      return scope !== null && canRead(principal, scope) ? { id: aggregate.definition.id.make(row.id), state } : null
+      return scope !== null && canRead(principal, scope, grants)
+        ? { id: aggregate.definition.id.make(row.id), state }
+        : null
     })
   )
   return memoize((rows: ReadonlyArray<Row>): Read => {
@@ -137,13 +139,32 @@ export const makeReader = (principal: Principal) => {
   })
 }
 
-export const reader = (rows: ReadonlyArray<Row>, principal: Principal): Read => makeReader(principal)(rows)
+export const reader = (rows: ReadonlyArray<Row>, principal: Principal, grants: ReadonlyArray<Grant> = []): Read =>
+  makeReader(principal, grants)(rows)
 
 export const decide = (
   aggregates: ReadonlyArray<Aggregate.Any>,
   rows: ReadonlyArray<Row>,
   principal: Principal,
-  intent: Intent
+  intent: Intent,
+  grants: ReadonlyArray<Grant> = []
+): { readonly rows: ReadonlyArray<Row>; readonly rejection: unknown | null } => {
+  if (intent.action !== undefined) return { rows, rejection: null }
+  let next = rows
+  for (const item of intent.commands) {
+    const result = decideCommand(aggregates, next, principal, { ...item, now: intent.now }, grants)
+    if (result.rejection !== null) return { rows, rejection: result.rejection }
+    next = result.rows
+  }
+  return { rows: next, rejection: null }
+}
+
+const decideCommand = (
+  aggregates: ReadonlyArray<Aggregate.Any>,
+  rows: ReadonlyArray<Row>,
+  principal: Principal,
+  intent: { readonly aggregate: string; readonly command: unknown; readonly now: number },
+  grants: ReadonlyArray<Grant>
 ): { readonly rows: ReadonlyArray<Row>; readonly rejection: unknown | null } => {
   const aggregate = Option.getOrUndefined(Array.findFirst(aggregates, (a) => a.tag === intent.aggregate))
   if (aggregate === undefined) throw new Error(`Unknown aggregate ${intent.aggregate}`)
@@ -154,6 +175,7 @@ export const decide = (
     Array.findFirst(aggregate.definition.commands, (c) => c.tag === envelope._tag)
   )
   if (commandClass === undefined) throw new Error(`Unknown command ${envelope._tag}`)
+  if (commandClass.authority === "server") throw new Error("Server-only commands require a trusted action")
   const command = decode(commandClass, intent.command)
   if (!Predicate.hasProperty(command, "_tag") || typeof command._tag !== "string")
     throw new Error("Invalid command tag")
@@ -162,9 +184,9 @@ export const decide = (
   )
   let state = row === undefined ? aggregate.definition.initial : decode(aggregate.definition.state, row.state)
   const scope = aggregate.definition.scope(state)
-  if (scope !== null && !canWrite(principal, scope))
+  if (scope !== null && !canWrite(principal, scope, grants))
     return { rows, rejection: encode(ScopeForbidden, new ScopeForbidden({ scope })) }
-  const read = reader(rows, principal)
+  const read = reader(rows, principal, grants)
   function declared<R extends Aggregate.Any>(ref: R, id: Aggregate.IdOf<R>): Aggregate.StateOf<R> | null
   function declared<I extends Index.Any>(ref: I, value: Index.Value<I>): ReadonlyArray<Index.Entry<I>>
   function declared(ref: Command.Read, value: unknown): unknown {
@@ -186,7 +208,7 @@ export const decide = (
   const outcome = handler(
     state,
     { ...command, _tag: command._tag },
-    { principal, now: DateTime.makeUnsafe(intent.now), read: declared }
+    { principal, now: DateTime.makeUnsafe(intent.now), read: declared, grants }
   )
   if (!Array.isArray(outcome)) {
     const rejection = Option.getOrUndefined(
@@ -204,7 +226,7 @@ export const decide = (
     state = evolve(state, { ...event, _tag: tagged._tag })
   }
   const nextScope = aggregate.definition.scope(state)
-  if (nextScope !== null && !canWrite(principal, nextScope))
+  if (nextScope !== null && !canWrite(principal, nextScope, grants))
     return { rows, rejection: encode(ScopeForbidden, new ScopeForbidden({ scope: nextScope })) }
   return {
     rows: [

@@ -383,6 +383,57 @@ behaviour adds or amends an item here in the same branch.
     deciding (changes rejection precedence). Multi-command batches may reload a declared-read
     aggregate; receipts, atomicity, authorization and SERIALIZABLE uniqueness remain unchanged.
 
+25. **Collaboration uses explicit grants and trusted atomic actions** (2026-11-01).
+    Shared scopes have reader/writer/owner grants; private ownership and catalog readership
+    remain intrinsic. Grants authorize declared reads, prediction, Stories and execution.
+    Moving a stream requires write access at both ends and invalidates both scope snapshots.
+    Trusted actions own application membership rules, transactional reads, commands and grant
+    transitions; clients journal action requests without predicting them. Server-only commands
+    are not directly wire-addressable. Rejected: application SQL against engine tables,
+    client-supplied grants, and non-atomic membership updates.
+    Imports fold registered truthful events from initial state, with actual import actor/time,
+    stable identity and conflict refusal; no invented history or eventless noninitial streams.
+    Actions are pure planners over privileged declared-aggregate snapshots. Their ordered
+    operations stage domain commands and grant/revoke facts; a domain rejection discards all.
+    Only `authority: "server"` commands bypass source/destination write gates, and their
+    declared reads remain actor-visible. Ordinary commands inside actions retain both gates.
+    Stories of server-only commands exercise that trusted context, not raw RPC authorization.
+    Owner roles permit app-wired grant management; there is no unconditional public grant RPC
+    that could bypass application membership constraints. Grant facts use an engine-owned
+    append-only log and projection rather than an application-visible aggregate.
+    `importStreams` composes with the caller's SQL migration transaction without changing its
+    isolation level. Imports refuse existing identities, never update them. `get` reads typed
+    actor-visible state; `onFailure` executes a server-only Effect hook before error sanitization,
+    retaining original causes in the request runtime and isolating failures of the hook itself.
+    `onRejected` reports only operation kind and rejection tag after a newly committed rejection,
+    never during serialization retries or receipt replay. It isolates hook failures and is
+    best-effort: a process crash after commit can lose the diagnostic, not the durable receipt.
+26. **Commit revisions reconcile accepted work after access loss** (2026-11-01).
+    Every accepted batch advances the singleton revision, including no-ops. A durable Pull
+    installs its revision, role grants and complete visible scopes in one snapshot. An accepted
+    intent retires when that installed revision covers its receipt in the same authority epoch.
+    Rejected: requiring its stream sequences to remain visible after a move or revocation.
+27. **Tabs serialize durable mutations; one elected tab owns networking** (2026-11-01).
+    Each tab runs typed selector closures locally. An interruptible Web Lock guards each
+    reload/mutation/publish operation, another serializes sync, and a lifetime lock elects the
+    network owner. BroadcastChannel carries invalidations, never ownership; successor tabs
+    reload durable state. Reset locks sync and mutation, refuses unresolved intents without
+    explicit consent, erases durable identity first and withdraws peers with `connection: reset`.
+    Identity invalidation is published before fallible replica cleanup, without an interruption
+    gap; receivers check generations. Replica reset also holds the cross-tab sync lock.
+    A stale peer's identity mismatch fences every later write. Rejected: proxying arbitrary
+    closures across MessagePorts and a SQLite/worker rewrite. This supersedes item 16's busy
+    second-opener restriction; browser storage deletion remains outside engine guarantees.
+28. **Presence uses authenticated connection and participant leases** (2026-11-01).
+    The existing Changes stream issues a connection token bound to the session principal and
+    carries authorized presence snapshots. Participant state is bounded to 8192 JSON code units
+    and 64 entries per connection; existing entries remain updatable at capacity. Public state
+    excludes null (the wire leave sentinel); `leave` is explicit. Living tabs renew participant leases every 20 seconds;
+    connections and participants expire after 60 seconds. Connection cleanup and room revocation
+    stop delivery; crashed followers cannot survive indefinitely on another tab's keepalive.
+    Rejected: unauthenticated client identities and process-local presence maps. Presence is
+    ephemeral, never journaled; ordinary sync remains notification-driven without client polling.
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -396,14 +447,29 @@ Areas: `SERVER` (execute, receipts, scope log, grants, policies, epoch), `CLIENT
 journal, replica, effective state, rebase, outcomes, queries), `SYNC` (end to end across
 devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
 
+- **INV-SERVER-7:** Shared grants authorize reads and writes by role; scope moves invalidate
+  old and new readers, and revoked readers lose the entire scope on their next pull.
+- **INV-SERVER-8:** Trusted actions atomically decide domain commands and grant changes using
+  transactional reads, never expose server-only commands to raw Execute, and deduplicate retries.
+- **INV-SERVER-9:** Trusted event imports fold registered events from initial state, preserve
+  payload audit fields, record actual envelope actor/time, and refuse conflicting streams atomically.
+- **INV-CLIENT-7:** Public batches predict and journal atomically; trusted actions remain
+  durably pending without prediction and are inspectable before reconnect.
+- **INV-CLIENT-8:** Tabs share durable ownership, survive owner loss and coordinate profile
+  reset; deletion refuses pending work without explicit consent and withdraws every tab's data
+  even when replica cleanup fails. Replica reset cannot race an in-flight Pull.
+- **INV-PRESENCE-1:** Scope presence authenticates room membership, removes disconnected and
+  revoked participants, and never fans out room state to unauthorized readers.
+
 - **INV-SERVER-1:** Accepted and rejected batches are atomic and deduplicated under the
   authenticated principal, client id and batch id; retrying cannot append events twice.
+  Post-commit rejection diagnostics contain only kind/tag and do not repeat on receipt replay.
   A stream initialized by a registered historical event accepts subsequent ordinary events;
   registration alone never authorizes a command to emit that historical event.
 - **INV-SERVER-2:** Concurrent decisions serialize, including declared index reads; two
   claims for the same visible unique value cannot both be accepted.
-- **INV-SERVER-3:** Writes require the principal's private scope; declared reads see private
-  and catalog rows only, hidden ids read as null, and undeclared reads fail.
+- **INV-SERVER-3:** Ordinary writes require writer/owner access; declared reads see authorized
+  scopes only, hidden ids read as null, and undeclared reads fail.
   Unrelated stored states outside the current command's target and declared-read aggregates
   are not decoded; selected persisted states still validate.
 - **INV-SERVER-4:** Pull snapshots and cursors share one transaction snapshot; reconnect
@@ -414,7 +480,7 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
   connected reader after a commit; reconnect starts with a catchup poke.
 - **INV-CLIENT-1:** Journal survives offline reload and replica reset.
 - **INV-CLIENT-2:** Retries preserve intent identity; accepted intents remain until the
-  durable replica covers every receipt sequence.
+  durable replica revision covers the receipt, even when touched streams become invisible.
 - **INV-CLIENT-3:** Authoritative state rebases intents in journal order and surfaces rejections;
   epoch transitions invalidate old cache state even if persisting the new cache fails, and a
   changed authority epoch on a keepalive triggers resynchronization without a separate poke.
@@ -423,7 +489,7 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
   membership eviction. Every Upsert is validated before publishing any part of the response.
   Failed journal retirement or authoritative rejection persistence remains recoverable before the
   next local decision, without duplicating covered predictions or forgetting rejected intents.
-- **INV-CLIENT-4:** An exclusive profile lifetime prevents competing leaders. Open hydrates
+- **INV-CLIENT-4:** An exclusive network-owner lifetime prevents competing leaders. Open hydrates
   offline and owns automatic connection startup; close ends streams and releases storage,
   connection and lock before another profile instance opens.
 - **INV-CLIENT-5:** Typed queries expose effective state and suppress structurally unchanged emissions.

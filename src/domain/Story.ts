@@ -8,7 +8,7 @@ import * as Record from "effect/Record"
 import * as Aggregate from "./Aggregate.ts"
 import type * as Command from "./Command.ts"
 import type * as Index from "./Indexes.ts"
-import { canRead, canWrite, type Principal, ScopeForbidden } from "./Scope.ts"
+import { canRead, canWrite, type Grant, type Principal, ScopeForbidden } from "./Scope.ts"
 
 /** Any event instance, for streams of aggregates other than the one under test. */
 export interface SomeEvent {
@@ -56,6 +56,7 @@ export interface Definition<A extends Aggregate.Any, W extends Aggregate.Command
   readonly when: W
   readonly as: Principal
   readonly then: Then<A, W>
+  readonly grants?: ReadonlyArray<Grant>
   /** `ctx.now` for the decision; a story that does not care gets a fixed instant. */
   readonly now?: DateTime.Utc
 }
@@ -110,6 +111,7 @@ export const run = <A extends Aggregate.Any, W extends Aggregate.CommandInstance
   const when: { readonly _tag: string; readonly target: string } = story.when
   const tag = when._tag
   const principal = story.as
+  const grants = Arr.filter(story.grants ?? [], (grant) => grant.principal === principal)
 
   const command = Arr.findFirst(aggregate.definition.commands, (c) => c.tag === tag)
   if (Option.isNone(command)) {
@@ -145,14 +147,15 @@ export const run = <A extends Aggregate.Any, W extends Aggregate.CommandInstance
 
   const visible = (row: Stream): boolean => {
     const scope = row.aggregate.definition.scope(row.state)
-    return scope !== null && canRead(principal, scope)
+    return scope !== null && canRead(principal, scope, grants)
   }
 
   const target = Record.get(streams, key(aggregate, when.target))
   const state = Option.isSome(target) ? target.value.state : aggregate.definition.initial
   if (Option.isSome(target)) {
     const scope = aggregate.definition.scope(state)
-    if (scope !== null && !canWrite(principal, scope)) return new ScopeForbidden({ scope })
+    if (scope !== null && command.value.authority !== "server" && !canWrite(principal, scope, grants))
+      return new ScopeForbidden({ scope })
   }
 
   function read<R extends Aggregate.Any>(ref: R, id: Aggregate.IdOf<R>): Aggregate.StateOf<R> | null
@@ -187,10 +190,24 @@ export const run = <A extends Aggregate.Any, W extends Aggregate.CommandInstance
     )
   }
 
-  const ctx: Aggregate.DecideContext = { principal, now: story.now ?? fixedNow, read }
+  const ctx: Aggregate.DecideContext = { principal, now: story.now ?? fixedNow, read, grants }
   const decide = Record.get(aggregate.definition.decide, tag)
   if (Option.isNone(decide)) {
     throw new StoryError({ message: `${aggregate.tag} declares ${tag} but has no decide handler for it` })
   }
-  return decide.value(state, when, ctx)
+  const decision = decide.value(state, when, ctx)
+  if (Arr.isArray(decision) && decision.length > 0) {
+    let next = state
+    for (const event of decision) {
+      if (!Predicate.hasProperty(event, "_tag") || typeof event._tag !== "string")
+        throw new StoryError({ message: "Invalid event" })
+      const evolve = aggregate.definition.evolve[event._tag]
+      if (evolve === undefined) throw new StoryError({ message: "Missing evolve handler" })
+      next = evolve(next, { ...event, _tag: event._tag })
+    }
+    const scope = aggregate.definition.scope(next)
+    if (scope !== null && command.value.authority !== "server" && !canWrite(principal, scope, grants))
+      return new ScopeForbidden({ scope })
+  }
+  return decision
 }

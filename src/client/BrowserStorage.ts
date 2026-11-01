@@ -10,7 +10,7 @@ export class ProfileBusy extends Data.TaggedError("ProfileBusy")<{ readonly prof
 export const randomId = Effect.sync(() => crypto.randomUUID())
 
 /** Browser platform edge: the lock is held until the owning Effect scope closes. */
-export const ownProfile = (profile: string) =>
+export const ownProfile = (profile: string, wait = false) =>
   Effect.acquireRelease(
     Effect.callback<Effect.Effect<void>, StorageError | ProfileBusy>((resume) => {
       if (!globalThis.navigator?.locks) {
@@ -23,8 +23,9 @@ export const ownProfile = (profile: string) =>
       const held = new Promise<void>((resolve) => {
         release = resolve
       })
+      const controller = new AbortController()
       const finished = navigator.locks
-        .request(`echo:${profile}`, { ifAvailable: true }, (lock) => {
+        .request(`echo:${profile}`, wait ? { signal: controller.signal } : { ifAvailable: true }, (lock) => {
           if (lock === null) {
             resume(Effect.fail(new ProfileBusy({ profile })))
             return
@@ -40,10 +41,18 @@ export const ownProfile = (profile: string) =>
           return held
         })
         .catch((cause: unknown) => resume(Effect.fail(new StorageError({ cause }))))
-      return Effect.sync(() => release())
+      return Effect.sync(() => {
+        controller.abort()
+        release()
+      })
     }),
-    (release) => release
+    (release) => release,
+    { interruptible: true }
   ).pipe(Effect.asVoid)
+
+/** Cross-tab serialization. A dead tab releases the browser-owned lock automatically. */
+export const withLock = <A, E, R>(name: string, effect: Effect.Effect<A, E, R>) =>
+  Effect.scoped(Effect.andThen(ownProfile(name, true), effect))
 
 /** Separate databases deliberately prevent cache disposal from deleting pending commands. */
 export const openDatabase = (name: string) =>

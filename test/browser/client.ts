@@ -3,6 +3,7 @@ import * as Clock from "effect/Clock"
 import * as DateTime from "effect/DateTime"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Equal from "effect/Equal"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Option from "effect/Option"
@@ -17,10 +18,12 @@ import { DefineTag, Note, NoteId, Tag, TagId, WriteNote } from "../../examples/f
 import * as Domain from "../../src/domain/index.ts"
 import * as Client from "../../src/client/index.ts"
 import * as Storage from "../../src/client/BrowserStorage.ts"
+import * as Model from "../../src/client/Model.ts"
 import {
   ResyncRequired,
   type Change,
   type ExecuteRequest,
+  type ExecuteResponse,
   type PullResponse,
   type Receipt
 } from "../../src/protocol.ts"
@@ -1675,7 +1678,7 @@ const durableRefresh = (profile: string) =>
           resume(Effect.succeed(false))
         })
       })
-      yield* check(oldOpenFailed, "old writer reopened version 2")
+      yield* check(oldOpenFailed, "old writer reopened upgraded storage")
       yield* Storage.save(peer, { revision: 2 })
       const changed = yield* Storage.load(db)
       yield* check((yield* decode(changed)).revision === 2 && changed !== first, "missed peer write without broadcast")
@@ -1709,7 +1712,7 @@ const durableRefresh = (profile: string) =>
       peer.database.close()
       yield* Effect.callback<void, Storage.StorageError>((resume) => {
         // A leaked handle from the failed open would block this later schema change.
-        const request = indexedDB.open(name, 3)
+        const request = indexedDB.open(name, 4)
         request.addEventListener("blocked", () =>
           resume(Effect.fail(new Storage.StorageError({ cause: "late-open leak" })))
         )
@@ -1723,9 +1726,309 @@ const durableRefresh = (profile: string) =>
     })
   )
 
+// INV-SCHEMA-1 catches coexistence with older writers and late in-flight response installation.
+const compatibility = (profile: string) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const name = `echo:journal:${encodeURIComponent(profile)}:${encodeURIComponent(principal)}`
+      const legacy = yield* Effect.callback<IDBDatabase>((resume) => {
+        const request = indexedDB.open(name, 2)
+        request.addEventListener("upgradeneeded", () => request.result.createObjectStore("data"))
+        request.addEventListener("success", () => resume(Effect.succeed(request.result)))
+      })
+      yield* Effect.addFinalizer(() => Effect.sync(() => legacy.close()))
+      const blocked = yield* Effect.scoped(Client.open(options(profile))).pipe(Effect.flip)
+      yield* check(blocked._tag === "CompatibilityError" && blocked.reason === "blocked", "legacy writer was admitted")
+      legacy.close()
+      const started = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const old = yield* Client.open(
+        options(profile, {
+          ...disconnected,
+          pull: () =>
+            Effect.andThen(Deferred.succeed(started, undefined), Deferred.await(release)).pipe(Effect.as(snapshot(9)))
+        })
+      )
+      const queued = yield* add(old, 3)
+      yield* check(queued._tag === "Pending", "seed not journaled")
+      const before = yield* old.pending
+      const syncing = yield* old.sync.pipe(Effect.exit, Effect.forkScoped)
+      yield* Deferred.await(started)
+      const terminal = yield* old.status.pipe(
+        Stream.filter((s) => s.connection === "incompatible"),
+        Stream.runHead,
+        Effect.forkScoped
+      )
+      const current = yield* Client.open({ ...options(profile), compatibilityGeneration: 2 })
+      yield* Fiber.join(terminal).pipe(Effect.timeout("2 seconds"))
+      yield* check(
+        Exit.isFailure(yield* Effect.try(() => value(old)).pipe(Effect.exit)) && value(current) === 3,
+        "upgrade lost journal or retained stale view"
+      )
+      const pending = yield* current.pending
+      yield* check(Equal.equals(pending, before), "upgrade changed pending identity/payload")
+      yield* check((yield* add(old, 1).pipe(Effect.flip))._tag === "ClientClosed", "superseded client wrote")
+      yield* check(
+        Exit.isFailure(yield* Fiber.join(syncing).pipe(Effect.timeout("2 seconds"))),
+        "superseded manual sync did not terminate"
+      )
+      yield* current.sync.pipe(Effect.flip, Effect.timeout("2 seconds"))
+      yield* Deferred.succeed(release, undefined)
+      yield* check(Exit.isFailure(yield* Fiber.join(syncing)), "late pull installed after upgrade")
+      yield* check(value(current) === 3, "late pull poisoned upgraded state")
+      const outdated = yield* Effect.scoped(Client.open(options(profile))).pipe(Effect.flip)
+      yield* check(outdated._tag === "CompatibilityError" && outdated.reason === "outdated", "old generation reopened")
+      const peer = yield* Client.open({ ...options(profile), compatibilityGeneration: 2 })
+      yield* add(peer, 2)
+      yield* check((yield* current.pending).length === 2, "same-generation peer lost work")
+      const denied = yield* Client.resetProfile({ profile, principal, compatibilityGeneration: 2 }).pipe(Effect.flip)
+      yield* check(denied._tag === "PendingIntents", "reset discarded pending work")
+      yield* Client.resetProfile({ profile, principal, compatibilityGeneration: 2, discardPending: true })
+      const downgrade = yield* Client.resetProfile({ profile, principal, discardPending: true }).pipe(Effect.flip)
+      yield* check(downgrade._tag === "CompatibilityError", "reset downgraded admission")
+      const fresh = yield* Client.open({ ...options(profile), compatibilityGeneration: 2 })
+      yield* check((yield* fresh.pending).length === 0, "explicit reset retained work")
+      const invalid = yield* Effect.scoped(
+        Client.open({ ...options(`${profile}-invalid`), compatibilityGeneration: 0 })
+      ).pipe(Effect.flip)
+      yield* check(
+        invalid._tag === "CompatibilityError" && invalid.reason === "invalidGeneration",
+        "invalid generation accepted"
+      )
+      return "PASS INV-SCHEMA-1 blocked legacy tabs, live fencing, late pull, durable identity, same-generation peers and reset"
+    })
+  )
+
+// INV-SCHEMA-2 catches dropping/retrying unknown payloads, partial prediction and relabeling sent work.
+const incompatibleCommands = (profile: string) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const name = `echo:journal:${encodeURIComponent(profile)}:${encodeURIComponent(principal)}`
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const seed = yield* Client.open(options(profile))
+          yield* seed.batch([
+            Client.command(Counter, new Add({ target: "one", amount: 2 })),
+            Client.command(Counter, new Add({ target: "one", amount: 3 }))
+          ])
+        })
+      )
+      const db = yield* Storage.openDatabase(name)
+      const initial = yield* Schema.decodeUnknownEffect(Model.Journal)(yield* Storage.load(db))
+      const base = initial.intents[0]
+      if (base === undefined) throw new Error("missing seed")
+      const first = base.commands[0]
+      if (first === undefined) throw new Error("missing command")
+      const incompatible: ReadonlyArray<Model.Intent> = [
+        {
+          ...base,
+          id: "missing-aggregate",
+          commands: [first, { aggregate: "Retired", command: { _tag: "Add", target: "one", amount: 3 } }]
+        },
+        {
+          ...base,
+          id: "missing-command",
+          commands: [
+            { aggregate: "Counter", command: { _tag: "Add", target: "one", amount: 11 } },
+            { aggregate: "Counter", command: { _tag: "Retired", target: "one", amount: 3 } }
+          ]
+        },
+        {
+          ...base,
+          id: "changed-payload",
+          commands: [
+            first,
+            { aggregate: "Counter", command: { _tag: "Add", target: "one", amount: "three", retained: "original" } }
+          ]
+        }
+      ]
+      yield* Storage.save(db, { ...initial, intents: incompatible })
+      const transaction = IDBDatabase.prototype.transaction
+      let saves = 0
+      Object.defineProperty(IDBDatabase.prototype, "transaction", {
+        configurable: true,
+        writable: true,
+        value: function (this: IDBDatabase, ...args: Parameters<typeof transaction>) {
+          const tx = transaction.call(this, ...args)
+          if (this.name === name && args[1] === "readwrite" && ++saves === 2) queueMicrotask(() => tx.abort())
+          return tx
+        }
+      })
+      const failedNotice = yield* Effect.scoped(Client.open(options(profile))).pipe(
+        Effect.exit,
+        Effect.ensuring(
+          Effect.sync(() => {
+            IDBDatabase.prototype.transaction = transaction
+          })
+        )
+      )
+      const retained = yield* Schema.decodeUnknownEffect(Model.Journal)(yield* Storage.load(db))
+      yield* check(
+        Exit.isFailure(failedNotice) && Arr.every(retained.intents, (intent) => intent.phase === "Pending"),
+        "failed quarantine lost pending work or returned a client"
+      )
+      let sent = 0
+      const safeTransport: Client.Transport = {
+        ...disconnected,
+        pull: () => Effect.succeed(snapshot(0, 0)),
+        execute: () =>
+          Effect.sync(() => {
+            sent++
+            throw new Error("quarantined command sent")
+          })
+      }
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const client = yield* Client.open(options(profile, safeTransport))
+          const notices = Option.getOrThrow(yield* Stream.runHead(client.notices))
+          yield* check(
+            notices.length === 3 && value(client) === 0,
+            "incompatible batch partially predicted or missing notice"
+          )
+          for (const [i, notice] of notices.entries()) {
+            yield* check(
+              notice.phase === "Unknown" && Equal.equals(notice.commands, incompatible[i]?.commands),
+              "quarantine changed payload"
+            )
+          }
+          yield* client.sync
+          yield* check(sent === 0, "quarantined work sent")
+          yield* client.dismiss("changed-payload")
+          yield* check((yield* client.pending).length === 3, "dismiss deleted incompatible work")
+        })
+      )
+      const reopened = yield* Client.open(options(profile))
+      yield* check(
+        Option.getOrThrow(yield* Stream.runHead(reopened.notices)).length === 2,
+        "notice dismissal not durable"
+      )
+      const reset = yield* Client.resetProfile({ profile, principal }).pipe(Effect.flip)
+      yield* check(reset._tag === "PendingIntents" && reset.count === 3, "unknown work discarded without consent")
+
+      // Unknown Sent/Accepted commands retain raw retry identity and retire only after revision coverage.
+      const phases: ReadonlyArray<"Sent" | "Accepted"> = ["Sent", "Accepted"]
+      for (const phase of phases) {
+        const nextProfile = `${profile}-${phase}`
+        const nextName = `echo:journal:${encodeURIComponent(nextProfile)}:${encodeURIComponent(principal)}`
+        const journal = yield* Storage.openDatabase(nextName)
+        const missing = incompatible[1]
+        if (missing === undefined) throw new Error("missing fixture")
+        yield* Storage.save(journal, {
+          ...initial,
+          epoch: "one",
+          intents: [
+            {
+              ...missing,
+              phase,
+              attemptEpoch: "one",
+              receipt: phase === "Accepted" ? { _tag: "Accepted", batchId: missing.id, revision: 1, seqs: [] } : null
+            },
+            {
+              ...base,
+              id: "dependent",
+              commands: [{ aggregate: "Counter", command: { _tag: "Add", target: "one", amount: 6 } }]
+            }
+          ]
+        })
+        const requests: Array<ExecuteRequest> = []
+        let covered = false
+        const transport: Client.Transport = {
+          changes: Stream.never,
+          pull: () => (covered ? Effect.succeed(snapshot(5, 1)) : Effect.fail(offline)),
+          execute: (request) =>
+            Effect.sync(() => {
+              requests.push(request)
+              return {
+                epoch: "one",
+                receipts: [{ _tag: "Accepted", batchId: missing.id, revision: 1, seqs: [] }]
+              } satisfies ExecuteResponse
+            })
+        }
+        const client = yield* Client.open(options(nextProfile, transport))
+        const state = Option.getOrThrow(yield* Stream.runHead(client.status))
+        yield* check(
+          state.compatibilityIssues.length === 1 && (yield* client.pending)[0]?.phase === phase,
+          "unresolved phase relabeled"
+        )
+        yield* check(value(client) === 0, "dependent intent predicted across incomplete replay")
+        const blocked = yield* add(client, 11).pipe(Effect.flip)
+        yield* check(
+          blocked._tag === "CompatibilityError" && blocked.reason === "predictionUnavailable",
+          "incomplete replay produced a terminal domain decision"
+        )
+        yield* check((yield* client.pending)[1]?.phase === "Pending", "dependent intent falsely rejected")
+        if (phase === "Sent") {
+          yield* client.sync.pipe(Effect.flip)
+          yield* check(
+            requests.length === 1 &&
+              requests[0]?.clientId === initial.clientId &&
+              Equal.equals(requests[0]?.batches[0]?.commands, missing.commands),
+            "receipt retry changed identity/payload"
+          )
+        }
+        covered = true
+        yield* client.sync
+        yield* check(
+          (yield* client.pending).length === 0 &&
+            Option.getOrThrow(yield* Stream.runHead(client.notices))[0]?.phase === "Rejected" &&
+            value(client) === 5,
+          "accepted command did not retire by revision"
+        )
+        yield* check((yield* add(client, 1))._tag === "Pending" && value(client) === 6, "replay did not resume")
+      }
+      // A SchemaError thrown by domain code must not masquerade as a command codec mismatch.
+      for (const fault of ["decide", "evolve", "state"]) {
+        const faultProfile = `${profile}-${fault}`
+        const namespace = `${encodeURIComponent(faultProfile)}:${encodeURIComponent(principal)}`
+        const journalDb = yield* Storage.openDatabase(`echo:journal:${namespace}`)
+        const replicaDb = yield* Storage.openDatabase(`echo:replica:${namespace}`)
+        yield* Storage.save(journalDb, initial)
+        yield* Storage.save(replicaDb, {
+          epoch: null,
+          revision: 0,
+          grants: [],
+          cursors: {},
+          rows:
+            fault === "state"
+              ? [{ aggregate: "Counter", id: "one", seq: 1, scope: `user:${principal}`, state: { value: "invalid" } }]
+              : []
+        })
+        const broken = Domain.Aggregate("Counter", {
+          ...Counter.definition,
+          indexes: Domain.Index(Id, State, {}),
+          decide: {
+            Add: (state, command, ctx) => {
+              // Inject a pure handler's schema failure, not a persisted command decode failure.
+              // oxlint-disable-next-line effecttsgo/schema-sync
+              if (fault === "decide") Schema.decodeUnknownSync(Schema.String)(3)
+              return Counter.definition.decide.Add(state, command, ctx)
+            }
+          },
+          evolve: {
+            Added: (state, event) => {
+              if (fault === "evolve") throw new Error("domain defect")
+              return Counter.definition.evolve.Added(state, event)
+            }
+          }
+        })
+        const failed = yield* Effect.scoped(Client.open({ ...options(faultProfile), aggregates: [broken] })).pipe(
+          Effect.exit
+        )
+        const preserved = yield* Schema.decodeUnknownEffect(Model.Journal)(yield* Storage.load(journalDb))
+        yield* check(
+          Exit.isFailure(failed) && preserved.intents[0]?.phase === "Pending",
+          `${fault} failure was quarantined`
+        )
+      }
+      return "PASS INV-SCHEMA-2 durable quarantine, aborted save, payload retention, unresolved receipts and defect controls"
+    })
+  )
+
 const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect)
 Object.assign(globalThis, {
   echoScenarios: {
+    compatibility: (profile: string) => run(compatibility(profile)),
+    incompatibleCommands: (profile: string) => run(incompatibleCommands(profile)),
     durableRefresh: (profile: string) => run(durableRefresh(profile)),
     batches: (profile: string) => run(batches(profile)),
     ownership: (profile: string) => run(ownership(profile)),

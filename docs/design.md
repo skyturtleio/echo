@@ -448,6 +448,32 @@ behaviour adds or amends an item here in the same branch.
     BroadcastChannel-only invalidation (notifications can be missed), caching before commit
     (aborts create false hot state), and admitting mixed version-1 writers.
 
+30. **Browser compatibility generations fence incompatible bundles** (2026-11-03).
+    Client open and profile reset accept a positive `compatibilityGeneration` (default 1),
+    mapped to IndexedDB version `2 + generation` for both existing database names. Bump it
+    when an older bundle cannot interpret new commands; never change the profile namespace
+    to implement an upgrade. A blocked upgrade preserves data and asks callers to close old
+    tabs; an older version cannot reopen after upgrade. Generation-aware handles close on
+    versionchange and withdraw their client. Preexisting v2 handles cannot be made to close
+    retroactively. Reset retains database versions. Generations are admission fences, not
+    upcasters, and rollback must retain the current generation and necessary codecs.
+    Incompatible unsent command batches become durable Unknown notices retaining their
+    original payloads and identity; dismissal neither deletes nor retries them. Missing
+    aggregate/command registrations and command schema mismatches qualify, not state decode
+    failures or defects in domain handlers/codecs. Sent and Accepted batches retain their
+    outcome phases and original receipt recovery; unavailable predictions are identified in
+    status until covered or rejected. Replay stops at that unresolved boundary; later intents
+    are preserved without prediction or terminal local rejection, and new predicted writes
+    fail with `CompatibilityError` (`predictionUnavailable`) until recovery. Compatibility
+    checks inspect every command before domain evaluation can reject a batch. Supersession
+    interrupts manual and automatic sync, releasing cross-tab locks even during stalled I/O.
+    Trusted actions remain opaque and unpredicted.
+    This is local fencing, not a server compatibility floor: deploy additive server support
+    first, retain safe old codecs and reject unsafe legacy operations on other devices.
+    State/event upcasting remains deferred. Rejected: journal metadata alone (old clients
+    ignore it), separate versioned profiles (strands pending work), and broad exception
+    quarantine (hides defects and mislabels unresolved execution).
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -460,6 +486,14 @@ on the server, act from a device, assert state after sync or rebase.
 Areas: `SERVER` (execute, receipts, scope log, grants, policies, epoch), `CLIENT` (leader,
 journal, replica, effective state, rebase, outcomes, queries), `SYNC` (end to end across
 devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
+
+- **INV-SCHEMA-1:** Browser compatibility generations preserve journal identity and payloads,
+  exclude older bundles and supersede live handles without late writes. Blocked upgrades
+  preserve data; profile reset cannot downgrade admission or discard pending work silently.
+- **INV-SCHEMA-2:** Incompatible unsent commands become durable Unknown notices without
+  partial predictions or sending; dismissal retains payloads. Sent/Accepted outcomes still
+  recover by original identity and revision; their missing predictions block dependent
+  decisions until recovery. State/handler defects are not quarantined.
 
 - **INV-SERVER-7:** Shared grants authorize reads and writes by role; scope moves invalidate
   old and new readers, and revoked readers lose the entire scope on their next pull.

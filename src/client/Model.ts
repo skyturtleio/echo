@@ -1,6 +1,7 @@
 /* Pure synchronous domain evaluation and selectors; the client wraps failures at its Effect boundary. */
 /* oxlint-disable effecttsgo/schema-sync */
 import * as Array from "effect/Array"
+import * as Data from "effect/Data"
 import * as DateTime from "effect/DateTime"
 import * as Equal from "effect/Equal"
 import { memoize } from "effect/Function"
@@ -64,6 +65,20 @@ const codec = memoize((schema: Schema.Top) => {
 })
 export const decode = (schema: Schema.Top, value: unknown): unknown => codec(schema).decode(value)
 export const encode = (schema: Schema.Top, value: unknown): unknown => codec(schema).encode(value)
+
+export class IncompatibleCommand extends Data.TaggedError("IncompatibleCommand")<{
+  readonly reason: "aggregate" | "command" | "payload"
+}> {}
+
+// Only command decoding qualifies. State codecs and domain defects must still fail visibly.
+const decodeCommand = <A>(read: () => A): A => {
+  try {
+    return read()
+  } catch (error) {
+    if (Schema.isSchemaError(error)) throw new IncompatibleCommand({ reason: "payload" })
+    throw error
+  }
+}
 
 export type DomainRejection<A extends Aggregate.Any> =
   | Aggregate.InstanceOf<Aggregate.CommandsOf<A>["rejects"][number]>
@@ -150,35 +165,44 @@ export const decide = (
   grants: ReadonlyArray<Grant> = []
 ): { readonly rows: ReadonlyArray<Row>; readonly rejection: unknown | null } => {
   if (intent.action !== undefined) return { rows, rejection: null }
+  // Inspect the whole batch before a domain rejection can short-circuit evaluation.
+  const prepared = Array.map(intent.commands, (item) => prepareCommand(aggregates, item))
   let next = rows
-  for (const item of intent.commands) {
-    const result = decideCommand(aggregates, next, principal, { ...item, now: intent.now }, grants)
+  for (const item of prepared) {
+    const result = decideCommand(next, principal, item, intent.now, grants)
     if (result.rejection !== null) return { rows, rejection: result.rejection }
     next = result.rows
   }
   return { rows: next, rejection: null }
 }
 
-const decideCommand = (
+const prepareCommand = (
   aggregates: ReadonlyArray<Aggregate.Any>,
-  rows: ReadonlyArray<Row>,
-  principal: Principal,
-  intent: { readonly aggregate: string; readonly command: unknown; readonly now: number },
-  grants: ReadonlyArray<Grant>
-): { readonly rows: ReadonlyArray<Row>; readonly rejection: unknown | null } => {
+  intent: { readonly aggregate: string; readonly command: unknown }
+) => {
   const aggregate = Option.getOrUndefined(Array.findFirst(aggregates, (a) => a.tag === intent.aggregate))
-  if (aggregate === undefined) throw new Error(`Unknown aggregate ${intent.aggregate}`)
-  const envelope = Schema.decodeUnknownSync(Schema.Struct({ _tag: Schema.String, target: Schema.String }))(
-    intent.command
-  )
+  if (aggregate === undefined) throw new IncompatibleCommand({ reason: "aggregate" })
+  const envelopeSchema = Schema.Struct({ _tag: Schema.String, target: Schema.String })
+  const envelope = decodeCommand(() => Schema.decodeUnknownSync(envelopeSchema)(intent.command))
   const commandClass = Option.getOrUndefined(
     Array.findFirst(aggregate.definition.commands, (c) => c.tag === envelope._tag)
   )
-  if (commandClass === undefined) throw new Error(`Unknown command ${envelope._tag}`)
+  if (commandClass === undefined) throw new IncompatibleCommand({ reason: "command" })
   if (commandClass.authority === "server") throw new Error("Server-only commands require a trusted action")
-  const command = decode(commandClass, intent.command)
+  const command = decodeCommand(() => decode(commandClass, intent.command))
   if (!Predicate.hasProperty(command, "_tag") || typeof command._tag !== "string")
     throw new Error("Invalid command tag")
+  return { aggregate, envelope, commandClass, command: { ...command, _tag: command._tag } }
+}
+
+const decideCommand = (
+  rows: ReadonlyArray<Row>,
+  principal: Principal,
+  prepared: ReturnType<typeof prepareCommand>,
+  now: number,
+  grants: ReadonlyArray<Grant>
+): { readonly rows: ReadonlyArray<Row>; readonly rejection: unknown | null } => {
+  const { aggregate, envelope, commandClass, command } = prepared
   const row = Option.getOrUndefined(
     Array.findFirst(rows, (r) => r.aggregate === aggregate.tag && r.id === envelope.target)
   )
@@ -208,7 +232,7 @@ const decideCommand = (
   const outcome = handler(
     state,
     { ...command, _tag: command._tag },
-    { principal, now: DateTime.makeUnsafe(intent.now), read: declared, grants }
+    { principal, now: DateTime.makeUnsafe(now), read: declared, grants }
   )
   if (!Array.isArray(outcome)) {
     const rejection = Option.getOrUndefined(

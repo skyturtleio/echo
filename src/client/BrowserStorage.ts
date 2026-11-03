@@ -1,9 +1,18 @@
 import * as Data from "effect/Data"
 import * as Effect from "effect/Effect"
 import { constVoid } from "effect/Function"
+import * as Schema from "effect/Schema"
 
 export class StorageError extends Data.TaggedError("StorageError")<{ readonly cause: unknown }> {}
 export class ProfileBusy extends Data.TaggedError("ProfileBusy")<{ readonly profile: string }> {}
+export class CompatibilityError extends Data.TaggedError("CompatibilityError")<{
+  readonly reason: "blocked" | "outdated" | "superseded" | "invalidGeneration" | "predictionUnavailable"
+}> {}
+
+const Generation = Schema.Int.check(
+  Schema.isGreaterThanOrEqualTo(1),
+  Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER - 2)
+)
 
 // Browser platform edge; use the same native cryptographic source as Web Locks/IndexedDB's host.
 // oxlint-disable-next-line effecttsgo/crypto-random-uuid, effecttsgo/crypto-random-uuid-in-effect
@@ -56,16 +65,21 @@ export const withLock = <A, E, R>(name: string, effect: Effect.Effect<A, E, R>) 
 
 export interface Database {
   readonly database: IDBDatabase
+  superseded: boolean
   cache: { readonly token: unknown; readonly value: unknown } | undefined
 }
 
 /** Separate databases deliberately prevent cache disposal from deleting pending commands.
- * Version 2 fences writers that do not atomically maintain the change token. */
-export const openDatabase = (name: string) =>
+ * Version 2 introduced change tokens; later versions fence incompatible app bundles. */
+export const openDatabase = (name: string, compatibilityGeneration = 1) =>
   Effect.acquireRelease(
-    Effect.callback<Database, StorageError>((resume) => {
+    Effect.callback<Database, StorageError | CompatibilityError>((resume) => {
+      if (!Schema.is(Generation)(compatibilityGeneration)) {
+        resume(Effect.fail(new CompatibilityError({ reason: "invalidGeneration" })))
+        return
+      }
       let abandoned = false
-      const request = indexedDB.open(name, 2)
+      const request = indexedDB.open(name, 2 + compatibilityGeneration)
       request.addEventListener("upgradeneeded", () => {
         if (abandoned) {
           request.transaction?.abort()
@@ -75,13 +89,29 @@ export const openDatabase = (name: string) =>
       })
       request.addEventListener("blocked", () => {
         abandoned = true
-        resume(Effect.fail(new StorageError({ cause: "Database upgrade blocked; close older clients and retry" })))
+        resume(Effect.fail(new CompatibilityError({ reason: "blocked" })))
       })
       request.addEventListener("success", () => {
         if (abandoned) request.result.close()
-        else resume(Effect.succeed({ database: request.result, cache: undefined }))
+        else {
+          const db: Database = { database: request.result, superseded: false, cache: undefined }
+          db.database.addEventListener("versionchange", () => {
+            // Close synchronously: the upgrader may already hold the profile mutation lock.
+            db.superseded = true
+            db.database.close()
+          })
+          resume(Effect.succeed(db))
+        }
       })
-      request.addEventListener("error", () => resume(Effect.fail(new StorageError({ cause: request.error }))))
+      request.addEventListener("error", () =>
+        resume(
+          Effect.fail(
+            request.error?.name === "VersionError"
+              ? new CompatibilityError({ reason: "outdated" })
+              : new StorageError({ cause: request.error })
+          )
+        )
+      )
       return Effect.sync(() => {
         abandoned = true
       })
@@ -90,9 +120,21 @@ export const openDatabase = (name: string) =>
     { interruptible: true }
   )
 
+export const awaitSuperseded = (db: Database) =>
+  Effect.callback<void>((resume) => {
+    const changed = () => resume(Effect.void)
+    db.database.addEventListener("versionchange", changed)
+    if (db.superseded) changed()
+    return Effect.sync(() => db.database.removeEventListener("versionchange", changed))
+  })
+
 /** Results are borrowed immutable values. Token and snapshot are read in one transaction. */
 export const load = (db: Database) =>
-  Effect.callback<unknown, StorageError>((resume) => {
+  Effect.callback<unknown, StorageError | CompatibilityError>((resume) => {
+    if (db.superseded) {
+      resume(Effect.fail(new CompatibilityError({ reason: "superseded" })))
+      return
+    }
     const tx = db.database.transaction("data", "readonly")
     const store = tx.objectStore("data")
     const request = store.get("token")
@@ -117,7 +159,11 @@ export const load = (db: Database) =>
 /** Resolve only on transaction completion, never on request success.
  * Do not cache the caller's value: the next load borrows IndexedDB's detached clone. */
 export const save = (db: Database, value: unknown) =>
-  Effect.callback<void, StorageError>((resume) => {
+  Effect.callback<void, StorageError | CompatibilityError>((resume) => {
+    if (db.superseded) {
+      resume(Effect.fail(new CompatibilityError({ reason: "superseded" })))
+      return
+    }
     const tx = db.database.transaction("data", "readwrite", { durability: "strict" })
     tx.objectStore("data").put(value, "snapshot")
     // Browser platform edge: a unique token also fences reset/recreation (no counter ABA).

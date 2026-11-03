@@ -23,7 +23,7 @@ import * as Storage from "./BrowserStorage.ts"
 import * as Diagnostics from "./Diagnostics.ts"
 import * as Model from "./Model.ts"
 
-export { ProfileBusy, StorageError } from "./BrowserStorage.ts"
+export { CompatibilityError, ProfileBusy, StorageError } from "./BrowserStorage.ts"
 export type { Diagnostics, DiagnosticOperation } from "./Diagnostics.ts"
 export type { Read } from "./Model.ts"
 export class ClientClosed extends Data.TaggedError("ClientClosed") {}
@@ -51,14 +51,22 @@ export interface Options {
   readonly principal: Principal
   readonly aggregates: ReadonlyArray<Aggregate.Any>
   readonly transport: Transport
+  /** Positive monotonic app generation, default 1. Bump when older bundles cannot replay new writes.
+   * Keep the profile stable; upgrades preserve pending work and may require closing old tabs. */
+  readonly compatibilityGeneration?: number
   /** Defaults to true. Auth/oversized failures stop automation until close/reopen; sync stays one-shot. */
   readonly autoConnect?: boolean
 }
 export interface Status {
-  readonly connection: "idle" | "syncing" | "offline" | "error" | "auth" | "oversized" | "reset"
+  readonly connection: "idle" | "syncing" | "offline" | "error" | "auth" | "oversized" | "reset" | "incompatible"
   readonly pending: number
   readonly lastSynced: number | null
   readonly error: unknown
+  /** Sent/Accepted work still awaiting its authoritative outcome, without a readable local prediction. */
+  readonly compatibilityIssues: ReadonlyArray<{
+    readonly id: string
+    readonly reason: Model.IncompatibleCommand["reason"]
+  }>
 }
 export type Notice = Model.Intent
 export type Outcome<A extends Aggregate.Any = Aggregate.Any> =
@@ -152,6 +160,7 @@ export const resetProfile = Effect.fn("Echo.resetProfile")(function* (options: {
   readonly profile: string
   readonly principal: Principal
   readonly discardPending?: boolean
+  readonly compatibilityGeneration?: number
 }) {
   const namespace = profileNamespace(options)
   yield* Storage.withLock(
@@ -159,8 +168,8 @@ export const resetProfile = Effect.fn("Echo.resetProfile")(function* (options: {
     Storage.withLock(
       namespace,
       Effect.gen(function* () {
-        const journalDb = yield* Storage.openDatabase(`echo:journal:${namespace}`)
-        const replicaDb = yield* Storage.openDatabase(`echo:replica:${namespace}`)
+        const journalDb = yield* Storage.openDatabase(`echo:journal:${namespace}`, options.compatibilityGeneration)
+        const replicaDb = yield* Storage.openDatabase(`echo:replica:${namespace}`, options.compatibilityGeneration)
         const saved = yield* Storage.load(journalDb)
         const journal = saved === undefined ? undefined : yield* Schema.decodeUnknownEffect(Model.Journal)(saved)
         const count = Arr.filter(journal?.intents ?? [], (intent) => intent.phase !== "Rejected").length
@@ -194,8 +203,8 @@ export const open = (options: Options) =>
       Effect.sync(() => new BroadcastChannel(`echo:${namespace}`)),
       (value) => Effect.sync(() => value.close())
     )
-    const journalDb = yield* Storage.openDatabase(`echo:journal:${namespace}`)
-    const replicaDb = yield* Storage.openDatabase(`echo:replica:${namespace}`)
+    const journalDb = yield* Storage.openDatabase(`echo:journal:${namespace}`, options.compatibilityGeneration)
+    const replicaDb = yield* Storage.openDatabase(`echo:replica:${namespace}`, options.compatibilityGeneration)
     const hydrated = yield* Storage.withLock(
       namespace,
       Effect.gen(function* () {
@@ -244,29 +253,49 @@ export const open = (options: Options) =>
       connection: "idle",
       pending: 0,
       lastSynced: null,
-      error: null
+      error: null,
+      compatibilityIssues: []
     })
-    const guard = Effect.suspend(() => (closed ? Effect.fail(new ClientClosed()) : Effect.void))
-    const withdraw = Effect.gen(function* () {
-      closed = true
-      yield* SubscriptionRef.set(state, [])
-      yield* SubscriptionRef.set(notices, [])
-      yield* SubscriptionRef.set(frame, { _tag: "Keepalive", epoch: "" })
-      yield* SubscriptionRef.set(status, { connection: "reset", pending: 0, lastSynced: null, error: null })
-      yield* Deferred.succeed(stopped, undefined)
-    })
+    const withdraw = (connection: "reset" | "incompatible" = "reset") =>
+      Effect.gen(function* () {
+        closed = true
+        yield* SubscriptionRef.set(state, [])
+        yield* SubscriptionRef.set(notices, [])
+        yield* SubscriptionRef.set(frame, { _tag: "Keepalive", epoch: "" })
+        yield* SubscriptionRef.update(status, (s) => ({
+          ...s,
+          connection,
+          pending: connection === "reset" ? 0 : s.pending,
+          lastSynced: null,
+          error: connection === "incompatible" ? new Storage.CompatibilityError({ reason: "superseded" }) : null,
+          compatibilityIssues: []
+        }))
+        yield* Deferred.succeed(stopped, undefined)
+      })
+    const guard = Effect.suspend(() =>
+      journalDb.superseded || replicaDb.superseded
+        ? Effect.andThen(withdraw("incompatible"), Effect.fail(new ClientClosed()))
+        : closed
+          ? Effect.fail(new ClientClosed())
+          : Effect.void
+    )
+    yield* Storage.awaitSuperseded(journalDb).pipe(
+      Effect.race(Storage.awaitSuperseded(replicaDb)),
+      Effect.andThen(withdraw("incompatible")),
+      Effect.forkScoped
+    )
     let refreshedJournal: unknown
     let refreshedReplica: unknown
     const refresh = Effect.gen(function* () {
       const saved = yield* Storage.load(journalDb)
       if (saved === undefined) {
-        yield* withdraw
+        yield* withdraw()
         return yield* new ClientClosed()
       }
       if (saved !== refreshedJournal) {
         const nextJournal = yield* Schema.decodeUnknownEffect(Model.Journal)(saved)
         if (nextJournal.clientId !== journal.clientId) {
-          yield* withdraw
+          yield* withdraw()
           return yield* new ClientClosed()
         }
         if (!Equal.equals(journal, nextJournal)) journal = nextJournal
@@ -289,6 +318,7 @@ export const open = (options: Options) =>
             Effect.gen(function* () {
               yield* guard
               yield* refresh
+              yield* guard
               return yield* effect
             })
           )
@@ -303,26 +333,50 @@ export const open = (options: Options) =>
       })
     const publish = (rejectUnsent = false, prediction?: ReadonlyArray<Model.Row>) =>
       Effect.gen(function* () {
+        yield* guard
         rejectPending ||= rejectUnsent
         if (!rejectPending && publishedJournal === journal && publishedReplica === replica) return
         let rows = prediction ?? replica.rows
         const intents: Array<Model.Intent> = []
+        const compatibilityIssues: Array<Status["compatibilityIssues"][number]> = []
+        let quarantined = false
         for (const intent of journal.intents) {
           if (prediction !== undefined || intent.phase === "Rejected" || intent.phase === "Unknown") {
             intents.push(intent)
             continue
           }
           if (covered(intent, replica)) continue
+          if (compatibilityIssues.length > 0) {
+            intents.push(intent)
+            continue
+          }
           const decision = yield* attempt(() =>
             Model.decide(options.aggregates, rows, options.principal, intent, replica.grants)
+          ).pipe(
+            Effect.catchTag("ClientError", (error) =>
+              error.cause instanceof Model.IncompatibleCommand ? Effect.succeed(error.cause) : Effect.fail(error)
+            )
           )
+          if (decision instanceof Model.IncompatibleCommand) {
+            if (intent.phase === "Pending") {
+              intents.push({ ...intent, phase: "Unknown", rejection: { _tag: decision._tag, reason: decision.reason } })
+              quarantined = true
+            } else {
+              intents.push(intent)
+              compatibilityIssues.push({ id: intent.id, reason: decision.reason })
+            }
+            continue
+          }
           if (decision.rejection === null) {
             rows = decision.rows
             intents.push(intent)
-          } else if (rejectPending && intent.phase === "Pending") {
+          } else if (rejectPending && intent.phase === "Pending" && compatibilityIssues.length === 0) {
             intents.push({ ...intent, phase: "Rejected", rejection: decision.rejection })
           } else intents.push(intent)
         }
+        // Quarantine must be durable before publishing its notice or permitting another send.
+        if (quarantined) yield* writeJournal({ ...journal, intents })
+        yield* guard
         // Rows derive solely from already durable intents and the current confirmed replica.
         // A failed retirement/notice write must not leave subsequent decisions on stale hot state.
         const previous = SubscriptionRef.getUnsafe(state)
@@ -347,6 +401,7 @@ export const open = (options: Options) =>
         )
         yield* SubscriptionRef.update(status, (s) => ({
           ...s,
+          compatibilityIssues: prediction === undefined ? compatibilityIssues : s.compatibilityIssues,
           pending: Arr.filter(intents, (i) => i.phase !== "Rejected" && i.phase !== "Unknown").length
         }))
         // Failed reconciliation must retry, including authoritative rejection persistence.
@@ -486,6 +541,8 @@ export const open = (options: Options) =>
       Effect.gen(function* () {
         const request = yield* locked(
           Effect.gen(function* () {
+            const current = Arr.findFirst(journal.intents, (i) => i.id === intent.id)
+            if (Option.isNone(current) || (current.value.phase !== "Pending" && current.value.phase !== "Sent")) return
             yield* writeJournal({
               ...journal,
               intents: Arr.map(journal.intents, (i) =>
@@ -505,6 +562,7 @@ export const open = (options: Options) =>
             }
           })
         )
+        if (request === undefined) return
         const response = yield* diagnostics.measure(
           "execute",
           options.transport.execute(request),
@@ -549,7 +607,11 @@ export const open = (options: Options) =>
             yield* pull
             while (true) {
               const intent = yield* locked(
-                Effect.sync(() => Option.getOrUndefined(Arr.findFirst(journal.intents, (i) => i.phase === "Pending")))
+                Effect.gen(function* () {
+                  yield* publish()
+                  if (SubscriptionRef.getUnsafe(status).compatibilityIssues.length > 0) return undefined
+                  return Option.getOrUndefined(Arr.findFirst(journal.intents, (i) => i.phase === "Pending"))
+                })
               )
               if (intent === undefined) break
               yield* send(intent)
@@ -566,8 +628,10 @@ export const open = (options: Options) =>
         )
       )
       .pipe(
+        Effect.raceFirst(Effect.andThen(Deferred.await(stopped), Effect.fail(new ClientClosed()))),
         Effect.catch((error) =>
           Effect.gen(function* () {
+            if (closed) return yield* Effect.fail(error)
             if (Schema.is(ProtocolEpoch)(error)) yield* changeEpoch(error.epoch)
             yield* SubscriptionRef.update(status, (s): Status => ({
               ...s,
@@ -588,6 +652,8 @@ export const open = (options: Options) =>
           // A prior sync may have durably advanced the replica before journal reconciliation failed.
           // Recover from that state before deciding another local command, rather than using stale hot rows.
           yield* publish()
+          if (entries.length > 0 && SubscriptionRef.getUnsafe(status).compatibilityIssues.length > 0)
+            return yield* new Storage.CompatibilityError({ reason: "predictionUnavailable" })
           const commands = yield* attempt(() =>
             Arr.map(entries, ({ aggregate, command: value }) => {
               const schema = Option.getOrUndefined(
@@ -710,6 +776,7 @@ export const open = (options: Options) =>
           Stream.runForEach(() => sync),
           Effect.catch((error) =>
             Effect.gen(function* () {
+              if (closed) return yield* new ClientClosed()
               yield* SubscriptionRef.update(status, (s): Status => ({
                 ...s,
                 connection: error._tag === "TransportError" ? error.reason : "error",
@@ -722,7 +789,7 @@ export const open = (options: Options) =>
         )
         yield* retry
       })
-    ).pipe(Effect.catchTag("TransportError", () => Effect.void))
+    ).pipe(Effect.catchTags({ TransportError: () => Effect.void, ClientClosed: () => Effect.void }))
     yield* Stream.fromEventListener<MessageEvent>(channel, "message").pipe(
       Stream.runForEach((event) => {
         const value: unknown = event.data

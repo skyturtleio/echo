@@ -16,6 +16,7 @@ import { FetchHttpClient, HttpClient } from "effect/http"
 import { DefineTag, Note, NoteId, Tag, TagId, WriteNote } from "../../examples/fixture/domain/src/index.ts"
 import * as Domain from "../../src/domain/index.ts"
 import * as Client from "../../src/client/index.ts"
+import * as Storage from "../../src/client/BrowserStorage.ts"
 import {
   ResyncRequired,
   type Change,
@@ -666,7 +667,7 @@ const queries = (profile: string) =>
               seq: 1,
               // The persisted scope is deliberately misleading for the second row.
               state: {
-                scope: id === "visible" ? catalog : "user:someone-else",
+                scope: id === "visible" ? catalog : "shared:references",
                 key: { group: "first" },
                 at: "2026-10-30T00:00:00.000Z"
               }
@@ -722,6 +723,53 @@ const queries = (profile: string) =>
         ).length === savedBefore,
         "unchanged pull rewrote durable snapshots"
       )
+      // A cursor/revision-only pull must not discard decoded rows for equal fresh grants.
+      response = { ...response, revision: 2, scopes: [{ scope: catalog, cursor: 2, reset: false, entries: [] }] }
+      yield* references.sync
+      yield* check(references.query((read) => read.get(Reference, "visible")) === first, "equal grants flushed reader")
+      const get = IDBObjectStore.prototype.get
+      let snapshotReads = 0
+      Object.defineProperty(IDBObjectStore.prototype, "get", {
+        configurable: true,
+        writable: true,
+        value: function (this: IDBObjectStore, key: IDBValidKey | IDBKeyRange) {
+          if (key === "snapshot") snapshotReads++
+          return get.call(this, key)
+        }
+      })
+      yield* Effect.gen(function* () {
+        // First refresh after a committed write may load it once; subsequent locks must not.
+        yield* references.pending
+        snapshotReads = 0
+        yield* references.sync
+        yield* references.pending
+        yield* check(snapshotReads === 0, "unchanged critical sections loaded snapshots")
+        yield* add(client, 1)
+        snapshotReads = 0
+        yield* client.pending
+        yield* check(snapshotReads === 1, "journal-only write reloaded replica or missed journal")
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            IDBObjectStore.prototype.get = get
+          })
+        )
+      )
+      response = {
+        ...response,
+        grants: [{ scope: Domain.Scope.Scope.make("shared:references"), principal, role: "reader" }]
+      }
+      yield* references.sync
+      const granted = references.query((read) => read)
+      yield* check(granted.get(Reference, "hidden") !== null, "grant addition retained stale visibility")
+      response = { ...response, grants: [] }
+      yield* references.sync
+      yield* check(
+        references.query((read) => read.get(Reference, "hidden")) === null &&
+          granted.get(Reference, "hidden") !== null &&
+          before.get(Reference, "hidden") === null,
+        "grant revocation retained access or changed historical readers"
+      )
       response = {
         epoch: "query",
         revision: 2,
@@ -750,9 +798,9 @@ const queries = (profile: string) =>
           references.query((read) => read.get(Reference, "visible"))?.key.group === "second" &&
           references.query((read) => read.index(Reference.by_key, { group: "first" })).length === 0 &&
           references.query((read) => read.index(Reference.by_key, { group: "second" })).length === 1 &&
-          emitted.length === 2 &&
+          emitted.length === 4 &&
           emitted[0]?.[0]?.state?.key.group === "first" &&
-          emitted[1]?.[0]?.state?.key.group === "second",
+          emitted.at(-1)?.[0]?.state?.key.group === "second",
         "snapshot cache returned stale state/index or mutated a retained snapshot"
       )
       yield* references.resetReplica
@@ -1457,6 +1505,32 @@ const ownership = (profile: string) =>
       const fresh = yield* Client.open(options(profile))
       yield* check(value(fresh) === 0 && (yield* fresh.pending).length === 0, "reset retained data")
 
+      // Notifications are hints: every locked mutation still observes peers and identity reset.
+      const silentProfile = `${profile}-silent`
+      const silentFirst = yield* Client.open(options(silentProfile))
+      const silentSecond = yield* Client.open(options(silentProfile))
+      const postMessage = BroadcastChannel.prototype.postMessage
+      BroadcastChannel.prototype.postMessage = () => {}
+      yield* Effect.gen(function* () {
+        yield* add(silentFirst, 2)
+        yield* add(silentSecond, 3)
+        yield* add(silentFirst, 1)
+        yield* check(value(silentFirst) === 6, "missed notification lost peer journal work")
+        yield* Client.resetProfile({ profile: silentProfile, principal, discardPending: true })
+        const reopened = yield* Client.open(options(silentProfile))
+        yield* check(value(reopened) === 0, "silent reset/reopen retained work")
+        yield* check(
+          (yield* add(silentSecond, 1).pipe(Effect.flip))._tag === "ClientClosed",
+          "missed reset notification allowed stale identity to write"
+        )
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            BroadcastChannel.prototype.postMessage = postMessage
+          })
+        )
+      )
+
       const ownerScope = yield* Scope.make()
       const followerScope = yield* Scope.make()
       let active = 0
@@ -1547,9 +1621,112 @@ const ownership = (profile: string) =>
     })
   )
 
+// INV-CLIENT-9 catches tokenless peers, pre-commit cache updates, and late blocked-open leaks.
+const durableRefresh = (profile: string) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const name = `echo:token-test:${profile}`
+      const legacy = yield* Effect.callback<IDBDatabase, Storage.StorageError>((resume) => {
+        const request = indexedDB.open(name, 1)
+        request.addEventListener("upgradeneeded", () => request.result.createObjectStore("data"))
+        request.addEventListener("success", () => resume(Effect.succeed(request.result)))
+        request.addEventListener("error", () => resume(Effect.fail(new Storage.StorageError({ cause: request.error }))))
+      })
+      yield* Effect.addFinalizer(() => Effect.sync(() => legacy.close()))
+      yield* Effect.callback<void, Storage.StorageError>((resume) => {
+        const tx = legacy.transaction("data", "readwrite")
+        tx.objectStore("data").put({ revision: 1 }, "snapshot")
+        tx.addEventListener("complete", () => resume(Effect.void))
+        tx.addEventListener("abort", () => resume(Effect.fail(new Storage.StorageError({ cause: tx.error }))))
+      })
+      const blocked = yield* Storage.openDatabase(name).pipe(Effect.exit)
+      yield* check(Exit.isFailure(blocked), "upgrade admitted a live tokenless writer")
+      // A retry queues behind the abandoned upgrade. It must remain cancellable
+      // while the legacy connection is still open; the watchdog bounds a regression.
+      let forcedClose = false
+      const watchdog = yield* Effect.sleep("1 second").pipe(
+        Effect.andThen(
+          Effect.sync(() => {
+            forcedClose = true
+            legacy.close()
+          })
+        ),
+        Effect.forkScoped
+      )
+      const queued = yield* Storage.openDatabase(name).pipe(Effect.forkScoped)
+      yield* Effect.sleep("20 millis")
+      yield* Fiber.interrupt(queued)
+      yield* Fiber.interrupt(watchdog)
+      yield* check(!forcedClose, "queued database acquisition ignored interruption until legacy close")
+      legacy.close()
+      const db = yield* Storage.openDatabase(name).pipe(Effect.timeout("2 seconds"))
+      const peer = yield* Storage.openDatabase(name)
+      const decode = Schema.decodeUnknownEffect(Schema.Struct({ revision: Schema.Number }))
+      const first = yield* Storage.load(db)
+      yield* check(
+        (yield* decode(first)).revision === 1 && (yield* Storage.load(db)) === first,
+        "upgrade erased snapshot or cold cache"
+      )
+      const oldOpenFailed = yield* Effect.callback<boolean>((resume) => {
+        const request = indexedDB.open(name, 1)
+        request.addEventListener("error", () => resume(Effect.succeed(request.error?.name === "VersionError")))
+        request.addEventListener("success", () => {
+          request.result.close()
+          resume(Effect.succeed(false))
+        })
+      })
+      yield* check(oldOpenFailed, "old writer reopened version 2")
+      yield* Storage.save(peer, { revision: 2 })
+      const changed = yield* Storage.load(db)
+      yield* check((yield* decode(changed)).revision === 2 && changed !== first, "missed peer write without broadcast")
+      const transaction = IDBDatabase.prototype.transaction
+      Object.defineProperty(IDBDatabase.prototype, "transaction", {
+        configurable: true,
+        writable: true,
+        value: function (this: IDBDatabase, ...args: Parameters<typeof transaction>) {
+          const tx = transaction.call(this, ...args)
+          if (this.name === name && args[1] === "readwrite") queueMicrotask(() => tx.abort())
+          return tx
+        }
+      })
+      const aborted = yield* Storage.save(db, { revision: 3 }).pipe(
+        Effect.exit,
+        Effect.ensuring(
+          Effect.sync(() => {
+            IDBDatabase.prototype.transaction = transaction
+          })
+        )
+      )
+      yield* check(Exit.isFailure(aborted) && (yield* Storage.load(db)) === changed, "aborted write poisoned hot cache")
+      yield* Storage.save(peer, undefined)
+      yield* check((yield* Storage.load(db)) === undefined, "peer reset reused snapshot")
+      yield* Storage.save(peer, { revision: 2 })
+      yield* check(
+        (yield* decode(yield* Storage.load(db))).revision === 2,
+        "reset/reopen at same revision reused tombstone"
+      )
+      db.database.close()
+      peer.database.close()
+      yield* Effect.callback<void, Storage.StorageError>((resume) => {
+        // A leaked handle from the failed open would block this later schema change.
+        const request = indexedDB.open(name, 3)
+        request.addEventListener("blocked", () =>
+          resume(Effect.fail(new Storage.StorageError({ cause: "late-open leak" })))
+        )
+        request.addEventListener("success", () => {
+          request.result.close()
+          resume(Effect.void)
+        })
+        request.addEventListener("error", () => resume(Effect.fail(new Storage.StorageError({ cause: request.error }))))
+      })
+      return "PASS INV-CLIENT-9 atomic tokens, missed notifications, abort, reset, legacy upgrade and writer fence"
+    })
+  )
+
 const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect)
 Object.assign(globalThis, {
   echoScenarios: {
+    durableRefresh: (profile: string) => run(durableRefresh(profile)),
     batches: (profile: string) => run(batches(profile)),
     ownership: (profile: string) => run(ownership(profile)),
     diagnostics: (profile: string) => run(diagnostics(profile)),

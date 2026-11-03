@@ -434,6 +434,20 @@ behaviour adds or amends an item here in the same branch.
     Rejected: unauthenticated client identities and process-local presence maps. Presence is
     ephemeral, never journaled; ordinary sync remains notification-driven without client polling.
 
+29. **Durable refresh checks atomic change tokens before reading snapshots** (2026-11-03).
+    Each journal/replica write, including reset, commits a fresh opaque token in the same
+    strict IndexedDB transaction. A handle reads token and, only when changed, snapshot in
+    one readonly transaction; it caches borrowed immutable raw values only after completion.
+    Refresh skips decoding and structural comparison only for that identical validated raw
+    value. Journal identity and epoch fencing, mutation locks and journal/replica ordering
+    remain mandatory. Equal grants do not invalidate snapshot readers; actual grant changes do.
+    IndexedDB version 2 preserves version-1 snapshots but excludes old writers that cannot
+    maintain tokens. Existing old handles block upgrade: open fails with StorageError, the
+    caller closes old clients and retries. An abandoned late open aborts upgrade or closes its
+    handle. Rejected: server revision as a storage token (journal/reset can change alone),
+    BroadcastChannel-only invalidation (notifications can be missed), caching before commit
+    (aborts create false hot state), and admitting mixed version-1 writers.
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -458,6 +472,10 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
 - **INV-CLIENT-8:** Tabs share durable ownership, survive owner loss and coordinate profile
   reset; deletion refuses pending work without explicit consent and withdraws every tab's data
   even when replica cleanup fails. Replica reset cannot race an in-flight Pull.
+- **INV-CLIENT-9:** Unchanged durable snapshots are not reloaded; changed snapshots remain
+  visible without notifications, including journal-only writes and resets. Aborted transactions
+  cannot poison the cache. Version-1 snapshots survive upgrade, old writers cannot reopen, and
+  blocked upgrade attempts fail without leaking late handles.
 - **INV-PRESENCE-1:** Scope presence authenticates room membership, removes disconnected and
   revoked participants, and never fans out room state to unauthorized readers.
 

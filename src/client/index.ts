@@ -185,9 +185,9 @@ export const resetProfile = Effect.fn("Echo.resetProfile")(function* (options: {
 export const open = (options: Options) =>
   Effect.gen(function* () {
     const diagnostics = Diagnostics.make()
-    const saveJournal = (db: IDBDatabase, value: Model.Journal) =>
+    const saveJournal = (db: Storage.Database, value: Model.Journal) =>
       diagnostics.measure("journal", Storage.save(db, value), () => value.intents.length)
-    const saveReplica = (db: IDBDatabase, value: Model.Replica) =>
+    const saveReplica = (db: Storage.Database, value: Model.Replica) =>
       diagnostics.measure("replica", Storage.save(db, value), () => value.rows.length)
     const namespace = profileNamespace(options)
     const channel = yield* Effect.acquireRelease(
@@ -255,23 +255,31 @@ export const open = (options: Options) =>
       yield* SubscriptionRef.set(status, { connection: "reset", pending: 0, lastSynced: null, error: null })
       yield* Deferred.succeed(stopped, undefined)
     })
+    let refreshedJournal: unknown
+    let refreshedReplica: unknown
     const refresh = Effect.gen(function* () {
       const saved = yield* Storage.load(journalDb)
       if (saved === undefined) {
         yield* withdraw
         return yield* new ClientClosed()
       }
-      const nextJournal = yield* Schema.decodeUnknownEffect(Model.Journal)(saved)
-      if (nextJournal.clientId !== journal.clientId) {
-        yield* withdraw
-        return yield* new ClientClosed()
+      if (saved !== refreshedJournal) {
+        const nextJournal = yield* Schema.decodeUnknownEffect(Model.Journal)(saved)
+        if (nextJournal.clientId !== journal.clientId) {
+          yield* withdraw
+          return yield* new ClientClosed()
+        }
+        if (!Equal.equals(journal, nextJournal)) journal = nextJournal
+        refreshedJournal = saved
       }
       const cached = yield* Storage.load(replicaDb)
-      const nextReplica =
-        cached === undefined ? emptyReplica() : yield* Schema.decodeUnknownEffect(Model.Replica)(cached)
-      if (!Equal.equals(journal, nextJournal)) journal = nextJournal
-      if (!Equal.equals(replica, nextReplica))
-        replica = nextReplica.epoch === journal.epoch ? nextReplica : emptyReplica()
+      if (cached !== refreshedReplica) {
+        const nextReplica =
+          cached === undefined ? emptyReplica() : yield* Schema.decodeUnknownEffect(Model.Replica)(cached)
+        if (!Equal.equals(replica, nextReplica)) replica = nextReplica
+        refreshedReplica = cached
+      }
+      if (replica.epoch !== journal.epoch) replica = emptyReplica()
     })
     const locked = <A, E>(effect: Effect.Effect<A, E>) =>
       mutex.withPermit(
@@ -318,7 +326,7 @@ export const open = (options: Options) =>
         // Rows derive solely from already durable intents and the current confirmed replica.
         // A failed retirement/notice write must not leave subsequent decisions on stale hot state.
         const previous = SubscriptionRef.getUnsafe(state)
-        const grantsChanged = publishedReplica?.grants !== replica.grants
+        const grantsChanged = !Equal.equals(publishedReplica?.grants, replica.grants)
         if (grantsChanged) read = Model.makeReader(options.principal, replica.grants)
         if (
           grantsChanged ||

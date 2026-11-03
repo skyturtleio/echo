@@ -54,37 +54,75 @@ export const ownProfile = (profile: string, wait = false) =>
 export const withLock = <A, E, R>(name: string, effect: Effect.Effect<A, E, R>) =>
   Effect.scoped(Effect.andThen(ownProfile(name, true), effect))
 
-/** Separate databases deliberately prevent cache disposal from deleting pending commands. */
+export interface Database {
+  readonly database: IDBDatabase
+  cache: { readonly token: unknown; readonly value: unknown } | undefined
+}
+
+/** Separate databases deliberately prevent cache disposal from deleting pending commands.
+ * Version 2 fences writers that do not atomically maintain the change token. */
 export const openDatabase = (name: string) =>
   Effect.acquireRelease(
-    Effect.callback<IDBDatabase, StorageError>((resume) => {
-      const request = indexedDB.open(name, 1)
+    Effect.callback<Database, StorageError>((resume) => {
+      let abandoned = false
+      const request = indexedDB.open(name, 2)
       request.addEventListener("upgradeneeded", () => {
-        request.result.createObjectStore("data")
+        if (abandoned) {
+          request.transaction?.abort()
+          return
+        }
+        if (!request.result.objectStoreNames.contains("data")) request.result.createObjectStore("data")
       })
-      request.addEventListener("success", () => resume(Effect.succeed(request.result)))
+      request.addEventListener("blocked", () => {
+        abandoned = true
+        resume(Effect.fail(new StorageError({ cause: "Database upgrade blocked; close older clients and retry" })))
+      })
+      request.addEventListener("success", () => {
+        if (abandoned) request.result.close()
+        else resume(Effect.succeed({ database: request.result, cache: undefined }))
+      })
       request.addEventListener("error", () => resume(Effect.fail(new StorageError({ cause: request.error }))))
+      return Effect.sync(() => {
+        abandoned = true
+      })
     }),
-    (db) => Effect.sync(() => db.close())
+    (db) => Effect.sync(() => db.database.close()),
+    { interruptible: true }
   )
 
-export const load = (db: IDBDatabase) =>
+/** Results are borrowed immutable values. Token and snapshot are read in one transaction. */
+export const load = (db: Database) =>
   Effect.callback<unknown, StorageError>((resume) => {
-    const tx = db.transaction("data", "readonly")
-    const request = tx.objectStore("data").get("snapshot")
+    const tx = db.database.transaction("data", "readonly")
+    const store = tx.objectStore("data")
+    const request = store.get("token")
+    let value: unknown
+    request.addEventListener("success", () => {
+      if (db.cache !== undefined && db.cache.token === request.result) value = db.cache.value
+      else {
+        const snapshot = store.get("snapshot")
+        snapshot.addEventListener("success", () => {
+          value = snapshot.result
+        })
+      }
+    })
     tx.addEventListener("complete", () => {
-      const value: unknown = request.result
+      db.cache = { token: request.result, value }
       resume(Effect.succeed(value))
     })
     tx.addEventListener("abort", () => resume(Effect.fail(new StorageError({ cause: tx.error }))))
     tx.addEventListener("error", () => resume(Effect.fail(new StorageError({ cause: tx.error }))))
   })
 
-/** Resolve only on transaction completion, never on request success. */
-export const save = (db: IDBDatabase, value: unknown) =>
+/** Resolve only on transaction completion, never on request success.
+ * Do not cache the caller's value: the next load borrows IndexedDB's detached clone. */
+export const save = (db: Database, value: unknown) =>
   Effect.callback<void, StorageError>((resume) => {
-    const tx = db.transaction("data", "readwrite", { durability: "strict" })
+    const tx = db.database.transaction("data", "readwrite", { durability: "strict" })
     tx.objectStore("data").put(value, "snapshot")
+    // Browser platform edge: a unique token also fences reset/recreation (no counter ABA).
+    // oxlint-disable-next-line effecttsgo/crypto-random-uuid, effecttsgo/crypto-random-uuid-in-effect
+    tx.objectStore("data").put(crypto.randomUUID(), "token")
     tx.addEventListener("complete", () => resume(Effect.void))
     tx.addEventListener("abort", () => resume(Effect.fail(new StorageError({ cause: tx.error }))))
     tx.addEventListener("error", () => resume(Effect.fail(new StorageError({ cause: tx.error }))))

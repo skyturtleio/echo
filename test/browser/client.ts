@@ -732,17 +732,22 @@ const queries = (profile: string) =>
       yield* check(references.query((read) => read.get(Reference, "visible")) === first, "equal grants flushed reader")
       const get = IDBObjectStore.prototype.get
       let snapshotReads = 0
+      let replicaReads = 0
       Object.defineProperty(IDBObjectStore.prototype, "get", {
         configurable: true,
         writable: true,
         value: function (this: IDBObjectStore, key: IDBValidKey | IDBKeyRange) {
-          if (key === "snapshot") snapshotReads++
+          if (key === "snapshot") {
+            snapshotReads++
+            if (Str.startsWith("echo:replica:")(this.transaction.db.name)) replicaReads++
+          }
           return get.call(this, key)
         }
       })
       yield* Effect.gen(function* () {
-        // First refresh after a committed write may load it once; subsequent locks must not.
+        // Even the first refresh after our own replica commit needs only its token.
         yield* references.pending
+        yield* check(replicaReads === 0, "own committed replica was read back")
         snapshotReads = 0
         yield* references.sync
         yield* references.pending
@@ -806,11 +811,76 @@ const queries = (profile: string) =>
           emitted.at(-1)?.[0]?.state?.key.group === "second",
         "snapshot cache returned stale state/index or mutated a retained snapshot"
       )
+      // A peer can replace a same-sized snapshot without changing revision or seq.
+      // Exercise refresh without BroadcastChannel, not just Pull's in-memory path.
+      const namespace = `${encodeURIComponent(`${profile}-references`)}:${encodeURIComponent(principal)}`
+      const peer = yield* Storage.openDatabase(`echo:replica:${namespace}`)
+      const saved = yield* Schema.decodeUnknownEffect(Model.Replica)(yield* Storage.load(peer))
+      const reopened = yield* Client.open({ ...options(`${profile}-references`), aggregates: [Counter, Reference] })
+      yield* check(
+        reopened.query((read) => read.get(Reference, "visible"))?.key.group === "second",
+        "reopen lost hydrated state"
+      )
+      // No peer snapshot has initialized refresh's identity cache yet. Explicit
+      // absence must not be confused with that uninitialized cache after own writes.
+      yield* Storage.save(peer, undefined)
+      yield* references.dismiss("absent")
+      yield* check(
+        references.query((read) => read.scan(Reference)).length === 0 && (yield* references.pending).length === 0,
+        "peer replica deletion retained rows or removed journal identity"
+      )
+      yield* Storage.save(peer, saved)
+      yield* references.dismiss("absent")
+      const retained = references.query((read) => read.scan(Reference))
+      yield* Storage.save(peer, saved)
+      yield* references.dismiss("absent")
+      yield* check(references.query((read) => read.scan(Reference)) === retained, "equal clone invalidated reads")
+      const changed = {
+        ...saved,
+        rows: Arr.map(saved.rows, (row) => ({
+          ...row,
+          state: { scope: catalog, key: { group: row.id }, at: "2028-01-01T00:00:00.000Z" }
+        }))
+      }
+      yield* Storage.save(peer, changed)
+      yield* references.dismiss("absent")
+      yield* reopened.dismiss("absent")
+      yield* check(
+        reopened.query((read) => read.get(Reference, "visible"))?.key.group === "visible",
+        "hydration stamp hid a same-revision peer replacement"
+      )
+      yield* check(
+        Equal.equals(
+          references.query((read) => Arr.map(read.scan(Reference), (entry) => entry.state?.key.group)),
+          ["hidden", "visible"]
+        ) && retained[0]?.state?.key.group === "second",
+        "same revision/sequence replacement was skipped or mutated retained data"
+      )
+      yield* Storage.save(peer, { ...changed, rows: Arr.reverse(changed.rows) })
+      yield* references.dismiss("absent")
+      yield* check(
+        Equal.equals(
+          references.query((read) => Arr.map(read.scan(Reference), (entry) => entry.id)),
+          ["visible", "hidden"]
+        ),
+        "ordered rows were compared as a set"
+      )
       yield* references.resetReplica
       yield* check(
         references.query((read) => read.scan(Reference)).length === 0 && before.scan(Reference).length === 1,
         "reset reused cached rows or changed a retained snapshot"
       )
+      yield* references.sync
+      const journalPeer = yield* Storage.openDatabase(`echo:journal:${namespace}`)
+      const journal = yield* Schema.decodeUnknownEffect(Model.Journal)(yield* Storage.load(journalPeer))
+      yield* Storage.save(journalPeer, { ...journal, epoch: "peer-epoch" })
+      yield* references.dismiss("absent")
+      yield* check(
+        references.query((read) => read.scan(Reference)).length === 0,
+        "own replica token hid a journal-only epoch change"
+      )
+      yield* Storage.save(journalPeer, undefined)
+      yield* check(Exit.isFailure(yield* references.pending.pipe(Effect.exit)), "replica token hid journal deletion")
       return "PASS INV-CLIENT-5 queries: network stalled, local value 3, count emissions [0,1], effective index hit"
     })
   )
@@ -1679,9 +1749,15 @@ const durableRefresh = (profile: string) =>
         })
       })
       yield* check(oldOpenFailed, "old writer reopened upgraded storage")
-      yield* Storage.save(peer, { revision: 2 })
+      const callerValue = { revision: 2 }
+      const token = yield* Storage.save(peer, callerValue)
+      callerValue.revision = 99
+      yield* check(Option.isNone(yield* Storage.loadIfChanged(db, token)), "committed token was not acknowledged")
       const changed = yield* Storage.load(db)
-      yield* check((yield* decode(changed)).revision === 2 && changed !== first, "missed peer write without broadcast")
+      yield* check(
+        (yield* decode(changed)).revision === 2 && changed !== first && changed !== callerValue,
+        "missed peer write or cached caller-owned value"
+      )
       const transaction = IDBDatabase.prototype.transaction
       Object.defineProperty(IDBDatabase.prototype, "transaction", {
         configurable: true,
@@ -1702,6 +1778,10 @@ const durableRefresh = (profile: string) =>
       )
       yield* check(Exit.isFailure(aborted) && (yield* Storage.load(db)) === changed, "aborted write poisoned hot cache")
       yield* Storage.save(peer, undefined)
+      yield* check(
+        Option.isSome(yield* Storage.loadIfChanged(db, token)),
+        "missing snapshot was mistaken for acknowledged write"
+      )
       yield* check((yield* Storage.load(db)) === undefined, "peer reset reused snapshot")
       yield* Storage.save(peer, { revision: 2 })
       yield* check(

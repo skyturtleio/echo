@@ -1,6 +1,7 @@
 import * as Data from "effect/Data"
 import * as Effect from "effect/Effect"
 import { constVoid } from "effect/Function"
+import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 
 export class StorageError extends Data.TaggedError("StorageError")<{ readonly cause: unknown }> {}
@@ -128,9 +129,10 @@ export const awaitSuperseded = (db: Database) =>
     return Effect.sync(() => db.database.removeEventListener("versionchange", changed))
   })
 
-/** Results are borrowed immutable values. Token and snapshot are read in one transaction. */
-export const load = (db: Database) =>
-  Effect.callback<unknown, StorageError | CompatibilityError>((resume) => {
+/** None acknowledges a caller's committed token; Some(undefined) is an absent snapshot.
+ * Token and snapshot are read in one transaction; acknowledgment never caches caller-owned data. */
+export const loadIfChanged = (db: Database, acknowledgedToken?: string) =>
+  Effect.callback<Option.Option<unknown>, StorageError | CompatibilityError>((resume) => {
     if (db.superseded) {
       resume(Effect.fail(new CompatibilityError({ reason: "superseded" })))
       return
@@ -139,8 +141,10 @@ export const load = (db: Database) =>
     const store = tx.objectStore("data")
     const request = store.get("token")
     let value: unknown
+    let unchanged = false
     request.addEventListener("success", () => {
-      if (db.cache !== undefined && db.cache.token === request.result) value = db.cache.value
+      if (acknowledgedToken !== undefined && acknowledgedToken === request.result) unchanged = true
+      else if (db.cache !== undefined && db.cache.token === request.result) value = db.cache.value
       else {
         const snapshot = store.get("snapshot")
         snapshot.addEventListener("success", () => {
@@ -149,17 +153,20 @@ export const load = (db: Database) =>
       }
     })
     tx.addEventListener("complete", () => {
-      db.cache = { token: request.result, value }
-      resume(Effect.succeed(value))
+      if (!unchanged) db.cache = { token: request.result, value }
+      resume(Effect.succeed(unchanged ? Option.none() : Option.some(value)))
     })
     tx.addEventListener("abort", () => resume(Effect.fail(new StorageError({ cause: tx.error }))))
     tx.addEventListener("error", () => resume(Effect.fail(new StorageError({ cause: tx.error }))))
   })
 
+/** Results are borrowed immutable values detached from callers' saved objects. */
+export const load = (db: Database) => loadIfChanged(db).pipe(Effect.map(Option.getOrUndefined))
+
 /** Resolve only on transaction completion, never on request success.
  * Do not cache the caller's value: the next load borrows IndexedDB's detached clone. */
 export const save = (db: Database, value: unknown) =>
-  Effect.callback<void, StorageError | CompatibilityError>((resume) => {
+  Effect.callback<string, StorageError | CompatibilityError>((resume) => {
     if (db.superseded) {
       resume(Effect.fail(new CompatibilityError({ reason: "superseded" })))
       return
@@ -168,8 +175,9 @@ export const save = (db: Database, value: unknown) =>
     tx.objectStore("data").put(value, "snapshot")
     // Browser platform edge: a unique token also fences reset/recreation (no counter ABA).
     // oxlint-disable-next-line effecttsgo/crypto-random-uuid, effecttsgo/crypto-random-uuid-in-effect
-    tx.objectStore("data").put(crypto.randomUUID(), "token")
-    tx.addEventListener("complete", () => resume(Effect.void))
+    const token = crypto.randomUUID()
+    tx.objectStore("data").put(token, "token")
+    tx.addEventListener("complete", () => resume(Effect.succeed(token)))
     tx.addEventListener("abort", () => resume(Effect.fail(new StorageError({ cause: tx.error }))))
     tx.addEventListener("error", () => resume(Effect.fail(new StorageError({ cause: tx.error }))))
   })

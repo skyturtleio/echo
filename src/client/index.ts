@@ -194,10 +194,20 @@ export const resetProfile = Effect.fn("Echo.resetProfile")(function* (options: {
 export const open = (options: Options) =>
   Effect.gen(function* () {
     const diagnostics = Diagnostics.make()
+    let committedReplica: { readonly token: string; readonly value: Model.Replica } | undefined
     const saveJournal = (db: Storage.Database, value: Model.Journal) =>
       diagnostics.measure("journal", Storage.save(db, value), () => value.intents.length)
     const saveReplica = (db: Storage.Database, value: Model.Replica) =>
-      diagnostics.measure("replica", Storage.save(db, value), () => value.rows.length)
+      diagnostics
+        .measure("replica", Storage.save(db, value), () => value.rows.length)
+        .pipe(
+          Effect.tap((token) =>
+            Effect.sync(() => {
+              // Only reusable while this exact immutable value is installed as the current replica.
+              committedReplica = { token, value }
+            })
+          )
+        )
     const namespace = profileNamespace(options)
     const channel = yield* Effect.acquireRelease(
       Effect.sync(() => new BroadcastChannel(`echo:${namespace}`)),
@@ -227,7 +237,7 @@ export const open = (options: Options) =>
         const invalidCache = replica.epoch !== journal.epoch
         if (invalidCache) replica = emptyReplica()
         if (saved === undefined || cached === undefined || invalidCache) yield* saveReplica(replicaDb, replica)
-        return { journal, replica }
+        return { journal, replica, refreshedReplica: saved !== undefined && !invalidCache ? cached : undefined }
       })
     )
     let journal = hydrated.journal
@@ -285,7 +295,7 @@ export const open = (options: Options) =>
       Effect.forkScoped
     )
     let refreshedJournal: unknown
-    let refreshedReplica: unknown
+    let refreshedReplica: unknown = hydrated.refreshedReplica
     const refresh = Effect.gen(function* () {
       const saved = yield* Storage.load(journalDb)
       if (saved === undefined) {
@@ -301,8 +311,13 @@ export const open = (options: Options) =>
         if (!Equal.equals(journal, nextJournal)) journal = nextJournal
         refreshedJournal = saved
       }
-      const cached = yield* Storage.load(replicaDb)
-      if (cached !== refreshedReplica) {
+      const loaded = yield* Storage.loadIfChanged(
+        replicaDb,
+        committedReplica?.value === replica ? committedReplica.token : undefined
+      )
+      if (Option.isSome(loaded) && (loaded.value === undefined || loaded.value !== refreshedReplica)) {
+        committedReplica = undefined
+        const cached = loaded.value
         const nextReplica =
           cached === undefined ? emptyReplica() : yield* Schema.decodeUnknownEffect(Model.Replica)(cached)
         if (!Equal.equals(replica, nextReplica)) replica = nextReplica

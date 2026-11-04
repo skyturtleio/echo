@@ -474,6 +474,20 @@ behaviour adds or amends an item here in the same branch.
     ignore it), separate versioned profiles (strands pending work), and broad exception
     quarantine (hides defects and mislabels unresolved execution).
 
+31. **Clients acknowledge their own committed replica token** (2026-11-04).
+    A successful strict replica transaction returns its token. The client associates it with
+    that exact immutable replica and may skip reading/decoding/comparing the snapshot only
+    while that value is current and a readonly transaction confirms the same durable token.
+    Hydration retains the raw identity it already validated, avoiding a second decode/comparison
+    during initial publication; rejected or orphaned caches are never marked validated.
+    Peer writes still load normally, even with equal revision, sequence or size. Journal
+    identity checks run first and epoch reconciliation always runs afterward. Ordinary storage
+    loads still return detached committed values; acknowledgment never puts caller values into
+    the storage cache. Aborts acknowledge nothing, and replacing hot state disables an older
+    acknowledgment. Rejected: caching caller-owned values, assuming broadcasts cannot be lost,
+    revision-only checks, and changing generic equality without measured end-to-end benefit.
+    Storage formats, admission, publication equality and write-before-publication do not change.
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -510,6 +524,8 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
   visible without notifications, including journal-only writes and resets. Aborted transactions
   cannot poison the cache. Version-1 snapshots survive upgrade, old writers cannot reopen, and
   blocked upgrade attempts fail without leaking late handles.
+  A client's own committed replica needs only a token check while still current; this never
+  hides journal identity/epoch changes or aliases callers' saved values in ordinary storage reads.
 - **INV-PRESENCE-1:** Scope presence authenticates room membership, removes disconnected and
   revoked participants, and never fans out room state to unauthorized readers.
 
@@ -548,6 +564,8 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
   Borrowed immutable reads retain their snapshot through later changes/reset, authorize from decoded
   scope and preserve structural index equality and decoded types. Exact unchanged pulls do not
   rewrite journal/replica snapshots; a changed cursor, scope membership, reset or entry is not unchanged.
+  Equal detached replicas retain reads; same-revision/sequence state replacements and ordered-row
+  changes remain visible, including peer writes without notifications.
 - **INV-CLIENT-6:** Diagnostic snapshots retain at most 100 completed operations with scalar
   allowlisted timing/count/failure data only. Offline work retains its age across reopen;
   follow-up counts exclude initial calls, successful sync reports actual response counts,

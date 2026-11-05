@@ -2,7 +2,7 @@
   "$schema": "./node_modules/@effect/tsgo/schema.json",
   "compilerOptions": {
     "target": "ES2023",
-    "lib": ["ES2023", "DOM", "DOM.Iterable", "WebWorker"],
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "moduleResolution": "bundler",
     "moduleDetection": "force",
@@ -32,16 +32,13 @@
       {
         "name": "@effect/language-service",
         "diagnostics": true,
+        "effectFn": ["untraced", "span"],
         "allowedUnstableApis": [
           "effect/http",
           "effect/reactivity",
           "effect/rpc",
           "effect/sql",
-          "effect/workers",
-          "@effect/platform-browser",
-          "@effect/platform-bun",
           "@effect/sql-pg",
-          "@effect/sql-sqlite-wasm",
           "@effect/vitest"
         ]
       }

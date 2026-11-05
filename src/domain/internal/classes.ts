@@ -13,7 +13,7 @@ export const taggedClass = <Self, Tag extends string, F extends Fields>(
   tag: Tag,
   fields: F
 ): Schema.Class<Self, Schema.TaggedStruct<Tag, F>, {}> => {
-  const made = Schema.TaggedClass<Self, {}>(tag)(tag, fields)
+  const made = Schema.TaggedClass<Self>(tag)(tag, fields)
   // oxlint-disable-next-line typescript/consistent-type-assertions -- resolves the `Self` conditional, see above
   return made as Schema.Class<Self, Schema.TaggedStruct<Tag, F>, {}>
 }
@@ -22,7 +22,7 @@ export const taggedError = <Self, Tag extends string, F extends Fields>(
   tag: Tag,
   fields: F
 ): Schema.Class<Self, Schema.TaggedStruct<Tag, F>, Cause.YieldableError> => {
-  const made = Schema.TaggedError<Self, {}>(tag)(tag, fields)
+  const made = Schema.TaggedError<Self>(tag)(tag, fields)
   // oxlint-disable-next-line typescript/consistent-type-assertions -- resolves the `Self` conditional, see above
   return made as Schema.Class<Self, Schema.TaggedStruct<Tag, F>, Cause.YieldableError>
 }

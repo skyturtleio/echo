@@ -16,20 +16,20 @@ const Generation = Schema.Int.check(
 )
 
 // Browser platform edge; use the same native cryptographic source as Web Locks/IndexedDB's host.
-// oxlint-disable-next-line effecttsgo/crypto-random-uuid, effecttsgo/crypto-random-uuid-in-effect
+// oxlint-disable-next-line effecttsgo/crypto-random-uuid-in-effect -- browser identity uses the host cryptographic source
 export const randomId = Effect.sync(() => crypto.randomUUID())
 
 /** Browser platform edge: the lock is held until the owning Effect scope closes. */
 export const ownProfile = (profile: string, wait = false) =>
   Effect.acquireRelease(
     Effect.callback<Effect.Effect<void>, StorageError | ProfileBusy>((resume) => {
-      if (!globalThis.navigator?.locks) {
+      if (globalThis.navigator?.locks === undefined) {
         resume(Effect.fail(new StorageError({ cause: "Web Locks unavailable" })))
         return
       }
       let release = constVoid
       // Web Locks requires a native pending Promise to retain ownership; this is not an Effect task.
-      // oxlint-disable-next-line effecttsgo/new-promise
+      // oxlint-disable-next-line effecttsgo/new-promise -- Web Locks retains ownership until this native Promise resolves
       const held = new Promise<void>((resolve) => {
         release = resolve
       })
@@ -174,7 +174,7 @@ export const save = (db: Database, value: unknown) =>
     const tx = db.database.transaction("data", "readwrite", { durability: "strict" })
     tx.objectStore("data").put(value, "snapshot")
     // Browser platform edge: a unique token also fences reset/recreation (no counter ABA).
-    // oxlint-disable-next-line effecttsgo/crypto-random-uuid, effecttsgo/crypto-random-uuid-in-effect
+    // oxlint-disable-next-line effecttsgo/crypto-random-uuid-in-effect -- native token fences cross-tab reset and recreation
     const token = crypto.randomUUID()
     tx.objectStore("data").put(token, "token")
     tx.addEventListener("complete", () => resume(Effect.succeed(token)))

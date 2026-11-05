@@ -1,5 +1,5 @@
 /* Pure synchronous domain evaluation and selectors; the client wraps failures at its Effect boundary. */
-/* oxlint-disable effecttsgo/schema-sync */
+/* oxlint-disable effecttsgo/schema-sync -- Pure model evaluation is synchronous; the client wraps errors at its Effect boundary. */
 import * as Array from "effect/Array"
 import * as Data from "effect/Data"
 import * as DateTime from "effect/DateTime"
@@ -12,19 +12,23 @@ import * as Aggregate from "../domain/Aggregate.ts"
 import type * as Command from "../domain/Command.ts"
 import type * as Index from "../domain/Indexes.ts"
 import { canRead, canWrite, Grant, type Principal, ScopeForbidden } from "../domain/Scope.ts"
-import { Batch, Receipt } from "../protocol.ts"
+import { Batch, Position, Receipt } from "../protocol.ts"
+
+export const IntentTime = Schema.Finite.check(
+  Schema.isBetween({ minimum: -8640000000000000, maximum: 8640000000000000 })
+)
 
 export const Row = Schema.Struct({
   aggregate: Schema.String,
   id: Schema.String,
   scope: Schema.String,
-  seq: Schema.Number,
+  seq: Position,
   state: Schema.Unknown
 })
 export type Row = typeof Row.Type
 export const Intent = Schema.Struct({
   ...Batch.fields,
-  now: Schema.Number,
+  now: IntentTime,
   attemptEpoch: Schema.NullOr(Schema.String),
   dismissed: Schema.Boolean,
   phase: Schema.Literals(["Pending", "Sent", "Accepted", "Unknown", "Rejected"]),
@@ -41,9 +45,9 @@ export const Journal = Schema.Struct({
 export type Journal = typeof Journal.Type
 export const Replica = Schema.Struct({
   epoch: Schema.NullOr(Schema.String),
-  revision: Schema.Number,
+  revision: Position,
   grants: Schema.Array(Grant),
-  cursors: Schema.Record(Schema.String, Schema.Number),
+  cursors: Schema.Record(Schema.String, Position),
   rows: Schema.Array(Row)
 })
 export type Replica = typeof Replica.Type
@@ -163,7 +167,7 @@ export const decide = (
   principal: Principal,
   intent: Intent,
   grants: ReadonlyArray<Grant> = []
-): { readonly rows: ReadonlyArray<Row>; readonly rejection: unknown | null } => {
+): { readonly rows: ReadonlyArray<Row>; readonly rejection: unknown } => {
   if (intent.action !== undefined) return { rows, rejection: null }
   // Inspect the whole batch before a domain rejection can short-circuit evaluation.
   const prepared = Array.map(intent.commands, (item) => prepareCommand(aggregates, item))
@@ -201,7 +205,7 @@ const decideCommand = (
   prepared: ReturnType<typeof prepareCommand>,
   now: number,
   grants: ReadonlyArray<Grant>
-): { readonly rows: ReadonlyArray<Row>; readonly rejection: unknown | null } => {
+): { readonly rows: ReadonlyArray<Row>; readonly rejection: unknown } => {
   const { aggregate, envelope, commandClass, command } = prepared
   const row = Option.getOrUndefined(
     Array.findFirst(rows, (r) => r.aggregate === aggregate.tag && r.id === envelope.target)

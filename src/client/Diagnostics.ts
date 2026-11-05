@@ -65,35 +65,38 @@ export const make = () => {
   let operations: ReadonlyArray<DiagnosticOperation> = []
   const failedOperationFollowups = { execute: 0, pull: 0 }
   const failed = { execute: false, pull: false }
-  const measure = <A, E, R>(operation: Operation, effect: Effect.Effect<A, E, R>, count: (value: A) => number) =>
-    Effect.gen(function* () {
-      const request = operation === "execute" || operation === "pull" ? operation : null
-      const followsFailure = request !== null && failed[request]
-      if (followsFailure && request !== null) failedOperationFollowups[request]++
-      const start = yield* Clock.monotonicTimeNanos.pipe(Effect.catchCause(() => Effect.succeed(null)))
-      // Instrumentation must never prevent or retry the underlying operation.
-      if (start === null) return yield* effect
-      return yield* effect.pipe(
-        Effect.onExit((exit) =>
-          Effect.gen(function* () {
-            const end = yield* Clock.monotonicTimeNanos
-            const failure = Exit.isFailure(exit) ? category(exit.cause) : null
-            if (request !== null) failed[request] = failure !== null
-            operations = [
-              ...operations.slice(-99),
-              {
-                operation,
-                durationMs: Math.max(0, Number(end - start) / 1_000_000),
-                failure,
-                count: Exit.isSuccess(exit) ? count(exit.value) : null,
-                bytes: null,
-                followsFailure
-              }
-            ]
-          }).pipe(Effect.ignoreCause)
-        )
+  const measure = Effect.fnUntraced(function* <A, E, R>(
+    operation: Operation,
+    effect: Effect.Effect<A, E, R>,
+    count: (value: A) => number
+  ) {
+    const request = operation === "execute" || operation === "pull" ? operation : null
+    const followsFailure = request !== null && failed[request]
+    if (followsFailure && request !== null) failedOperationFollowups[request]++
+    const start = yield* Clock.monotonicTimeNanos.pipe(Effect.catchCause(() => Effect.succeed(null)))
+    // Instrumentation must never prevent or retry the underlying operation.
+    if (start === null) return yield* effect
+    return yield* effect.pipe(
+      Effect.onExit((exit) =>
+        Effect.gen(function* () {
+          const end = yield* Clock.monotonicTimeNanos
+          const failure = Exit.isFailure(exit) ? category(exit.cause) : null
+          if (request !== null) failed[request] = failure !== null
+          operations = [
+            ...operations.slice(-99),
+            {
+              operation,
+              durationMs: Math.max(0, Number(end - start) / 1_000_000),
+              failure,
+              count: Exit.isSuccess(exit) ? count(exit.value) : null,
+              bytes: null,
+              followsFailure
+            }
+          ]
+        }).pipe(Effect.ignoreCause)
       )
-    })
+    )
+  })
   return {
     measure,
     snapshot: () => ({

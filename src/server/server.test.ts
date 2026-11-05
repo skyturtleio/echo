@@ -667,10 +667,10 @@ describe.skipIf(url === undefined)("Postgres server", () => {
               : Effect.fail(new Wire.ServerError({ message: "Unauthorized" }))
           )
         )
-        const context = yield* Effect.context<never>()
+        const context = yield* Effect.context()
         const listener = createServer((incoming, outgoing) => {
           const handle = Effect.gen(function* () {
-            const chunks = yield* Schema.decodeUnknownEffect(Schema.Array(Schema.Uint8Array))(
+            const chunks = yield* Schema.decodeEffect(Schema.Array(Schema.Uint8Array))(
               yield* Effect.promise(() => incoming.toArray())
             )
             const headers = new Headers()
@@ -690,7 +690,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
               )
             )
             outgoing.writeHead(response.status, Record.fromEntries(response.headers))
-            if (response.body) {
+            if (response.body !== null) {
               const reader = response.body.getReader()
               while (true) {
                 const chunk = yield* Effect.promise(() => reader.read())

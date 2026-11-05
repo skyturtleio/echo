@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": []
+  },
+  "include": ["src/client", "src/domain", "src/protocol.ts"],
+  "exclude": ["src/**/*.test.ts", "src/domain/testing"]
+}

@@ -11,11 +11,14 @@
     "./client": "./src/client/index.ts"
   },
   "scripts": {
-    "check": "bun .agents/check-invariants.ts && bun run typecheck && bun run lint && oxfmt --check && vitest run",
-    "typecheck": "effect-tsgo tsc@7.1.0-beta --noEmit",
-    "lint": "oxlint --deny-warnings && effect-tsgo oxlint --config .oxlintrc.type-aware.json --type-aware --deny-warnings",
+    "check": "bun .agents/check-invariants.ts && bun run --parallel --no-exit-on-error typecheck lint fmt:check test",
+    "typecheck": "effect-tsgo tsc@7.1.0-beta --noEmit && effect-tsgo tsc@7.1.0-beta --noEmit -p tsconfig.browser.json",
+    "lint": "effect-tsgo --tsrs-lint=0.21.0-ts7.1.0-beta oxlint --config .oxlintrc.type-aware.json --type-aware --deny-warnings",
     "test": "vitest run",
     "test:pg": "ECHO_PG_URL=${ECHO_PG_URL:-postgres://postgres@127.0.0.1:5432/postgres} vitest run src/server test/",
+    "test:browser": "bash test/browser/run.sh",
+    "check:integration": "bun run test:pg && bun run test:browser",
+    "fmt:check": "oxfmt --check",
     "fmt": "oxfmt",
     "lsp": "effect-tsgo tsc@7.1.0-beta --lsp --stdio"
   },
@@ -23,12 +26,11 @@
     "@effect/sql-pg": "4.1.1"
   },
   "devDependencies": {
-    "@effect/tsgo": "0.59.0",
+    "@effect/tsgo": "0.67.1",
     "@effect/vitest": "4.1.1",
     "@types/bun": "1.4.3",
     "oxfmt": "0.74.0",
     "oxlint": "1.89.0",
-    "oxlint-tsgolint": "7.0.2005",
     "typescript": "7.1.0-beta",
     "vitest": "5.0.5"
   },

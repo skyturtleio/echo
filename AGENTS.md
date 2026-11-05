@@ -23,13 +23,13 @@ in `node_modules/effect/src/**` and `node_modules/@effect/*`.
 
 - The repository root is the package (`echo`), consumed as a git dependency pinned to a
   commit SHA; it ships TypeScript source, no build step, no npm publish.
-- Planned entry points (design §1): `echo/domain` (the building blocks an app's
-  domain package is written against: `Aggregate`, `Command`, `Event`, `Rejection`, `Story`,
-  `Policy`, `Batch`), `echo/server` (Postgres, `Execute`/`Pull`/`Changes`), `echo/client`
-  (leader worker, journal, replica cache, effective state, rebase, queries),
-  `echo/foldkit` (a thin translation of the client tab API that imports nothing from the
-  framework). `domain` and `client` code never imports `server`. No engine entry point
-  imports a UI framework; FoldKit is a devDependency for examples only.
+- Current entry points are `echo/domain`, `echo/domain/testing`, `echo/protocol`,
+  `echo/server`, and `echo/client` (see `package.json`). Domain rules are pure and do not
+  import client, server, or protocol code. Client code never imports server code or server
+  platform packages. No engine entry point imports a UI framework; examples may do so.
+  Tabs run queries locally and coordinate IndexedDB writes with Web Locks; one elected tab
+  owns networking. A worker implementation, FoldKit adapter, and policies remain deferred;
+  historical proposals in design §1 are not instructions to add them.
 - Runtime: Bun. Tooling: TypeScript strict (`exactOptionalPropertyTypes`,
   `noUncheckedIndexedAccess`), `oxlint`, `oxfmt`, `vitest` + `@effect/vitest`.
 - Runtime dependencies are Effect packages only, exact-pinned to one version.
@@ -40,7 +40,26 @@ in `node_modules/effect/src/**` and `node_modules/@effect/*`.
 - v4 import paths: `effect/sql`, `effect/rpc`, `effect/http`, `effect/workers`,
   `effect/testing`, `effect/Schema` (stable). `effect/schema` (lowercase) is a different,
   unstable barrel; lint forbids it.
-- No `any`, no `!`, no `as` outside platform edges (and then with a comment).
+- No `any` or non-null assertions. Type assertions are limited to platform serialization
+  and erased generic factory boundaries, with a named, explained lint exception.
+- Use `Effect.gen` inline, `Effect.fnUntraced` for reusable library computations, and
+  named `Effect.fn` only at useful tracing boundaries. Keep recoverable failures separate
+  from defects: `ignoreCause` is not a substitute for `ignore` or typed error handling.
+- Validate untrusted data with Schema. Numeric fields use their actual contract: a counter
+  is not an arbitrary `number`, and an epoch timestamp need not be positive or integral.
+  Correct schemas directly; add migrations or compatibility code only for demonstrated
+  valid historical representations, never to preserve previously accepted malformed data.
+- `bun run typecheck` checks both the complete project and the browser dependency graph
+  without Bun/Node ambient types. Keep `skipLibCheck: true`: use dependency types to check
+  our code, but trust library authors to check their declaration files. `strict: true` already
+  includes strict null/function/bind/call checks, unknown catches, and iterator returns;
+  do not add redundant flags and claim new enforcement.
+- Lint runs syntax and type-aware rules together so unused suppressions fail. Every lint
+  disable names rules and explains the exception inline with `-- reason`; no blanket
+  disables or compiler-suppression comments. Prefer a local exception to changing a preset.
+  `noImplicitReturns` handles generator returns; the additional `consistent-return` lint
+  rule is disabled because yieldable failures cause false positives. Assertion-style
+  `never` already bans all assertions, so the overlapping unsafe-assertion rule is disabled.
 - `decide` and `evolve` are pure functions, never Effects; `decide` sees only its stream's
   state, the command, and `ctx` (`principal`, `now`, declared `reads`).
 
@@ -79,7 +98,13 @@ name cites no existing `INV` id and is not a `Story`.
   `127.0.0.1:5432` with trust auth; `.agents/resume` makes sure it is running via
   `.amp/services.yaml`. Any machine with Bun and a PostgreSQL reachable at `ECHO_PG_URL`
   works the same way.
-- `bun run check` is the default gate (types, lint, format, unit tests). That database is
-  throwaway (crash durability off): never expose it or put production data in it.
+- `bun run check` is the infrastructure-free gate (test declarations, types, lint, format,
+  Stories). `bun run check:integration` separately runs the existing Postgres and browser
+  scenarios and fails if their prerequisites are missing. Start the disposable Postgres
+  service and the supervised `bun test/browser/serve.ts` fixture server before running it.
+  Run integration scenarios for changes to persistence, replay, sync, or resource lifetimes;
+  they exercise database isolation, IndexedDB durability, and cross-tab coordination that
+  TypeScript cannot prove. Pure tooling edits do not require a new database/browser framework.
+  The local database is throwaway (crash durability off): never expose it or use production data.
 - Long-lived servers in an orb run as supervised services (`amp orb service start`), never as
   detached shell jobs.

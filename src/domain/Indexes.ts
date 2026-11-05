@@ -59,7 +59,7 @@ export const make = <Id extends IdSchema, S extends Schema.Top, const X extends 
   state: S,
   spec: X
 ): Set<Id, S, X> => {
-  const set = Record.map(spec, (fields, name): Any => ({ kind: "Index", name: String(name), id, state, fields }))
+  const set = Record.map(spec, (fields, name): Any => ({ kind: "Index", name, id, state, fields }))
   // oxlint-disable-next-line typescript/consistent-type-assertions -- `Record.map` cannot express a per-key mapped type
   return set as Set<Id, S, X>
 }

@@ -24,18 +24,19 @@ import {
   type Change,
   type ExecuteRequest,
   type ExecuteResponse,
+  type PullRequest,
   type PullResponse,
   type Receipt
 } from "../../src/protocol.ts"
 
 // Non-idempotent fixture: repeating a prediction changes 3 to 6, unlike a set-value command.
 const Id = Schema.String
-const State = Schema.NullOr(Schema.Struct({ value: Schema.Number, scope: Domain.Scope.Scope }))
-class Added extends Domain.Event("Added", { amount: Schema.Number, scope: Domain.Scope.Scope }) {}
+const State = Schema.NullOr(Schema.Struct({ value: Schema.Finite, scope: Domain.Scope.Scope }))
+class Added extends Domain.Event("Added", { amount: Schema.Finite, scope: Domain.Scope.Scope }) {}
 class Limit extends Domain.Rejection("Limit", {}) {}
 class Add extends Domain.Command("Add", {
   target: Id,
-  input: { amount: Schema.Number },
+  input: { amount: Schema.Finite },
   events: [Added],
   rejects: [Limit],
   reads: []
@@ -94,6 +95,19 @@ const check = (condition: boolean, message: string) =>
   Effect.sync(() => {
     if (!condition) throw new Error(message)
   })
+// Delegate methods with their original receiver; Clock services may implement them on a prototype.
+const overrideClock = (
+  clock: Clock.Clock,
+  overrides: Partial<Pick<Clock.Clock, "currentTimeMillis" | "monotonicTimeNanos">>
+): Clock.Clock => ({
+  currentTimeMillisUnsafe: () => clock.currentTimeMillisUnsafe(),
+  currentTimeMillis: overrides.currentTimeMillis ?? clock.currentTimeMillis,
+  currentTimeNanosUnsafe: () => clock.currentTimeNanosUnsafe(),
+  currentTimeNanos: clock.currentTimeNanos,
+  monotonicTimeNanosUnsafe: () => clock.monotonicTimeNanosUnsafe(),
+  monotonicTimeNanos: overrides.monotonicTimeNanos ?? clock.monotonicTimeNanos,
+  sleep: (duration) => clock.sleep(duration)
+})
 const snapshot = (amount: number, seq = 1, epoch = "one"): PullResponse => ({
   epoch,
   revision: seq,
@@ -120,42 +134,42 @@ const snapshot = (amount: number, seq = 1, epoch = "one"): PullResponse => ({
 })
 
 // INV-CLIENT-1 catches publishing before the journal commit and deleting the journal on cache reset.
-const prepareReload = (profile: string) =>
-  Effect.gen(function* () {
-    const scope = yield* Scope.make()
-    const client = yield* Client.open(options(profile)).pipe(Effect.provideService(Scope.Scope, scope))
-    // A redundant fallible write after committing the command must not turn success into an ambiguous failure.
-    const original = IDBDatabase.prototype.transaction
-    let journalWrites = 0
-    Object.defineProperty(IDBDatabase.prototype, "transaction", {
-      configurable: true,
-      writable: true,
-      value: function (this: IDBDatabase, ...args: Parameters<typeof original>) {
-        const tx = original.call(this, ...args)
-        if (Str.startsWith("echo:journal:")(this.name) && args[1] === "readwrite" && ++journalWrites === 2)
-          queueMicrotask(() => tx.abort())
-        return tx
-      }
-    })
-    yield* Effect.gen(function* () {
-      const accepted = yield* add(client, 3)
-      yield* check(accepted._tag === "Pending", "durable append was reported as failed")
-      const rejected = yield* add(client, 8)
-      yield* check(
-        rejected._tag === "Rejected" && Schema.is(Limit)(rejected.rejection),
-        "next command used stale effective state or lost typed rejection"
-      )
-    }).pipe(
-      Effect.ensuring(
-        Effect.sync(() => {
-          IDBDatabase.prototype.transaction = original
-        })
-      )
-    )
-    yield* check(value(client) === 3, "optimistic state was not immediately available")
-    // Deliberately do not close: the browser navigation kills this resource, like an abrupt page reload.
-    return "PASS INV-CLIENT-1 prepare: durable offline +3"
+const prepareReload = Effect.fnUntraced(function* (profile: string) {
+  const scope = yield* Scope.make()
+  const client = yield* Client.open(options(profile)).pipe(Effect.provideService(Scope.Scope, scope))
+  // A redundant fallible write after committing the command must not turn success into an ambiguous failure.
+  // oxlint-disable-next-line typescript/unbound-method -- Fault injection calls the native method with .call(this) and restores its original identity.
+  const original = IDBDatabase.prototype.transaction
+  let journalWrites = 0
+  Object.defineProperty(IDBDatabase.prototype, "transaction", {
+    configurable: true,
+    writable: true,
+    value: function (this: IDBDatabase, ...args: Parameters<typeof original>) {
+      const tx = original.call(this, ...args)
+      if (Str.startsWith("echo:journal:")(this.name) && args[1] === "readwrite" && ++journalWrites === 2)
+        queueMicrotask(() => tx.abort())
+      return tx
+    }
   })
+  yield* Effect.gen(function* () {
+    const accepted = yield* add(client, 3)
+    yield* check(accepted._tag === "Pending", "durable append was reported as failed")
+    const rejected = yield* add(client, 8)
+    yield* check(
+      rejected._tag === "Rejected" && Schema.is(Limit)(rejected.rejection),
+      "next command used stale effective state or lost typed rejection"
+    )
+  }).pipe(
+    Effect.ensuring(
+      Effect.sync(() => {
+        IDBDatabase.prototype.transaction = original
+      })
+    )
+  )
+  yield* check(value(client) === 3, "optimistic state was not immediately available")
+  // Deliberately do not close: the browser navigation kills this resource, like an abrupt page reload.
+  return "PASS INV-CLIENT-1 prepare: durable offline +3"
+})
 const verifyReload = (profile: string) =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -163,6 +177,129 @@ const verifyReload = (profile: string) =>
       yield* check(value(client) === 3, "reload lost pending work")
       yield* client.resetReplica
       yield* check(value(client) === 3, "cache reset erased journal")
+      // IndexedDB structured clone preserves non-finite numbers; JSON fixtures would hide this corruption.
+      const numericProfile = `${profile}-numbers`
+      const namespace = `${encodeURIComponent(numericProfile)}:${encodeURIComponent(principal)}`
+      const journalDb = yield* Storage.openDatabase(`echo:journal:${namespace}`)
+      const replicaDb = yield* Storage.openDatabase(`echo:replica:${namespace}`)
+      const intent: Model.Intent = {
+        id: "numeric-intent",
+        commands: [{ aggregate: "Counter", command: { _tag: "Add", target: "one", amount: 2 } }],
+        now: 0,
+        attemptEpoch: null,
+        dismissed: false,
+        phase: "Pending",
+        receipt: null,
+        rejection: null
+      }
+      const journal: Model.Journal = { principal, clientId: "numeric-client", epoch: "one", intents: [intent] }
+      const row: Model.Row = {
+        aggregate: "Counter",
+        id: "one",
+        scope: `user:${principal}`,
+        seq: 0,
+        state: { value: 1, scope: `user:${principal}` }
+      }
+      const replica: Model.Replica = {
+        epoch: "one",
+        revision: 0,
+        grants: [],
+        cursors: { [row.scope]: 0 },
+        rows: [row]
+      }
+      for (const position of [0, Number.MAX_SAFE_INTEGER]) {
+        for (const now of [-8640000000000000, -1, -0.5, 0, 0.5, 8640000000000000]) {
+          const saved = { ...journal, intents: [{ ...intent, now }] }
+          const cached = {
+            ...replica,
+            revision: position,
+            cursors: { [row.scope]: position },
+            rows: [{ ...row, seq: position }]
+          }
+          yield* Storage.save(journalDb, saved)
+          yield* Storage.save(replicaDb, cached)
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const restored = yield* Client.open(options(numericProfile))
+              yield* check(value(restored) === 3, "valid numeric boundary failed hydration/prediction")
+              yield* check(
+                Equal.equals(yield* Storage.load(journalDb), saved),
+                "valid journal changed shape or identity"
+              )
+              yield* check(Equal.equals(yield* Storage.load(replicaDb), cached), "valid replica changed shape")
+              yield* restored.resetReplica
+              yield* check(value(restored) === 2, "boundary timestamp lost on replica reset")
+            })
+          )
+        }
+      }
+      for (const now of [-8640000000000001, 8640000000000001, NaN, Infinity, -Infinity]) {
+        const saved = { ...journal, intents: [{ ...intent, now }] }
+        yield* Storage.save(journalDb, saved)
+        yield* Storage.save(replicaDb, replica)
+        const opened = yield* Effect.scoped(Client.open(options(numericProfile))).pipe(Effect.flip)
+        const reset = yield* Client.resetProfile({ profile: numericProfile, principal, discardPending: true }).pipe(
+          Effect.flip
+        )
+        yield* check(
+          Schema.isSchemaError(opened) && Schema.isSchemaError(reset),
+          "malformed timestamp did not fail decode"
+        )
+        const retained = yield* Storage.load(journalDb)
+        // Compare through a permissive fixture codec, never the hardened engine decoder.
+        const raw = yield* Schema.decodeUnknownEffect(
+          Schema.Struct({
+            ...Model.Journal.fields,
+            // oxlint-disable-next-line effecttsgo/schema-number -- Inspect intentionally corrupted NaN/infinite storage without the production decoder.
+            intents: Schema.Array(Schema.Struct({ ...Model.Intent.fields, now: Schema.Number }))
+          })
+        )(retained)
+        yield* check(
+          Object.is(raw.intents[0]?.now, now) &&
+            Equal.equals({ ...raw, intents: [{ ...raw.intents[0], now: 0 }] }, journal),
+          "malformed journal bytes/identity changed"
+        )
+        yield* check(Equal.equals(yield* Storage.load(replicaDb), replica), "failed journal decode reset replica")
+      }
+      for (const position of [-1, 0.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+        for (const field of ["revision", "cursor", "seq"]) {
+          const cached = {
+            ...replica,
+            revision: field === "revision" ? position : 0,
+            cursors: { [row.scope]: field === "cursor" ? position : 0 },
+            rows: [{ ...row, seq: field === "seq" ? position : 0 }]
+          }
+          yield* Storage.save(journalDb, journal)
+          yield* Storage.save(replicaDb, cached)
+          const opened = yield* Effect.scoped(Client.open(options(numericProfile))).pipe(Effect.flip)
+          yield* check(Schema.isSchemaError(opened), `invalid ${field} did not fail replica decode`)
+          const raw = yield* Schema.decodeUnknownEffect(
+            Schema.Struct({
+              ...Model.Replica.fields,
+              // oxlint-disable-next-line effecttsgo/schema-number -- Corruption assertion must preserve non-finite revisions.
+              revision: Schema.Number,
+              // oxlint-disable-next-line effecttsgo/schema-number -- Corruption assertion must preserve non-finite cursors.
+              cursors: Schema.Record(Schema.String, Schema.Number),
+              // oxlint-disable-next-line effecttsgo/schema-number -- Corruption assertion must preserve non-finite sequences.
+              rows: Schema.Array(Schema.Struct({ ...Model.Row.fields, seq: Schema.Number }))
+            })
+          )(yield* Storage.load(replicaDb))
+          yield* check(
+            Object.is(raw.revision, cached.revision) &&
+              Object.is(raw.cursors[row.scope], cached.cursors[row.scope]) &&
+              Object.is(raw.rows[0]?.seq, cached.rows[0]?.seq) &&
+              Equal.equals(
+                { ...raw, revision: 0, cursors: replica.cursors, rows: Arr.map(raw.rows, (r) => ({ ...r, seq: 0 })) },
+                replica
+              ),
+            "failed replica decode changed stored snapshot"
+          )
+          yield* check(
+            Equal.equals(yield* Storage.load(journalDb), journal),
+            "failed replica decode changed intent identity"
+          )
+        }
+      }
       return "PASS INV-CLIENT-1 reload: offline value 3, independent replica reset preserved value 3"
     })
   )
@@ -177,24 +314,23 @@ const lostReceipt = (profile: string) =>
       const transport: Client.Transport = {
         changes: Stream.never,
         pull: () => Effect.succeed(snapshot(committed ? 3 : 0, committed ? 1 : 0)),
-        execute: (request) =>
-          Effect.gen(function* () {
-            requests.push(request)
-            committed = true
-            if (lose) {
-              lose = false
-              return yield* Effect.fail(offline)
-            }
-            return {
-              epoch: "one",
-              receipts: Arr.map(request.batches, (batch) => ({
-                _tag: "Accepted",
-                batchId: batch.id,
-                revision: 1,
-                seqs: [{ aggregate: "Counter", id: "one", seq: 1 }]
-              }))
-            }
-          })
+        execute: Effect.fnUntraced(function* (request: ExecuteRequest) {
+          requests.push(request)
+          committed = true
+          if (lose) {
+            lose = false
+            return yield* offline
+          }
+          return {
+            epoch: "one",
+            receipts: Arr.map(request.batches, (batch) => ({
+              _tag: "Accepted",
+              batchId: batch.id,
+              revision: 1,
+              seqs: [{ aggregate: "Counter", id: "one", seq: 1 }]
+            }))
+          }
+        })
       }
       const beforeReload = yield* Scope.make()
       const first = yield* Client.open(options(profile, transport)).pipe(
@@ -237,12 +373,11 @@ const rebaseAndEpoch = (profile: string) =>
               ? Effect.fail(new ResyncRequired({ epoch }))
               : Effect.succeed(snapshot(remote, remote === 0 ? 0 : 1, epoch))
           }),
-        execute: (request) =>
-          Effect.gen(function* () {
-            if (request.epoch !== epoch) return yield* Effect.fail(new ResyncRequired({ epoch }))
-            sends++
-            return yield* Effect.fail(offline)
-          })
+        execute: Effect.fnUntraced(function* (request: ExecuteRequest) {
+          if (request.epoch !== epoch) return yield* new ResyncRequired({ epoch })
+          sends++
+          return yield* offline
+        })
       }
       const client = yield* Client.open(options(profile, transport))
       yield* add(client, 3)
@@ -261,6 +396,7 @@ const rebaseAndEpoch = (profile: string) =>
       yield* add(client, 1) // Definitely unsent work must remain usable when the epoch reset's cache write fails.
       epoch = "two"
       // Browser platform fault injection: abort exactly the replica reset transaction, not the journal.
+      // oxlint-disable-next-line typescript/unbound-method -- Fault injection calls the native method with .call(this) and restores its original identity.
       const original = IDBDatabase.prototype.transaction
       let abortReplica = true
       yield* Effect.acquireRelease(
@@ -362,6 +498,7 @@ const rebaseAndEpoch = (profile: string) =>
         )
         yield* add(recovery, 3)
         if (!accepted) remoteValue = 8
+        // oxlint-disable-next-line typescript/unbound-method -- Fault injection calls the native method with .call(this) and restores its original identity.
         const transaction = IDBDatabase.prototype.transaction
         let armed = false
         let aborted = false
@@ -560,69 +697,68 @@ const rebaseAndEpoch = (profile: string) =>
   )
 
 // INV-CLIENT-4 catches lock release before resource close and user/profile cross-contamination.
-const lifetime = (profile: string) =>
-  Effect.gen(function* () {
-    const scope = yield* Scope.make()
-    const started = yield* Deferred.make<void>()
-    let starts = 0
-    let stops = 0
-    const transport: Client.Transport = {
-      ...disconnected,
-      pull: () => Effect.never,
-      changes: Stream.unwrap(
-        Effect.acquireRelease(
-          Effect.gen(function* () {
-            starts++
-            yield* Deferred.succeed(started, undefined)
-          }),
-          () =>
-            Effect.sync(() => {
-              stops++
-            })
-        ).pipe(Effect.as(Stream.never))
-      )
-    }
-    const first = yield* Client.open({ ...options(profile, transport), autoConnect: true }).pipe(
-      Effect.provideService(Scope.Scope, scope)
+const lifetime = Effect.fnUntraced(function* (profile: string) {
+  const scope = yield* Scope.make()
+  const started = yield* Deferred.make<void>()
+  let starts = 0
+  let stops = 0
+  const transport: Client.Transport = {
+    ...disconnected,
+    pull: () => Effect.never,
+    changes: Stream.unwrap(
+      Effect.acquireRelease(
+        Effect.gen(function* () {
+          starts++
+          yield* Deferred.succeed(started, undefined)
+        }),
+        () =>
+          Effect.sync(() => {
+            stops++
+          })
+      ).pipe(Effect.as(Stream.never))
     )
-    yield* Deferred.await(started).pipe(Effect.timeout("2 seconds"))
-    const consumers = yield* Effect.all(
-      [
-        Stream.runDrain(first.status),
-        Stream.runDrain(first.notices),
-        Stream.runDrain(first.subscribe((read) => read.scan(Counter)))
-      ],
-      { concurrency: "unbounded" }
-    ).pipe(Effect.forkChild)
-    yield* add(first, 2)
-    yield* Effect.scoped(
-      Effect.gen(function* () {
-        const peer = yield* Client.open(options(profile))
-        yield* check(value(peer) === 2, "second tab lost durable effective state")
+  }
+  const first = yield* Client.open({ ...options(profile, transport), autoConnect: true }).pipe(
+    Effect.provideService(Scope.Scope, scope)
+  )
+  yield* Deferred.await(started).pipe(Effect.timeout("2 seconds"))
+  const consumers = yield* Effect.all(
+    [
+      Stream.runDrain(first.status),
+      Stream.runDrain(first.notices),
+      Stream.runDrain(first.subscribe((read) => read.scan(Counter)))
+    ],
+    { concurrency: "unbounded" }
+  ).pipe(Effect.forkChild)
+  yield* add(first, 2)
+  yield* Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* Client.open(options(profile))
+      yield* check(value(peer) === 2, "second tab lost durable effective state")
+    })
+  )
+  yield* Effect.scoped(
+    Effect.gen(function* () {
+      const other = yield* Client.open({
+        ...options(profile),
+        principal: Domain.Scope.Principal.make("other-browser-user")
       })
-    )
-    yield* Effect.scoped(
-      Effect.gen(function* () {
-        const other = yield* Client.open({
-          ...options(profile),
-          principal: Domain.Scope.Principal.make("other-browser-user")
-        })
-        yield* check(value(other) === 0, "principal reused another journal")
-      })
-    )
-    yield* Scope.close(scope, Exit.void)
-    yield* Fiber.join(consumers).pipe(Effect.timeout("2 seconds"))
-    yield* check(starts === 1 && stops === 1, "automatic connection was duplicated or not stopped")
-    const closed = yield* add(first, 1).pipe(Effect.flip)
-    yield* check(closed._tag === "ClientClosed", "closed client accepted a command")
-    yield* Effect.scoped(
-      Effect.gen(function* () {
-        const reopened = yield* Client.open(options(profile))
-        yield* check(value(reopened) === 2, "new owner could not recover old journal")
-      })
-    )
-    return "PASS INV-CLIENT-4 lifetime: one automatic connection starts/stops; streams end; busy/isolation/closed writes/reopen 2"
-  })
+      yield* check(value(other) === 0, "principal reused another journal")
+    })
+  )
+  yield* Scope.close(scope, Exit.void)
+  yield* Fiber.join(consumers).pipe(Effect.timeout("2 seconds"))
+  yield* check(starts === 1 && stops === 1, "automatic connection was duplicated or not stopped")
+  const closed = yield* add(first, 1).pipe(Effect.flip)
+  yield* check(closed._tag === "ClientClosed", "closed client accepted a command")
+  yield* Effect.scoped(
+    Effect.gen(function* () {
+      const reopened = yield* Client.open(options(profile))
+      yield* check(value(reopened) === 2, "new owner could not recover old journal")
+    })
+  )
+  return "PASS INV-CLIENT-4 lifetime: one automatic connection starts/stops; streams end; busy/isolation/closed writes/reopen 2"
+})
 
 // INV-CLIENT-5 catches a network-held local-write lock and unnecessary query emissions.
 const queries = (profile: string) =>
@@ -730,6 +866,7 @@ const queries = (profile: string) =>
       response = { ...response, revision: 2, scopes: [{ scope: catalog, cursor: 2, reset: false, entries: [] }] }
       yield* references.sync
       yield* check(references.query((read) => read.get(Reference, "visible")) === first, "equal grants flushed reader")
+      // oxlint-disable-next-line typescript/unbound-method -- Read instrumentation calls the native method with .call(this) and restores its original identity.
       const get = IDBObjectStore.prototype.get
       let snapshotReads = 0
       let replicaReads = 0
@@ -903,23 +1040,22 @@ const prepareServerReload = (profile: string) =>
       return "PASS INV-SYNC-1 cached real-server tag"
     })
   )
-const pendingServerWrite = (profile: string) =>
-  Effect.gen(function* () {
-    const scope = yield* Scope.make()
-    const client = yield* Client.open({
-      profile: `${profile}-writer`,
-      principal,
-      aggregates: [Tag, Note],
-      transport: yield* Client.httpTransport(`${location.origin}/sync`).pipe(Effect.provideService(Scope.Scope, scope)),
-      autoConnect: false
-    }).pipe(Effect.provideService(Scope.Scope, scope))
-    const outcome = yield* client.execute(
-      Note,
-      new WriteNote({ target: NoteId.make(profile), tagId: TagId.make(profile), text: "durable browser note" })
-    )
-    yield* check(outcome._tag === "Pending", "offline real-server fixture write failed local decision")
-    return "PASS INV-SYNC-1 prepared: real server tag cached, offline note durable"
-  })
+const pendingServerWrite = Effect.fnUntraced(function* (profile: string) {
+  const scope = yield* Scope.make()
+  const client = yield* Client.open({
+    profile: `${profile}-writer`,
+    principal,
+    aggregates: [Tag, Note],
+    transport: yield* Client.httpTransport(`${location.origin}/sync`).pipe(Effect.provideService(Scope.Scope, scope)),
+    autoConnect: false
+  }).pipe(Effect.provideService(Scope.Scope, scope))
+  const outcome = yield* client.execute(
+    Note,
+    new WriteNote({ target: NoteId.make(profile), tagId: TagId.make(profile), text: "durable browser note" })
+  )
+  yield* check(outcome._tag === "Pending", "offline real-server fixture write failed local decision")
+  return "PASS INV-SYNC-1 prepared: real server tag cached, offline note durable"
+})
 
 const verifyServerReload = (profile: string) =>
   Effect.scoped(
@@ -964,28 +1100,27 @@ const verifyServerReload = (profile: string) =>
       let race = true
       const racing: Client.Transport = {
         ...http,
-        execute: (request) =>
-          Effect.gen(function* () {
-            if (race) {
-              race = false
-              yield* http.execute({
-                epoch: request.epoch,
-                clientId: `${profile}-racer`,
-                batches: [
-                  {
-                    id: "race",
-                    commands: [
-                      {
-                        aggregate: "Tag",
-                        command: { _tag: "DefineTag", target: `${profile}-winner`, name: `${profile}-race` }
-                      }
-                    ]
-                  }
-                ]
-              })
-            }
-            return yield* http.execute(request)
-          })
+        execute: Effect.fnUntraced(function* (request: ExecuteRequest) {
+          if (race) {
+            race = false
+            yield* http.execute({
+              epoch: request.epoch,
+              clientId: `${profile}-racer`,
+              batches: [
+                {
+                  id: "race",
+                  commands: [
+                    {
+                      aggregate: "Tag",
+                      command: { _tag: "DefineTag", target: `${profile}-winner`, name: `${profile}-race` }
+                    }
+                  ]
+                }
+              ]
+            })
+          }
+          return yield* http.execute(request)
+        })
       }
       const loser = yield* Client.open({
         profile: `${profile}-loser`,
@@ -1016,7 +1151,7 @@ const verifyServerReload = (profile: string) =>
       )
       const counts: Array<string> = []
       // Standalone browser scenario entry point; this client only reads the fixture's request counter.
-      // oxlint-disable-next-line effecttsgo/strict-effect-provide
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Standalone browser scenario owns its fixture counter client.
       const counterHttp = yield* HttpClient.HttpClient.pipe(Effect.provide(FetchHttpClient.layer))
       const requestCount = counterHttp.get(`${location.origin}/auth-count`).pipe(
         Effect.flatMap((response) => response.json),
@@ -1141,12 +1276,11 @@ const verifyServerReload = (profile: string) =>
         const retrying = yield* Client.open({
           ...options(`${profile}-hint-${mode}`, {
             ...disconnected,
-            pull: () =>
-              Effect.gen(function* () {
-                if (++attempts === 1) return yield* offline
-                yield* Deferred.succeed(retried, undefined)
-                return snapshot(0)
-              })
+            pull: Effect.fnUntraced(function* () {
+              if (++attempts === 1) return yield* offline
+              yield* Deferred.succeed(retried, undefined)
+              return snapshot(0)
+            })
           }),
           autoConnect: true
         }).pipe(Effect.provideService(Scope.Scope, retryScope))
@@ -1245,7 +1379,7 @@ const oversizedCatalog = (profile: string) =>
         })
       )
       // Standalone scenario's HTTP request counter, independent of the transport under test.
-      // oxlint-disable-next-line effecttsgo/strict-effect-provide
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Standalone scenario counter is independent of the transport under test.
       const counterHttp = yield* HttpClient.HttpClient.pipe(Effect.provide(FetchHttpClient.layer))
       const count = counterHttp.get(`${location.origin}/oversized-count`).pipe(
         Effect.flatMap((response) => response.json),
@@ -1343,10 +1477,12 @@ const diagnostics = (profile: string) =>
       )
       const clock = yield* Clock.Clock
       const backwards = yield* first.diagnostics.pipe(
-        Effect.provideService(Clock.Clock, {
-          ...clock,
-          currentTimeMillis: Effect.succeed(0)
-        })
+        Effect.provideService(
+          Clock.Clock,
+          overrideClock(clock, {
+            currentTimeMillis: Effect.succeed(0)
+          })
+        )
       )
       yield* check(backwards.pending.oldestAgeMs === 0, "backward device clock produced negative pending age")
       yield* Scope.close(firstScope, Exit.void)
@@ -1357,24 +1493,22 @@ const diagnostics = (profile: string) =>
       let pullCount: number | null = null
       const transport: Client.Transport = {
         changes: Stream.never,
-        pull: (request) =>
-          Effect.gen(function* () {
-            yield* Effect.sleep("20 millis")
-            if (failPull)
-              return yield* new Client.TransportError({
-                reason: "offline",
-                cause: { secret, url: "https://private/?token=secret" }
-              })
-            const response = yield* http.pull(request)
-            pullCount = Arr.reduce(response.scopes, 0, (n, scope) => n + scope.entries.length)
-            return response
-          }),
-        execute: (request) =>
-          Effect.gen(function* () {
-            yield* Effect.sleep("20 millis")
-            if (failExecute) return yield* new Client.TransportError({ reason: "auth", cause: { secret } })
-            return yield* http.execute(request)
-          })
+        pull: Effect.fnUntraced(function* (request: PullRequest) {
+          yield* Effect.sleep("20 millis")
+          if (failPull)
+            return yield* new Client.TransportError({
+              reason: "offline",
+              cause: { secret, url: "https://private/?token=secret" }
+            })
+          const response = yield* http.pull(request)
+          pullCount = Arr.reduce(response.scopes, 0, (n, scope) => n + scope.entries.length)
+          return response
+        }),
+        execute: Effect.fnUntraced(function* (request: ExecuteRequest) {
+          yield* Effect.sleep("20 millis")
+          if (failExecute) return yield* new Client.TransportError({ reason: "auth", cause: { secret } })
+          return yield* http.execute(request)
+        })
       }
       const client = yield* Client.open({ ...options(profile, transport), aggregates: [Note, Tag] })
       const reopened = yield* client.diagnostics
@@ -1454,7 +1588,7 @@ const diagnostics = (profile: string) =>
         "diagnostics leaked private data"
       )
       // Returned objects are detached, even when a JS consumer disregards readonly types.
-      if (synced.operations[0]) Object.assign(synced.operations[0], { count: 999999 })
+      if (synced.operations[0] !== undefined) Object.assign(synced.operations[0], { count: 999999 })
       const unchanged = yield* client.diagnostics
       yield* check(
         (yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(unchanged)) === encoded,
@@ -1463,12 +1597,11 @@ const diagnostics = (profile: string) =>
       // A broken diagnostic clock must neither block durable writes nor replace transport errors.
       for (const failAtStart of [true, false]) {
         let reads = 0
-        const faultyClock = {
-          ...clock,
+        const faultyClock = overrideClock(clock, {
           monotonicTimeNanos: Effect.suspend(() =>
             failAtStart || ++reads % 2 === 0 ? Effect.die(secret) : Effect.succeed(0n)
           )
-        }
+        })
         yield* Effect.scoped(
           Effect.gen(function* () {
             const isolated = yield* Client.open(options(`${profile}-clock-${failAtStart}`))
@@ -1516,6 +1649,57 @@ const batches = (profile: string) =>
       )
       const peer = yield* Client.open(options(profile))
       yield* check(value(peer) === 5 && (yield* peer.pending).length === 2, "journal hydration lost action or batch")
+      const clock = yield* Clock.Clock
+      const journalDb = yield* Storage.openDatabase(
+        `echo:journal:${encodeURIComponent(profile)}:${encodeURIComponent(principal)}`
+      )
+      const before = yield* Storage.load(journalDb)
+      for (const now of [-8640000000000001, 8640000000000001, NaN, Infinity, -Infinity]) {
+        for (const operation of [add(client, 1), client.action("numeric-clock", {})]) {
+          let reads = 0
+          const error = yield* operation.pipe(
+            Effect.provideService(
+              Clock.Clock,
+              overrideClock(clock, {
+                currentTimeMillis: Effect.sync(() => {
+                  reads++
+                  return now
+                })
+              })
+            ),
+            Effect.flip
+          )
+          yield* check(
+            error._tag === "ClientError" && Schema.isSchemaError(error.cause),
+            "invalid clock escaped intent validation"
+          )
+          yield* check(
+            reads === 1 && value(client) === 5 && (yield* client.pending).length === 2,
+            "invalid clock predicted/appended or was sampled twice"
+          )
+          yield* check(Equal.equals(yield* Storage.load(journalDb), before), "invalid clock changed durable journal")
+        }
+      }
+      for (const now of [-8640000000000000, -1, -0.5, 0, 0.5, 8640000000000000]) {
+        for (const operation of [add(client, 0), client.action("numeric-clock", {})]) {
+          let reads = 0
+          const result = yield* operation.pipe(
+            Effect.provideService(
+              Clock.Clock,
+              overrideClock(clock, {
+                currentTimeMillis: Effect.sync(() => {
+                  reads++
+                  return now
+                })
+              })
+            )
+          )
+          yield* check(
+            result._tag === "Pending" && reads === 1 && (yield* client.pending).at(-1)?.now === now,
+            "valid timestamp rejected, altered or sampled twice"
+          )
+        }
+      }
       return "PASS INV-CLIENT-7 atomic rollback/ordered prediction; one durable batch; unpredicted action survives reopen"
     })
   )
@@ -1551,6 +1735,7 @@ const ownership = (profile: string) =>
           Stream.runHead,
           Effect.forkScoped
         )
+      // oxlint-disable-next-line typescript/unbound-method -- Fault injection calls the native method with .call(this) and restores its original identity.
       const transaction = IDBDatabase.prototype.transaction
       Object.defineProperty(IDBDatabase.prototype, "transaction", {
         configurable: true,
@@ -1582,6 +1767,7 @@ const ownership = (profile: string) =>
       const silentProfile = `${profile}-silent`
       const silentFirst = yield* Client.open(options(silentProfile))
       const silentSecond = yield* Client.open(options(silentProfile))
+      // oxlint-disable-next-line typescript/unbound-method -- Capture only for restoration after suppressing notifications; never invoke it unbound.
       const postMessage = BroadcastChannel.prototype.postMessage
       BroadcastChannel.prototype.postMessage = () => {}
       yield* Effect.gen(function* () {
@@ -1615,14 +1801,13 @@ const ownership = (profile: string) =>
       const pokes = yield* SubscriptionRef.make<Change>({ _tag: "Poke", epoch: "one" })
       const transport: Client.Transport = {
         ...disconnected,
-        pull: () =>
-          Effect.gen(function* () {
-            if (blocked) {
-              yield* Deferred.succeed(pulling, undefined)
-              yield* Deferred.await(releasePull)
-            }
-            return snapshot(amount)
-          }),
+        pull: Effect.fnUntraced(function* () {
+          if (blocked) {
+            yield* Deferred.succeed(pulling, undefined)
+            yield* Deferred.await(releasePull)
+          }
+          return snapshot(amount)
+        }),
         changes: Stream.unwrap(
           Effect.acquireRelease(
             Effect.sync(() => {
@@ -1734,7 +1919,7 @@ const durableRefresh = (profile: string) =>
       legacy.close()
       const db = yield* Storage.openDatabase(name).pipe(Effect.timeout("2 seconds"))
       const peer = yield* Storage.openDatabase(name)
-      const decode = Schema.decodeUnknownEffect(Schema.Struct({ revision: Schema.Number }))
+      const decode = Schema.decodeUnknownEffect(Schema.Struct({ revision: Schema.Finite }))
       const first = yield* Storage.load(db)
       yield* check(
         (yield* decode(first)).revision === 1 && (yield* Storage.load(db)) === first,
@@ -1758,6 +1943,7 @@ const durableRefresh = (profile: string) =>
         (yield* decode(changed)).revision === 2 && changed !== first && changed !== callerValue,
         "missed peer write or cached caller-owned value"
       )
+      // oxlint-disable-next-line typescript/unbound-method -- Fault injection calls the native method with .call(this) and restores its original identity.
       const transaction = IDBDatabase.prototype.transaction
       Object.defineProperty(IDBDatabase.prototype, "transaction", {
         configurable: true,
@@ -1842,7 +2028,7 @@ const compatibility = (profile: string) =>
       const current = yield* Client.open({ ...options(profile), compatibilityGeneration: 2 })
       yield* Fiber.join(terminal).pipe(Effect.timeout("2 seconds"))
       yield* check(
-        Exit.isFailure(yield* Effect.try(() => value(old)).pipe(Effect.exit)) && value(current) === 3,
+        Exit.isFailure(yield* Effect.sync(() => value(old)).pipe(Effect.exit)) && value(current) === 3,
         "upgrade lost journal or retained stale view"
       )
       const pending = yield* current.pending
@@ -1923,6 +2109,7 @@ const incompatibleCommands = (profile: string) =>
         }
       ]
       yield* Storage.save(db, { ...initial, intents: incompatible })
+      // oxlint-disable-next-line typescript/unbound-method -- Fault injection calls the native method with .call(this) and restores its original identity.
       const transaction = IDBDatabase.prototype.transaction
       let saves = 0
       Object.defineProperty(IDBDatabase.prototype, "transaction", {
@@ -2079,7 +2266,7 @@ const incompatibleCommands = (profile: string) =>
           decide: {
             Add: (state, command, ctx) => {
               // Inject a pure handler's schema failure, not a persisted command decode failure.
-              // oxlint-disable-next-line effecttsgo/schema-sync
+              // oxlint-disable-next-line effecttsgo/schema-sync -- Inject a pure handler failure, not a persisted command decode error.
               if (fault === "decide") Schema.decodeUnknownSync(Schema.String)(3)
               return Counter.definition.decide.Add(state, command, ctx)
             }

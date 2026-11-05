@@ -488,6 +488,17 @@ behaviour adds or amends an item here in the same branch.
     revision-only checks, and changing generic equality without measured end-to-end benefit.
     Storage formats, admission, publication equality and write-before-publication do not change.
 
+32. **Persisted client numbers use their semantic bounds** (2026-11-04).
+    Replica row sequences, commit revisions and scope cursors reuse protocol `Position`:
+    integers from zero through `Number.MAX_SAFE_INTEGER`. Intent creation times are finite
+    milliseconds in the inclusive JavaScript Date range ±8640000000000000; negative and
+    fractional values remain valid. Validate the device clock once when constructing each
+    intent, before prediction or append, including unpredicted trusted actions. Existing
+    malformed snapshots fail decoding without erasing or replacing their payloads or identities;
+    valid stored shapes are unchanged. Rejected: permissive numeric decoding, whole-journal
+    validation on each write, legacy readers/bridges, generation bumps, migrations, quarantine
+    and fallback repair for these malformed numbers.
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -517,6 +528,8 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
   payload audit fields, record actual envelope actor/time, and refuse conflicting streams atomically.
 - **INV-CLIENT-7:** Public batches predict and journal atomically; trusted actions remain
   durably pending without prediction and are inspectable before reconnect.
+  Intent creation samples and validates the clock once before prediction/append, rejecting
+  non-finite or out-of-Date-range values for commands and actions without appending either.
 - **INV-CLIENT-8:** Tabs share durable ownership, survive owner loss and coordinate profile
   reset; deletion refuses pending work without explicit consent and withdraws every tab's data
   even when replica cleanup fails. Replica reset cannot race an in-flight Pull.
@@ -546,7 +559,11 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
   events, and atomically exposes a release to readers.
 - **INV-SERVER-6:** HTTP RPC resolves identity outside request bodies and Changes wakes a
   connected reader after a commit; reconnect starts with a catchup poke.
-- **INV-CLIENT-1:** Journal survives offline reload and replica reset.
+- **INV-CLIENT-1:** Journal survives offline reload and replica reset. Persisted positions
+  are nonnegative safe integers; intent times are finite milliseconds within the inclusive
+  Date range, including negative and fractional values. Malformed numbers fail snapshot
+  decoding without deleting or replacing stored payloads or identities, including journal
+  decode failure during explicit profile reset; valid boundary snapshots retain their shape.
 - **INV-CLIENT-2:** Retries preserve intent identity; accepted intents remain until the
   durable replica revision covers the receipt, even when touched streams become invisible.
 - **INV-CLIENT-3:** Authoritative state rebases intents in journal order and surfaces rejections;
@@ -629,4 +646,8 @@ implementation. Before keeping a test, name the plausible wrong implementation t
 if there is none, delete the test. `bun run check` rejects a test block whose name cites no
 catalogued `INV` id and is not a `Story`. Scenario declarations use `it`, `test`, or their
 direct modifiers (`it.effect`, `it.skip`, etc.) with a literal name, not aliased imports,
-computed names or `each` factories; the small naming gate deliberately supports these forms.
+computed names or `each` factories. The static admission check parses these declarations,
+requires catalogue citations, and checks browser scenario registrations against the explicit
+shell runner. Citation presence does not prove execution or semantic coverage. The fast
+`check` gate requires no database or browser; run `check:integration` separately for changes
+to persistence, replay, sync, or resource lifetimes, using the existing disposable fixtures.

@@ -108,6 +108,5 @@ await Effect.runPromise(
       return yield* Effect.never
     })
     // Standalone browser scenario server entry point.
-    // oxlint-disable-next-line effecttsgo/strict-effect-provide
   ).pipe(Effect.provide(postgres))
 )

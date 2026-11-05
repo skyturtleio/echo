@@ -49,7 +49,7 @@ export const make = <S extends Schema.Top>(options: {
   decide: (input, context) => {
     // Platform boundary: actions, like domain definitions, require synchronous service-free codecs.
     const schema = Schema.make<Schema.Codec<S["Type"], unknown>>(Schema.toCodecJson(options.input).ast)
-    // oxlint-disable-next-line effecttsgo/schema-sync
+    // oxlint-disable-next-line effecttsgo/schema-sync -- action planners are pure and require synchronous service-free codecs
     return options.decide(Schema.decodeUnknownSync(schema)(input), context)
   }
 })

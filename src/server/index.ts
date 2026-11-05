@@ -23,7 +23,7 @@ export * as Action from "./Action.ts"
 
 // Platform boundary: registered domain codecs are synchronous and service-free, as decide/evolve are.
 const codec = <S extends Schema.Top>(schema: S) =>
-  // oxlint-disable-next-line typescript/consistent-type-assertions
+  // oxlint-disable-next-line typescript/consistent-type-assertions -- domain codecs are synchronous and service-free at this erased boundary
   Schema.toCodecJson(schema) as unknown as Schema.Codec<S["Type"], Schema.Json>
 const decode = <S extends Schema.Top>(schema: S, value: unknown) => Schema.decodeUnknownEffect(codec(schema))(value)
 const encode = (schema: Schema.Top, value: unknown) => Schema.encodeEffect(codec(schema))(value)
@@ -139,9 +139,7 @@ export const make = Effect.fn("Echo.Server.make")(function* (
     <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       effect.pipe(
         Effect.onError((cause) =>
-          Effect.suspend(() => options.onFailure?.(operation, cause) ?? Effect.void).pipe(
-            Effect.catchCause(() => Effect.void)
-          )
+          Effect.suspend(() => options.onFailure?.(operation, cause) ?? Effect.void).pipe(Effect.ignoreCause)
         ),
         sanitize
       )
@@ -200,7 +198,7 @@ export const make = Effect.fn("Echo.Server.make")(function* (
             readonly receipt: unknown
             readonly same: boolean
           }>`SELECT receipt, request = ${sql.json(batch)} AS same FROM echo_receipts WHERE principal=${principal} AND client_id=${request.clientId} AND batch_id=${batch.id}`
-          if (prior[0]) {
+          if (prior[0] !== undefined) {
             if (!prior[0].same)
               return yield* new Wire.ServerError({ message: "Batch id reused with different commands" })
             return {
@@ -265,7 +263,7 @@ export const make = Effect.fn("Echo.Server.make")(function* (
                 if (Str.startsWith("user:")(scope) || Str.startsWith("catalog:")(scope))
                   return yield* new Wire.ServerError({ message: "Intrinsic scope grants cannot change" })
                 grants = Arr.filter(grants, (g) => g.scope !== scope || g.principal !== subject)
-                if (item.kind === "grant") grants = [...grants, yield* Schema.decodeUnknownEffect(Grant)(item.grant)]
+                if (item.kind === "grant") grants = [...grants, yield* Schema.decodeEffect(Grant)(item.grant)]
                 grantChanges.push(item)
                 changedScopes.add(scope)
                 continue
@@ -313,7 +311,11 @@ export const make = Effect.fn("Echo.Server.make")(function* (
               const row = Option.getOrUndefined(
                 Arr.findFirst(rows, (r) => r.aggregate === a.tag && r.id === command.target)
               )
-              if (row && c.authority !== "server" && !canWrite(principal, Scope.make(row.scope), grants)) {
+              if (
+                row !== undefined &&
+                c.authority !== "server" &&
+                !canWrite(principal, Scope.make(row.scope), grants)
+              ) {
                 return {
                   receipt: rejected(
                     yield* encode(ScopeForbidden, new ScopeForbidden({ scope: privateScope(principal) }))
@@ -390,7 +392,7 @@ export const make = Effect.fn("Echo.Server.make")(function* (
                   }
                 }
                 const next: Row = { aggregate: a.tag, id: command.target, seq, scope, state }
-                if (row) changedScopes.add(row.scope)
+                if (row !== undefined) changedScopes.add(row.scope)
                 changedScopes.add(scope)
                 touched.set(`${a.tag.length}:${a.tag}${command.target}`, next)
               }
@@ -553,7 +555,7 @@ export const make = Effect.fn("Echo.Server.make")(function* (
         const prior = yield* sql<{
           readonly same: boolean
         }>`SELECT request=${sql.json(request)} AS same FROM echo_imports WHERE id=${input.id}`
-        if (prior[0]) {
+        if (prior[0] !== undefined) {
           if (!prior[0].same) return yield* new Wire.ServerError({ message: "Import identity conflict" })
           return
         }
@@ -585,7 +587,7 @@ export const make = Effect.fn("Echo.Server.make")(function* (
           scopes.add(scope)
         }
         for (const value of input.grants ?? []) {
-          const grant = yield* Schema.decodeUnknownEffect(Grant)(value)
+          const grant = yield* Schema.decodeEffect(Grant)(value)
           if (Str.startsWith("user:")(grant.scope) || Str.startsWith("catalog:")(grant.scope))
             return yield* new Wire.ServerError({ message: "Intrinsic scope grants cannot change" })
           yield* sql`INSERT INTO echo_grants VALUES(${grant.scope},${grant.principal},${grant.role})`
@@ -712,21 +714,20 @@ export const make = Effect.fn("Echo.Server.make")(function* (
 })
 
 /** Mount this HTTP effect at the application's sync route; authentication runs for every request. */
-export const httpApp = <E, R>(
+export const httpApp = Effect.fnUntraced(function* <E, R>(
   server: Server,
   authenticate: (request: HttpServerRequest.HttpServerRequest) => Effect.Effect<Principal, E, R>
-) =>
-  Effect.gen(function* () {
-    const request = yield* HttpServerRequest.HttpServerRequest
-    const principal = yield* authenticate(request)
-    const handlers = Wire.EchoRpcs.toLayer({
-      Execute: (input) => server.execute(principal, input),
-      Pull: (input) => server.pull(principal, input),
-      Changes: () => server.changes(principal),
-      Presence: (input) => server.presence(principal, input)
-    })
-    const app = yield* RpcServer.toHttpEffect(Wire.EchoRpcs).pipe(
-      Effect.provide([handlers, RpcSerialization.layerNdjson])
-    )
-    return yield* app
+) {
+  const request = yield* HttpServerRequest.HttpServerRequest
+  const principal = yield* authenticate(request)
+  const handlers = Wire.EchoRpcs.toLayer({
+    Execute: (input) => server.execute(principal, input),
+    Pull: (input) => server.pull(principal, input),
+    Changes: () => server.changes(principal),
+    Presence: (input) => server.presence(principal, input)
   })
+  const app = yield* RpcServer.toHttpEffect(Wire.EchoRpcs).pipe(
+    Effect.provide([handlers, RpcSerialization.layerNdjson])
+  )
+  return yield* app
+})

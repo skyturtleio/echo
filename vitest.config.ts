@@ -14,7 +14,6 @@ export default defineConfig({
     }
   },
   test: {
-    include: ["src/**/*.test.ts", "test/**/*.test.ts", "examples/**/*.test.ts"],
-    passWithNoTests: true
+    include: ["src/**/*.test.ts", "test/**/*.test.ts", "examples/**/*.test.ts"]
   }
 })

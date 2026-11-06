@@ -2,7 +2,9 @@ import * as PgClient from "@effect/sql-pg/PgClient"
 import { describe, expect, it } from "@effect/vitest"
 import * as Arr from "effect/Array"
 import * as Cause from "effect/Cause"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
@@ -10,10 +12,12 @@ import * as Queue from "effect/Queue"
 import * as Record from "effect/Record"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
-import type * as Scope from "effect/Scope"
+import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import { FetchHttpClient, HttpClient, HttpClientRequest, HttpEffect } from "effect/http"
+import { Reactivity } from "effect/reactivity"
 import { RpcClient, RpcSerialization } from "effect/rpc"
+import { TestClock } from "effect/testing"
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- real socket fixture in Vitest's Node runtime, not an engine dependency
 import { createServer } from "node:http"
 import { Note } from "../../examples/fixture/domain/src/Note/Note.aggregate.ts"
@@ -57,7 +61,7 @@ const note = (id: string, tagId: string): Wire.ExecuteRequest => ({
 // Every scenario owns a temporary schema, including its engine singleton and listener connections.
 let nextSchema = 0
 const scenario = <A, E>(
-  body: (server: Server.Server, sql: PgClient.PgClient) => Effect.Effect<A, E, Scope.Scope>,
+  body: (server: Server.Server, sql: PgClient.PgClient) => Effect.Effect<A, E, Scope.Scope | PgClient.PgClient>,
   maxConnections = 12,
   actions: ReadonlyArray<Server.Action.Action> = []
 ) =>
@@ -66,7 +70,7 @@ const scenario = <A, E>(
       const schema = `echo_test_${process.pid}_${nextSchema++}`
       const layer = PgClient.layer({
         url: Redacted.make(url ?? ""),
-        startupParameters: { search_path: schema },
+        startupParameters: { search_path: schema, application_name: schema },
         maxConnections
       })
       return yield* Effect.gen(function* () {
@@ -86,6 +90,15 @@ describe.skipIf(url === undefined)("Postgres server", () => {
       Effect.fnUntraced(function* (server) {
         const shared = VisibilityScope.make("shared:room")
         const id = TagId.make("shared-tag")
+        // Another application instance must wake a reader absent from the old grant index.
+        const remote = yield* Server.make({ aggregates: [Tag, Note] })
+        const notifications = yield* Queue.unbounded<Wire.Change>()
+        yield* remote.changes(bob).pipe(
+          Stream.filter((frame) => frame._tag === "Poke"),
+          Stream.runForEach((frame) => Queue.offer(notifications, frame)),
+          Effect.forkScoped
+        )
+        yield* Queue.take(notifications)
         yield* server.importStreams({
           id: "seed",
           principal: alice,
@@ -99,9 +112,11 @@ describe.skipIf(url === undefined)("Postgres server", () => {
             { scope: shared, principal: bob, role: "reader" }
           ]
         })
+        yield* Queue.take(notifications)
         const before = yield* server.pull(bob, { epoch: null, cursors: {} })
         expect(entries(before)).toHaveLength(1)
         expect((yield* server.execute(bob, note("read", id))).receipts[0]?._tag).toBe("Accepted")
+        yield* Queue.take(notifications)
         const move = {
           epoch: null,
           clientId: "device",
@@ -114,6 +129,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         }
         expect((yield* server.execute(bob, move)).receipts[0]?._tag).toBe("Rejected")
         expect((yield* server.execute(alice, move)).receipts[0]?._tag).toBe("Accepted")
+        yield* Queue.take(notifications)
         const after = yield* server.pull(bob, { epoch: null, cursors: cursors(before) })
         expect(Arr.findFirst(after.scopes, (scope) => scope.scope === shared)).toMatchObject({
           value: { reset: true, entries: [] }
@@ -242,8 +258,10 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         ).toBe("ServerError")
         yield* server.presence(bob, { connectionId, room, clientId: "tab", state: { active: true } })
         expect((yield* Queue.take(queue)).presence).toMatchObject([{ principal: "bob", state: { active: true } }])
-        // Simulate a crashed participant's elapsed lease while its shared connection stays alive.
+        // No write/notification is needed to discover a crashed participant's expired lease.
         yield* sql`UPDATE echo_presence SET expires_at=now()-interval '1 second' WHERE client_id='tab'`
+        yield* TestClock.adjust("25 seconds")
+        expect((yield* Queue.take(queue)).presence).toEqual([])
         yield* server.presence(bob, { connectionId, room, clientId: "living", state: {} })
         expect((yield* Queue.take(queue)).presence).toMatchObject([{ clientId: "living" }])
         for (let i = 1; i < 64; i++) {
@@ -657,9 +675,193 @@ describe.skipIf(url === undefined)("Postgres server", () => {
     )
   )
 
+  it.effect("INV-SERVER-10 readers share a listener without blocking peers or poking unrelated scopes", () =>
+    scenario(
+      Effect.fnUntraced(function* (_server, sql) {
+        // A discarded constructor must not keep reconnecting in its caller's application scope.
+        let blockAcquisition = false
+        const acquiring = yield* Deferred.make<void>()
+        const releaseAcquisition = yield* Deferred.make<void>()
+        const name = `${sql.config.startupParameters?.["application_name"]}-acquire`
+        const parameters: Record<string, string> = { ...sql.config.startupParameters, echo_invalid_setting: "on" }
+        const acquisitionClient = yield* PgClient.make({
+          ...sql.config,
+          maxConnections: 3,
+          applicationName: name,
+          startupParameters: parameters,
+          onAcquire: Effect.gen(function* () {
+            if (blockAcquisition) {
+              yield* Deferred.succeed(acquiring, undefined)
+              yield* Deferred.await(releaseAcquisition)
+            }
+          })
+          // oxlint-disable-next-line effecttsgo/strict-effect-provide -- independent database client for real connection-acquisition fault injection
+        }).pipe(Effect.provide(Reactivity.layer))
+        const construct = Server.make({ aggregates: [Tag, Note] }).pipe(
+          Effect.provideService(PgClient.PgClient, acquisitionClient)
+        )
+        expect((yield* Effect.result(construct))._tag).toBe("Failure")
+        delete parameters["echo_invalid_setting"]
+        yield* TestClock.adjust("2 seconds")
+        expect(yield* sql`SELECT pid FROM pg_stat_activity WHERE application_name=${name}`).toHaveLength(0)
+        blockAcquisition = true
+        const cancelled = yield* construct.pipe(Effect.forkScoped)
+        yield* Deferred.await(acquiring)
+        yield* Fiber.interrupt(cancelled)
+        blockAcquisition = false
+        yield* Deferred.succeed(releaseAcquisition, undefined)
+        expect(yield* sql`SELECT pid FROM pg_stat_activity WHERE application_name=${name}`).toHaveLength(0)
+        const recoveredScope = yield* Scope.fork(yield* Effect.scope)
+        yield* Scope.provide(construct, recoveredScope)
+        expect(yield* sql`SELECT pid FROM pg_stat_activity WHERE application_name=${name}`).toHaveLength(1)
+        yield* Scope.close(recoveredScope, Exit.void)
+        const owned = yield* Scope.fork(yield* Effect.scope)
+        const server = yield* Scope.provide(Server.make({ aggregates: [Tag, Note] }), owned)
+        const listeners = sql<{
+          readonly count: number
+        }>`SELECT count(*)::int AS count FROM pg_stat_activity WHERE application_name=current_setting('application_name') AND query LIKE 'LISTEN %'`
+        expect((yield* listeners)[0]?.count).toBe(2)
+        const open = Effect.fnUntraced(function* (principal: Principal) {
+          const queue = yield* Queue.unbounded<Wire.Change>()
+          const fiber = yield* server.changes(principal).pipe(
+            Stream.runForEach((frame) => Queue.offer(queue, frame)),
+            Effect.result,
+            Effect.forkScoped
+          )
+          const initial = yield* Queue.take(queue)
+          expect(initial._tag).toBe("Poke")
+          return { queue, fiber, initial }
+        })
+        const readers = yield* Effect.all(
+          Arr.makeBy(24, (i) => open(i === 0 ? alice : Principal.make(`other-${i}`))),
+          { concurrency: "unbounded" }
+        )
+        const first = readers[0]
+        const unrelated = readers[1]
+        if (first === undefined || unrelated === undefined) return yield* Effect.die("Missing readers")
+        expect((yield* listeners)[0]?.count).toBe(2)
+        const resume = yield* Deferred.make<void>()
+        const paused = yield* Queue.unbounded<Wire.Change>()
+        let frames = 0
+        const slow = yield* server.changes(alice).pipe(
+          Stream.runForEach((frame) =>
+            Effect.gen(function* () {
+              yield* Queue.offer(paused, frame)
+              if (++frames === 1) yield* Deferred.await(resume)
+            })
+          ),
+          Effect.result,
+          Effect.forkScoped
+        )
+        yield* Queue.take(paused)
+        for (const reader of readers) yield* Queue.clear(reader.queue)
+        const nextPoke = Effect.fnUntraced(function* (queue: Queue.Dequeue<Wire.Change>) {
+          while (true) {
+            const frame = yield* Queue.take(queue)
+            if (frame._tag === "Poke") return frame
+          }
+        })
+        for (let i = 0; i < 8; i++) {
+          yield* server.execute(alice, request(`shared-listener-${i}`))
+          yield* nextPoke(first.queue)
+          yield* sql`SELECT pg_notify('echo_changes','presence')`
+        }
+        // A presence refresh after the data refresh must not overwrite slow reader's sticky Poke.
+        yield* Queue.take(first.queue)
+        expect(frames).toBe(1)
+        expect(Arr.some(yield* Queue.clear(unrelated.queue), (frame) => frame._tag === "Poke")).toBe(false)
+        yield* Deferred.succeed(resume, undefined)
+        expect((yield* Queue.take(paused))._tag).toBe("Poke")
+        expect(entries(yield* server.pull(alice, { epoch: null, cursors: {} }))).toHaveLength(8)
+        expect(entries(yield* server.pull(bob, { epoch: null, cursors: {} }))).toHaveLength(0)
+        yield* Fiber.interrupt(slow)
+        yield* server.execute(alice, request("after-close"))
+        yield* nextPoke(first.queue)
+        // Hold a real snapshot after it has taken dirty state, then commit from another instance.
+        const remoteScope = yield* Scope.fork(yield* Effect.scope)
+        const remote = yield* Scope.provide(construct, remoteScope)
+        const locked = yield* Deferred.make<void>()
+        const unlock = yield* Deferred.make<void>()
+        const locker = yield* acquisitionClient
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* acquisitionClient`LOCK TABLE echo_presence IN ACCESS EXCLUSIVE MODE`
+              yield* Deferred.succeed(locked, undefined)
+              yield* Deferred.await(unlock)
+            })
+          )
+          .pipe(Effect.forkScoped)
+        yield* Deferred.await(locked)
+        yield* Queue.clear(first.queue)
+        yield* remote.execute(alice, request("race-first"))
+        while (
+          (yield* acquisitionClient`SELECT pid FROM pg_stat_activity WHERE application_name=${sql.config.startupParameters?.["application_name"]} AND wait_event_type='Lock' AND query LIKE 'SELECT p.room%'`)
+            .length === 0
+        )
+          yield* Effect.yieldNow
+        yield* remote.execute(alice, request("race-second"))
+        const arriving = yield* server.changes(alice).pipe(Stream.take(1), Stream.runCollect, Effect.forkScoped)
+        yield* Deferred.succeed(unlock, undefined)
+        yield* Fiber.join(locker)
+        yield* nextPoke(first.queue)
+        yield* nextPoke(first.queue)
+        expect((yield* Fiber.join(arriving))[0]?._tag).toBe("Poke")
+        expect(entries(yield* server.pull(alice, { epoch: null, cursors: {} }))).toHaveLength(11)
+        yield* Scope.close(remoteScope, Exit.void)
+        // Unknown notifications and accepted no-ops conservatively wake unrelated readers too.
+        yield* Queue.clear(unrelated.queue)
+        yield* sql`SELECT pg_notify('echo_changes','unknown-future-format')`
+        yield* nextPoke(unrelated.queue)
+        yield* server.execute(alice, { epoch: null, clientId: "device", batches: [{ id: "no-op", commands: [] }] })
+        yield* nextPoke(unrelated.queue)
+        yield* sql`SELECT pg_notify('echo_changes',(SELECT json_agg('unreadable:' || i)::text FROM generate_series(1,257) AS i))`
+        yield* nextPoke(unrelated.queue)
+        // A silent epoch change is discovered by shared maintenance, not a client poll.
+        yield* Queue.clear(first.queue)
+        yield* sql`UPDATE echo_engine SET epoch='silent-reset'`
+        yield* TestClock.adjust("25 seconds")
+        expect((yield* Queue.take(first.queue)).epoch).toBe("silent-reset")
+        // Expired connection tokens are not silently revived by batch maintenance.
+        yield* sql`UPDATE echo_connections SET expires_at=now()-interval '1 second' WHERE id=${unrelated.initial.connectionId}`
+        yield* TestClock.adjust("25 seconds")
+        expect((yield* Fiber.join(unrelated.fiber))._tag).toBe("Failure")
+        // Exhaust the real query pool: refresh must fail by its deadline, not keep streams healthy.
+        const blocked = yield* Scope.fork(yield* Effect.scope)
+        yield* Scope.provide(sql.reserve, blocked)
+        yield* acquisitionClient`SELECT pg_notify('echo_changes','presence')`
+        while ((yield* sql.poolStats).pending === 0) yield* Effect.yieldNow
+        yield* TestClock.adjust("20 seconds")
+        // Socket shutdown is real I/O; wait until the readers actually enter their cleanup deadline.
+        while ((yield* sql.poolStats).pending < readers.length - 1) yield* Effect.yieldNow
+        yield* TestClock.adjust("5 seconds")
+        for (const reader of readers) expect((yield* Fiber.join(reader.fiber))._tag).toBe("Failure")
+        yield* Scope.close(blocked, Exit.void)
+        // Failed immediate cleanup is safe: lease expiry clears stale tokens on the next open.
+        yield* sql`UPDATE echo_connections SET expires_at=now()-interval '1 second'`
+        yield* TestClock.adjust("1 second")
+        const recovered = yield* server.changes(alice).pipe(
+          Stream.take(1),
+          Stream.runCollect,
+          // Let real socket handshakes run before advancing virtual reconnect/connect deadlines again.
+          Effect.tapError(() =>
+            TestClock.withLive(Effect.sleep("50 millis")).pipe(Effect.andThen(TestClock.adjust("1 second")))
+          ),
+          Effect.retry({ times: 10 })
+        )
+        expect(recovered[0]?._tag).toBe("Poke")
+        const liveAtShutdown = yield* open(alice)
+        yield* Scope.close(owned, Exit.void)
+        expect((yield* Fiber.join(liveAtShutdown.fiber))._tag).toBe("Failure")
+        expect((yield* listeners)[0]?.count).toBe(1)
+        expect(yield* sql`SELECT * FROM echo_connections`).toHaveLength(0)
+      }),
+      1
+    )
+  )
+
   it.effect("INV-SERVER-6 HTTP RPC authenticates outside payload and changes reconnect with a catchup poke", () =>
     scenario(
-      Effect.fnUntraced(function* (server) {
+      Effect.fnUntraced(function* (server, sql) {
         const web = HttpEffect.toWebHandler(
           Server.httpApp(server, (req) =>
             req.headers["authorization"] === "Bearer fixture"
@@ -753,6 +955,20 @@ describe.skipIf(url === undefined)("Postgres server", () => {
             { state: { scope: "user:alice" } }
           ])
           expect(yield* client.Changes({}).pipe(Stream.take(1), Stream.runCollect)).toHaveLength(1)
+          const connected = yield* Queue.unbounded<Wire.Change>()
+          const interrupted = yield* client.Changes({}).pipe(
+            Stream.runForEach((frame) => Queue.offer(connected, frame)),
+            Effect.result,
+            Effect.forkScoped
+          )
+          yield* Queue.take(connected)
+          yield* sql`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name=current_setting('application_name') AND query LIKE 'LISTEN %'`
+          expect((yield* Fiber.join(interrupted))._tag).toBe("Failure")
+          yield* server.execute(alice, request("in-listener-gap"))
+          yield* TestClock.adjust("1 second")
+          const catchup = yield* client.Changes({}).pipe(Stream.take(1), Stream.runCollect, Effect.retry({ times: 10 }))
+          expect(catchup[0]?._tag).toBe("Poke")
+          expect(entries(yield* client.Pull({ epoch: null, cursors: {} }))).toHaveLength(2)
           // oxlint-disable-next-line effecttsgo/strict-effect-provide -- real RPC client runtime entry point
         }).pipe(Effect.provide(protocol))
       }),

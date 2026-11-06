@@ -7,18 +7,19 @@ import * as Equal from "effect/Equal"
 import * as Option from "effect/Option"
 import * as Predicate from "effect/Predicate"
 import * as Schema from "effect/Schema"
-import * as Stream from "effect/Stream"
+import type * as ResourceScope from "effect/Scope"
+import type * as Stream from "effect/Stream"
 import * as Str from "effect/String"
 import { HttpServerRequest } from "effect/http"
 import { RpcSerialization, RpcServer } from "effect/rpc"
-import { Reactivity } from "effect/reactivity"
 import { SqlClient } from "effect/sql"
 import * as Aggregate from "../domain/Aggregate.ts"
 import type * as Command from "../domain/Command.ts"
 import type * as Index from "../domain/Indexes.ts"
-import { canRead, canWrite, Grant, privateScope, Principal, Scope, ScopeForbidden } from "../domain/Scope.ts"
+import { canRead, canWrite, Grant, privateScope, type Principal, Scope, ScopeForbidden } from "../domain/Scope.ts"
 import * as Wire from "../protocol.ts"
 import type * as Action from "./Action.ts"
+import * as Changes from "./Changes.ts"
 export * as Action from "./Action.ts"
 
 // Platform boundary: registered domain codecs are synchronous and service-free, as decide/evolve are.
@@ -132,7 +133,7 @@ export interface Server {
 
 export const make = Effect.fn("Echo.Server.make")(function* (
   options: Options
-): Effect.fn.Return<Server, Wire.ServerError, PgClient.PgClient> {
+): Effect.fn.Return<Server, Wire.ServerError, PgClient.PgClient | ResourceScope.Scope> {
   const sql = yield* PgClient.PgClient
   const protect =
     (operation: string) =>
@@ -179,11 +180,11 @@ export const make = Effect.fn("Echo.Server.make")(function* (
     const rows = yield* sql<Engine>`SELECT epoch,cursor::text FROM echo_engine`
     return rows[0] ?? fail("Run Echo migrate before serving requests")
   })
-  const changed = Effect.fnUntraced(function* (scopes: ReadonlyArray<string>) {
+  const changed = Effect.fnUntraced(function* (scopes: ReadonlyArray<string>, global: boolean = false) {
     yield* sql`UPDATE echo_engine SET cursor=cursor+1`
     for (const scope of new Set(scopes))
       yield* sql`INSERT INTO echo_scopes(scope,cursor) SELECT ${scope},cursor FROM echo_engine ON CONFLICT(scope) DO UPDATE SET cursor=EXCLUDED.cursor`
-    yield* sql`SELECT pg_notify('echo_changes','')`
+    yield* sql`SELECT pg_notify('echo_changes',${global ? "" : Changes.notification(scopes)})`
   })
   const execute = Effect.fn("Echo.Execute")(function* (principal: Principal, request: Wire.ExecuteRequest) {
     const now = yield* DateTime.now
@@ -423,7 +424,7 @@ export const make = Effect.fn("Echo.Server.make")(function* (
           for (const row of planned.touched)
             yield* sql`INSERT INTO echo_streams VALUES (${row.aggregate},${row.id},${row.scope},${row.seq},${sql.json(yield* encode(aggregate(row.aggregate).definition.state, row.state))}) ON CONFLICT(aggregate,id) DO UPDATE SET scope=EXCLUDED.scope,seq=EXCLUDED.seq,state=EXCLUDED.state`
           yield* sql`INSERT INTO echo_receipts VALUES (${principal},${request.clientId},${batch.id},${sql.json(batch)},${sql.json(planned.receipt)})`
-          if (planned.receipt._tag === "Accepted") yield* changed([...changedScopes])
+          if (planned.receipt._tag === "Accepted") yield* changed([...changedScopes], grantChanges.length > 0)
           return { epoch: current.epoch, receipt: planned.receipt, fresh: true }
         })
       )
@@ -595,7 +596,7 @@ export const make = Effect.fn("Echo.Server.make")(function* (
           scopes.add(grant.scope)
         }
         yield* sql`INSERT INTO echo_imports VALUES(${input.id},${sql.json(request)})`
-        if (scopes.size > 0) yield* changed([...scopes])
+        if (scopes.size > 0) yield* changed([...scopes], (input.grants?.length ?? 0) > 0)
       })
     )
   }, protect("importStreams"))
@@ -648,68 +649,7 @@ export const make = Effect.fn("Echo.Server.make")(function* (
       })
     )
   }, protect("Presence"))
-  const changes = (principal: Principal) =>
-    Stream.unwrap(
-      Effect.gen(function* () {
-        // LISTEN owns a separate physical connection, never a slot in the application query pool.
-        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- dedicated driver construction; the enclosing stream owns its scope
-        const listener = yield* PgClient.makeClient(sql.config).pipe(Effect.provide(Reactivity.layer))
-        // LISTEN completes before the initial poke: writes in the connection gap cannot be lost.
-        const queue = yield* listener.listen("echo_changes")
-        const connectionId = yield* Effect.acquireRelease(
-          Effect.gen(function* () {
-            yield* sql`DELETE FROM echo_connections WHERE expires_at<now()`
-            const rows = yield* sql<{
-              readonly id: string
-            }>`INSERT INTO echo_connections SELECT gen_random_uuid()::text,${principal},now()+interval '60 seconds' RETURNING id`
-            return rows[0]?.id ?? fail("Connection creation failed")
-          }),
-          (id) =>
-            Effect.gen(function* () {
-              yield* sql`DELETE FROM echo_connections WHERE id=${id}`
-              yield* sql`SELECT pg_notify('echo_changes','presence')`
-            }).pipe(Effect.orDie)
-        )
-        const snapshot = (tag: "Poke" | "Keepalive") =>
-          sql.withTransaction(
-            Effect.gen(function* () {
-              yield* sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`
-              yield* sql`UPDATE echo_connections SET expires_at=now()+interval '60 seconds' WHERE id=${connectionId}`
-              const grants = yield* loadGrants
-              const members = yield* sql<{
-                readonly room: string
-                readonly principal: string
-                readonly clientId: string
-                readonly state: Schema.Json
-              }>`SELECT p.room,c.principal,p.client_id AS "clientId",p.state FROM echo_presence p JOIN echo_connections c ON c.id=p.connection_id WHERE c.expires_at>now() AND p.expires_at>now()`
-              const visible = Arr.filter(
-                members,
-                (member) =>
-                  canRead(principal, Scope.make(member.room), grants) &&
-                  canRead(Principal.make(member.principal), Scope.make(member.room), grants)
-              )
-              return { _tag: tag, epoch: (yield* engine).epoch, connectionId, presence: visible } satisfies Wire.Change
-            })
-          )
-        const poke = snapshot("Poke")
-        const keepalive = Stream.fromEffectRepeat(
-          Effect.gen(function* () {
-            yield* Effect.sleep("25 seconds")
-            return yield* snapshot("Keepalive")
-          })
-        )
-        // Listener failure ends the HTTP stream (including keepalives), forcing catchup on reconnect.
-        return Stream.concat(
-          Stream.fromEffect(poke),
-          Stream.merge(
-            Stream.mapEffect(Stream.fromQueue(queue), (notification) =>
-              snapshot(notification.payload === "presence" ? "Keepalive" : "Poke")
-            ),
-            keepalive
-          )
-        )
-      })
-    ).pipe(Stream.mapError(() => new Wire.ServerError({ message: "Changes connection failed" })))
+  const changes = yield* Changes.make(sql)
   return { execute, pull, get, ingestCatalog, importStreams, resetEpoch, changes, presence }
 })
 

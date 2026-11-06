@@ -79,8 +79,9 @@ device whose cursor fell below the watermark re-pulls from 0 with its journal un
 
 **Transport** is plain HTTP over `effect/rpc`: `Execute` and `Pull` are request/response;
 `Changes` is one long-lived streaming response per leader carrying only pokes and presence,
-never data, with an inert server keepalive about every 25 s and client reconnect after about
-twice that. Correctness lives in cursors and `Pull`; the stream only shortens latency. No
+never data, with a keepalive from shared server maintenance about every 25 s and client reconnect
+after about twice that. Maintenance checks epoch and presence and renews connection leases once
+per server, not once per stream (§2 item 33). Correctness lives in cursors and `Pull`; the stream only shortens latency. No
 WebSockets, no client polling (§2 item 6).
 
 **Authority epoch.** `engine.epoch` changes on restore-from-backup or operator reset. Every
@@ -266,9 +267,9 @@ behaviour adds or amends an item here in the same branch.
     stubbed. Catalog and private scopes are the only supported scopes; commands cannot move
     streams between scopes. Epoch mismatch refuses execution before checking receipts.
     The singleton is a global write bottleneck, including receipt-only transactions. Per-scope
-    cursors avoid re-downloading unchanged catalogs after private writes. LISTEN uses a separate
-    physical connection per Changes stream so it cannot exhaust the application query pool;
-    apps must bound authenticated connections to their database connection budget.
+    cursors avoid re-downloading unchanged catalogs after private writes. LISTEN originally used
+    a separate physical connection per Changes stream to protect the application query pool;
+    item 33 supersedes that ownership boundary.
 16. **The first browser profile uses IndexedDB and an exclusive Web Lock** (2026-10-30).
     Separate journal and replica databases preserve the journal across cache reset. A second
     leader gets ProfileBusy; SharedWorker tab multiplexing and OPFS SQLite remain deferred.
@@ -499,6 +500,35 @@ behaviour adds or amends an item here in the same branch.
     validation on each write, legacy readers/bridges, generation bumps, migrations, quarantine
     and fallback repair for these malformed numbers.
 
+33. **Notification and presence refresh belong to the scoped server, not each reader**
+    (2026-11-06). `Server.make` requires an application lifetime Scope and must be constructed
+    once per database/schema runtime, never per request. One dedicated LISTEN session stays
+    outside the query pool. Listener or refresh failure closes dependent Changes streams;
+    the listener reconnects and subsequent streams start with catchup after LISTEN is ready.
+    Closing the server closes its subscribers and listener. A disconnected server refuses new
+    Changes streams until ready, rather than sending keepalives across a notification gap.
+    In-process invalidations coalesce into bounded dirty state and capacity-one wake tokens;
+    presence cannot overwrite a pending data poke, and slow readers cannot block the dispatcher.
+    Ordinary writes name changed scopes; grants, epoch changes, legacy/unknown notifications,
+    and oversized scope sets conservatively invalidate all readers. Scope moves name both ends.
+    Authorization remains authoritative in Pull and in transaction-consistent presence refresh;
+    routing is only an optimization. No-op accepted writes retain a global revision wakeup.
+    A shared refresh reads grants, active presence and epoch once, renews local connection leases
+    together, and publishes authorized snapshots without SQL per reader. A 25-second shared
+    maintenance tick discovers silent epoch changes and presence expiry even without writes.
+    Participant leases remain independent: a live connection never renews a dead tab's presence.
+    Expired/deleted connection tokens terminate their stream, and refresh has a bounded deadline
+    rather than continuing to claim health after maintenance stalls. Frames keep the complete
+    presence snapshot, so existing clients do not erase presence on transport keepalive.
+    This bounds Echo's pending invalidation state, not total memory: the pinned driver's native
+    LISTEN queue and HTTP/socket buffers are separate. The ingress pump never waits for SQL or
+    consumers, but no strict driver-queue bound is claimed. Admission and pool sizing still
+    require workload measurements. Rejected: per-reader PostgreSQL sessions, LISTEN in the query
+    pool, blocking global fanout, lossy mixed Poke/Keepalive mailboxes, and a WAL/read-store rewrite.
+    Effect, sql-pg and effect/vitest are aligned at 4.1.2. The existing scoped pin-ownership
+    sql-pg patch remains necessary in that release; dependency patches are not inherited by
+    consumers, so applications must retain it at their package-manager root.
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -559,6 +589,13 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
   events, and atomically exposes a release to readers.
 - **INV-SERVER-6:** HTTP RPC resolves identity outside request bodies and Changes wakes a
   connected reader after a commit; reconnect starts with a catchup poke.
+  Shared listener failure ends dependent streams; registration and reconnect cannot lose a
+  committed change. Presence traffic cannot erase a pending data invalidation.
+- **INV-SERVER-10:** A scoped server owns one isolated Changes listener independent of reader
+  count. Slow readers do not block peers; pending invalidations coalesce within fixed bounds.
+  Unrelated private-scope writes do not poke other readers. Closing a reader preserves its peers;
+  closing the server releases its listener and terminates its streams. Shared lease/epoch/presence
+  refresh performs no per-reader snapshot transactions and refuses expired connection tokens.
 - **INV-CLIENT-1:** Journal survives offline reload and replica reset. Persisted positions
   are nonnegative safe integers; intent times are finite milliseconds within the inclusive
   Date range, including negative and fractional values. Malformed numbers fail snapshot

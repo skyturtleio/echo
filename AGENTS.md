@@ -1,13 +1,15 @@
-# Echo — agent guidance
+# EchoSync — agent guidance
 
-Echo is an aggregate-based, offline-first sync engine for Effect v4 and FoldKit: the UI never
+EchoSync is an aggregate-based, offline-first sync engine for Effect v4 and FoldKit: the UI never
 waits for the network, writes work offline, and the server is authoritative. Read
 `docs/design.md` first; it is the model (§1), the decisions (§2, why and what was rejected),
 the invariants catalogue (§3), the phase plan (§4) and the working rules (§5) summarised here.
 
 ## Not references
 
-This repository replaces `skyturtleio/echo-sync`. That engine, its `docs/SPEC.md`, and the
+This repository (formerly `skyturtleio/echo`) replaces the legacy engine that previously
+occupied `skyturtleio/echo-sync`, not this repository's current design. That legacy engine,
+its `docs/SPEC.md`, and the
 sync code of the owner's two private apps written against it (a shared one and a single-user
 one) are the previous design. Do not read them, clone them, or borrow from
 them, even to "check how it was done"; if the design doc needs something they knew, say so in
@@ -21,15 +23,18 @@ in `node_modules/effect/src/**` and `node_modules/@effect/*`.
 
 ## Repo shape
 
-- The repository root is the package (`echo`), consumed as a git dependency pinned to a
+- The repository root is the package (`echo-sync`), consumed as a git dependency pinned to a
   commit SHA; it ships TypeScript source, no build step, no npm publish.
-- Current entry points are `echo/domain`, `echo/domain/testing`, `echo/protocol`,
-  `echo/server`, and `echo/client` (see `package.json`). Domain rules are pure and do not
+- Current entry points are `echo-sync/domain`, `echo-sync/domain/testing`, `echo-sync/protocol`,
+  `echo-sync/server`, and `echo-sync/client` (see `package.json`). Domain rules are pure and do not
   import client, server, or protocol code. Client code never imports server code or server
   platform packages. No engine entry point imports a UI framework; examples may do so.
   Tabs run queries locally and coordinate IndexedDB writes with Web Locks; one elected tab
   owns networking. A worker implementation, FoldKit adapter, and policies remain deferred;
   historical proposals in design §1 are not instructions to add them.
+- The EchoSync rename changes branding and package paths only. Existing `echo` storage,
+  coordination, SQL, protocol symbols and environment names remain compatibility identities;
+  do not rename them or change application profile namespaces as cosmetic cleanup.
 - Runtime: Bun. Tooling: TypeScript strict (`exactOptionalPropertyTypes`,
   `noUncheckedIndexedAccess`), `oxlint`, `oxfmt`, `vitest` + `@effect/vitest`.
 - Runtime dependencies are Effect packages only, exact-pinned to one version.

@@ -1,4 +1,4 @@
-import * as Domain from "echo/domain"
+import * as Domain from "echo-sync/domain"
 import * as Schema from "effect/Schema"
 import { NoteIndexes } from "../Note/Note.indexes.ts"
 import { TagId } from "./Tag.id.ts"

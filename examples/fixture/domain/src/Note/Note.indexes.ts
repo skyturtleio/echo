@@ -1,4 +1,4 @@
-import * as Domain from "echo/domain"
+import * as Domain from "echo-sync/domain"
 import { NoteId } from "./Note.id.ts"
 import { NoteState } from "./Note.state.ts"
 

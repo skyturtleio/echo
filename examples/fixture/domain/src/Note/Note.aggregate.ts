@@ -1,4 +1,4 @@
-import * as Domain from "echo/domain"
+import * as Domain from "echo-sync/domain"
 import { Tag } from "../Tag/Tag.aggregate.ts"
 import { NoteId } from "./Note.id.ts"
 import { NoteIndexes } from "./Note.indexes.ts"

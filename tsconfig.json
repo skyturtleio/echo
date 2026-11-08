@@ -25,8 +25,8 @@
     "types": ["bun"],
     "erasableSyntaxOnly": true,
     "paths": {
-      "echo/domain": ["./src/domain/index.ts"],
-      "echo/domain/testing": ["./src/domain/testing/index.ts"]
+      "echo-sync/domain": ["./src/domain/index.ts"],
+      "echo-sync/domain/testing": ["./src/domain/testing/index.ts"]
     },
     "plugins": [
       {

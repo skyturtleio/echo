@@ -1,8 +1,17 @@
-# Echo — an aggregate-based, offline-first sync engine for Effect v4 + FoldKit
+# EchoSync — an aggregate-based, offline-first sync engine for Effect v4 + FoldKit
 
 Status: design, 2026-10-29; cut to its five jobs 2026-10-30 (§2 item 13). This repository
-(`skyturtleio/echo`, package `echo`) replaces `skyturtleio/echo-sync`, whose code and SPEC
-are the previous design and are not references (§5). The vocabulary is `@alchemy.run/domain`'s.
+(`skyturtleio/echo-sync`, package `echo-sync`, formerly `skyturtleio/echo` / `echo`) replaces
+the legacy engine that previously occupied `skyturtleio/echo-sync`. That legacy engine's
+code and SPEC are the previous design and are not references (§5).
+The vocabulary is `@alchemy.run/domain`'s.
+
+**Naming** (2026-11-08). EchoSync is the display name; `echo-sync` is the repository and
+package name. The rename does not change engine behavior or durable formats. Existing
+`echo` SQL tables/notifications, IndexedDB names, Web Locks, BroadcastChannels, profile
+namespaces, protocol symbols and environment variables remain unchanged for compatibility.
+Consumers rename their dependency key and imports without changing their pinned engine
+commit merely for branding; a later pin bump adopts this package's new self-name.
 
 This document has five jobs and nothing else: the **model** (§1, what the engine is), the
 **decisions** (§2, why, with what each was chosen over), the **invariants catalogue** (§3, what
@@ -20,7 +29,7 @@ Device-decides logs (Effect `eventlog`, LiveStore) cannot refuse a write, and on
 engines cannot write before their first sync; this design is the remaining quadrant.
 
 **Domain package.** An app is a domain package (one block per file, a folder per aggregate,
-importing only `effect` and `echo/domain`) plus thin server and client wiring. The blocks:
+importing only `effect` and `echo-sync/domain`) plus thin server and client wiring. The blocks:
 
 | Block | Shape |
 |---|---|
@@ -30,7 +39,7 @@ importing only `effect` and `echo/domain`) plus thin server and client wiring. T
 | `Aggregate` | `id`, `state` schema (`null` while the stream has no events), `initial`, `commands`, `scope(state)`, `indexes`, `decide` and `evolve` as one handler per tag (§2 item 7) |
 | `Index` | `Domain.Index(id, state, spec)`, field lists over state, bound to the aggregate and exposed as statics (§2 item 9) |
 | `Scope` | `Principal`, `Scope` (opaque id), `privateScope`, `catalogScope`, the pre-grants rule, and `ScopeForbidden` (§2 item 8) |
-| `Story` | the domain test: *given* events (one stream, or several seeded with `Story.stream(Aggregate, id, events)`), *when* command, *as* principal, *then* events or rejection; pure runner in `echo/domain`, vitest binding in `echo/domain/testing` (§2 item 10) |
+| `Story` | the domain test: *given* events (one stream, or several seeded with `Story.stream(Aggregate, id, events)`), *when* command, *as* principal, *then* events or rejection; pure runner in `echo-sync/domain`, vitest binding in `echo-sync/domain/testing` (§2 item 10) |
 | `Policy`, `Batch`, versioning | server-side reaction to events; several commands committed atomically under one id; `(name, version)` on events, state and commands with upcasters. Not built yet (§4) |
 
 `decide` is pure and sees only its stream's state, the command and `ctx = { principal, now,
@@ -152,7 +161,7 @@ whether or not the app uses presence.
 **FoldKit integration.** Apps use the framework's real branded `Command.define`,
 `Subscription.make` and `ManagedResource` constructors. `Client.open` hydrates offline and
 owns a scoped connection loop by default (`autoConnect: false` selects manual sync); there
-is no public `connect` method or `echo/foldkit` adapter. Closing the client releases storage,
+is no public `connect` method or `echo-sync/foldkit` adapter. Closing the client releases storage,
 connection and profile lock and ends query/status/notice streams. Apps still gate late messages
 by readiness and resource generation.
 
@@ -198,7 +207,7 @@ behaviour adds or amends an item here in the same branch.
    match. Rejected: `Match.valueTags`, which needs the union assembled at the call site and
    gives one return type for all branches. Additional aggregate `events` also contribute
    evolution handlers and historical Story inputs (item 21), never command outputs.
-8. **`ScopeForbidden`, `Principal`, `Scope` and the pre-grants rule live in `echo/domain`**
+8. **`ScopeForbidden`, `Principal`, `Scope` and the pre-grants rule live in `echo-sync/domain`**
    (Phase 0, 2026-10-29), not in an engine module. Writing the ownership story showed the check
    is the same for every aggregate and depends only on `scope(state)` and the principal's
    grants, so it is the engine's job; a story asserts the rejection, so the domain package must
@@ -212,7 +221,7 @@ behaviour adds or amends an item here in the same branch.
    of its own aggregate in `reads`, and the aggregate imports its commands, so an index declared
    only inside the aggregate would be an import cycle. Rejected: `indexes: {...}` inline only,
    which would make own-aggregate `reads` strings or late-bound thunks.
-10. **The story runner is pure and lives in `echo/domain`; `echo/domain/testing` binds it to
+10. **The story runner is pure and lives in `echo-sync/domain`; `echo-sync/domain/testing` binds it to
     vitest** (Phase 0, 2026-10-29). `given` is a list (the target stream) or seeds
     `Story.stream(Aggregate, id, events)`; seeded streams must belong to the aggregate under
     test or to a declared read; `ctx.read` answers only declared reads and only streams the
@@ -520,7 +529,7 @@ behaviour adds or amends an item here in the same branch.
     Expired/deleted connection tokens terminate their stream, and refresh has a bounded deadline
     rather than continuing to claim health after maintenance stalls. Frames keep the complete
     presence snapshot, so existing clients do not erase presence on transport keepalive.
-    This bounds Echo's pending invalidation state, not total memory: the pinned driver's native
+    This bounds EchoSync's pending invalidation state, not total memory: the pinned driver's native
     LISTEN queue and HTTP/socket buffers are separate. The ingress pump never waits for SQL or
     consumers, but no strict driver-queue bound is claimed. Admission and pool sizing still
     require workload measurements. Rejected: per-reader PostgreSQL sessions, LISTEN in the query
@@ -653,7 +662,7 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
 
 ## 4. Phases
 
-0. **Domain building blocks and the fixture domain, no engine.** Done 2026-10-30: `echo/domain`
+0. **Domain building blocks and the fixture domain, no engine.** Done 2026-10-30: `echo-sync/domain`
    (`src/domain`) and `examples/fixture/domain` (item 14): `Note` and `Tag`, five stories, one
    per engine surface a domain can touch (an accepted command and its scope stamp, a read by
    id across scopes, `ScopeForbidden`, a read over an own index, a read over another
@@ -679,7 +688,8 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
 
 ## 5. Working rules
 
-**Clean start.** This repository is not a branch of `echo-sync`; the old engine stays frozen
+**Clean start.** This repository is not a branch of the legacy engine formerly named
+`echo-sync` (the repository name is now reused); the old engine stays frozen
 for the current apps until each is ported. Nothing was copied from it but the environment
 scripts and toolchain configuration, which are generic. The old engine, its SPEC and the
 apps' sync code are not references and are not read (`AGENTS.md`); the inputs are this

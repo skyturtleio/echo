@@ -2,9 +2,9 @@
 
 `sql-pg-4.1.1.patch` repairs an upstream connection-owner permit leak. Interrupting
 `pinExclusive` after taking the permit but before installing cleanup can leave an
-idle pooled connection unusable. Echo's public Pull and Execute both expose this
+idle pooled connection unusable. EchoSync's public Pull and Execute both expose this
 failure with a size-one pool. The patch restores scoped ownership without masking
-transaction bodies or changing Echo's engine behavior.
+transaction bodies or changing EchoSync's engine behavior.
 
 The reviewed patch has SHA256
 `a21407fe296b77c4631a5ab188908e386efc076325d80d9cd40091d5473927c6`.

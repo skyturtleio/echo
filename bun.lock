@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "echo",
+      "name": "echo-sync",
       "dependencies": {
         "@effect/sql-pg": "4.1.2",
       },

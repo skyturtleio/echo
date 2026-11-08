@@ -159,7 +159,7 @@ const covered = (intent: Model.Intent, replica: Model.Replica): boolean =>
 const profileNamespace = (options: { readonly profile: string; readonly principal: Principal }) =>
   `${encodeURIComponent(options.profile)}:${encodeURIComponent(options.principal)}`
 
-export const resetProfile = Effect.fn("Echo.resetProfile")(function* (options: {
+export const resetProfile = Effect.fn("EchoSync.resetProfile")(function* (options: {
   readonly profile: string
   readonly principal: Principal
   readonly discardPending?: boolean
@@ -838,7 +838,7 @@ export const open = Effect.fnUntraced(function* (options: Options) {
       ).pipe(Effect.race(Deferred.await(stopped)))
     )
   channel.postMessage("hello")
-  const presence = Effect.fn("Echo.Client.presence")(function* (
+  const presence = Effect.fn("EchoSync.Client.presence")(function* (
     room: Scope,
     initial: PresenceState
   ): Effect.fn.Return<PresenceRoom, ClientClosed | ClientError, EffectScope.Scope> {

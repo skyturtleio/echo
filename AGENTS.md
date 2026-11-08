@@ -32,9 +32,12 @@ in `node_modules/effect/src/**` and `node_modules/@effect/*`.
   Tabs run queries locally and coordinate IndexedDB writes with Web Locks; one elected tab
   owns networking. A worker implementation, FoldKit adapter, and policies remain deferred;
   historical proposals in design §1 are not instructions to add them.
-- The EchoSync rename changes branding and package paths only. Existing `echo` storage,
-  coordination, SQL, protocol symbols and environment names remain compatibility identities;
-  do not rename them or change application profile namespaces as cosmetic cleanup.
+- Naming: use `EchoSync` for display names and identifiers, `echo-sync` for the package,
+  import paths and repository, and `echosync` / `ECHOSYNC` for storage, SQL and environment
+  prefixes. Do not introduce permanent old-name aliases. Existing `echo` storage and API
+  names are unfinished migration work, not the desired convention. Replace them through
+  an explicitly coordinated data/client cutover, never a cosmetic search-and-replace that
+  strands journals or splits old and new clients' coordination.
 - Runtime: Bun. Tooling: TypeScript strict (`exactOptionalPropertyTypes`,
   `noUncheckedIndexedAccess`), `oxlint`, `oxfmt`, `vitest` + `@effect/vitest`.
 - Runtime dependencies are Effect packages only, exact-pinned to one version.

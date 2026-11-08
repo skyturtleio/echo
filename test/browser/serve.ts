@@ -97,7 +97,7 @@ await Effect.runPromise(
               return path === "/client.js"
                 ? new Response(script, { headers: { "content-type": "text/javascript" } })
                 : new Response(
-                    '<!doctype html><title>Echo browser scenarios</title><p>Client invariant scenario harness</p><script type="module">if (!navigator.serviceWorker.controller) { await navigator.serviceWorker.register("/shell-worker.js"); await navigator.serviceWorker.ready } await import("/client.js")</script>',
+                    '<!doctype html><title>EchoSync browser scenarios</title><p>Client invariant scenario harness</p><script type="module">if (!navigator.serviceWorker.controller) { await navigator.serviceWorker.register("/shell-worker.js"); await navigator.serviceWorker.ready } await import("/client.js")</script>',
                     { headers: { "content-type": "text/html" } }
                   )
             }

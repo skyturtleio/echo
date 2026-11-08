@@ -7,11 +7,16 @@ code and SPEC are the previous design and are not references (§5).
 The vocabulary is `@alchemy.run/domain`'s.
 
 **Naming** (2026-11-08). EchoSync is the display name; `echo-sync` is the repository and
-package name. The rename does not change engine behavior or durable formats. Existing
-`echo` SQL tables/notifications, IndexedDB names, Web Locks, BroadcastChannels, profile
-namespaces, protocol symbols and environment variables remain unchanged for compatibility.
-Consumers rename their dependency key and imports without changing their pinned engine
-commit merely for branding; a later pin bump adopts this package's new self-name.
+package name; `echosync` / `ECHOSYNC` are the target storage, SQL and environment prefixes.
+Code identifiers use `EchoSync`. Permanent old-name aliases are not the target design.
+The initial package/branding rename did not migrate durable data: existing `echo` SQL
+tables/notifications, IndexedDB names, Web Locks, BroadcastChannels, profile namespaces,
+protocol symbols and environment variables are unfinished cutover work. Renaming those
+requires coordinating server data, browser journals and older clients before switching
+names; do not strand offline intents or run split coordination namespaces. The current
+cosmetic follow-up changes error text, trace labels and the scenario page title only.
+Consumers retain their existing engine commit until they explicitly adopt a new pin;
+renaming the dependency key alone does not upgrade engine code.
 
 This document has five jobs and nothing else: the **model** (§1, what the engine is), the
 **decisions** (§2, why, with what each was chosen over), the **invariants catalogue** (§3, what

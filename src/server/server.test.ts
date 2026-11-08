@@ -530,7 +530,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         }).pipe(Effect.provideService(PgClient.PgClient, sql))
         expect(yield* Effect.result(invalid.execute(alice, request("undeclared")))).toMatchObject({
           _tag: "Failure",
-          failure: { _tag: "ServerError", message: "Echo storage operation failed" }
+          failure: { _tag: "ServerError", message: "EchoSync storage operation failed" }
         })
         expect(diagnostics).toHaveLength(1)
         expect(diagnostics[0]).toContain("undeclared read")

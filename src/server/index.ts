@@ -39,7 +39,7 @@ const sanitize = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       return Effect.fail(
         Schema.is(Wire.ResyncRequired)(error)
           ? error
-          : new Wire.ServerError({ message: "Echo storage operation failed" })
+          : new Wire.ServerError({ message: "EchoSync storage operation failed" })
       )
     })
   )
@@ -129,7 +129,7 @@ export interface Server {
   readonly presence: (principal: Principal, request: Wire.PresenceRequest) => Effect.Effect<void, ServerFailure>
 }
 
-export const make = Effect.fn("Echo.Server.make")(function* (
+export const make = Effect.fn("EchoSync.Server.make")(function* (
   options: Options
 ): Effect.fn.Return<Server, Wire.ServerError, PgClient.PgClient | ResourceScope.Scope> {
   const sql = yield* PgClient.PgClient
@@ -174,7 +174,7 @@ export const make = Effect.fn("Echo.Server.make")(function* (
       )
   const engine = Effect.gen(function* () {
     const rows = yield* sql<Engine>`SELECT epoch,cursor::text FROM echo_engine`
-    return rows[0] ?? fail("Run Echo migrate before serving requests")
+    return rows[0] ?? fail("Run EchoSync migrate before serving requests")
   })
   const changed = Effect.fnUntraced(function* (scopes: ReadonlyArray<string>, global: boolean = false) {
     yield* sql`UPDATE echo_engine SET cursor=cursor+1`
@@ -182,7 +182,7 @@ export const make = Effect.fn("Echo.Server.make")(function* (
       yield* sql`INSERT INTO echo_scopes(scope,cursor) SELECT ${scope},cursor FROM echo_engine ON CONFLICT(scope) DO UPDATE SET cursor=EXCLUDED.cursor`
     yield* sql`SELECT pg_notify('echo_changes',${global ? "" : Changes.notification(scopes)})`
   })
-  const execute = Effect.fn("Echo.Execute")(function* (principal: Principal, request: Wire.ExecuteRequest) {
+  const execute = Effect.fn("EchoSync.Execute")(function* (principal: Principal, request: Wire.ExecuteRequest) {
     const now = yield* DateTime.now
     const receipts: Array<Wire.Receipt> = []
     let epoch = ""
@@ -444,7 +444,7 @@ export const make = Effect.fn("Echo.Server.make")(function* (
     }
     return { epoch, receipts }
   }, protect("Execute"))
-  const pull = Effect.fn("Echo.Pull")(function* (
+  const pull = Effect.fn("EchoSync.Pull")(function* (
     principal: Principal,
     request: Wire.PullRequest
   ): Effect.fn.Return<Wire.PullResponse, unknown> {
@@ -489,7 +489,7 @@ export const make = Effect.fn("Echo.Server.make")(function* (
     )
   }, protect("Pull"))
 
-  const ingestCatalog = Effect.fn("Echo.ingestCatalog")(function* (catalog: Catalog) {
+  const ingestCatalog = Effect.fn("EchoSync.ingestCatalog")(function* (catalog: Catalog) {
     return yield* transaction(
       Effect.gen(function* () {
         if (!Str.startsWith("catalog:")(catalog.scope))
@@ -518,7 +518,7 @@ export const make = Effect.fn("Echo.Server.make")(function* (
     )
   }, protect("ingestCatalog"))
   /** Trusted only: never mounted by httpApp. An id permanently identifies one exact import. */
-  const importStreams = Effect.fn("Echo.importStreams")(function* (input: {
+  const importStreams = Effect.fn("EchoSync.importStreams")(function* (input: {
     readonly id: string
     readonly principal: Principal
     readonly streams: ReadonlyArray<ImportedStream>
@@ -603,7 +603,7 @@ export const make = Effect.fn("Echo.Server.make")(function* (
       return (yield* engine).epoch
     })
   ).pipe(protect("resetEpoch"))
-  const get: Server["get"] = Effect.fn("Echo.get")(function* <A extends Aggregate.Any>(
+  const get: Server["get"] = Effect.fn("EchoSync.get")(function* <A extends Aggregate.Any>(
     principal: Principal,
     ref: A,
     id: Aggregate.IdOf<A>
@@ -622,7 +622,7 @@ export const make = Effect.fn("Echo.Server.make")(function* (
       })
     )
   }, protect("get"))
-  const presence = Effect.fn("Echo.Presence")(function* (principal: Principal, request: Wire.PresenceRequest) {
+  const presence = Effect.fn("EchoSync.Presence")(function* (principal: Principal, request: Wire.PresenceRequest) {
     if ((yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Json))(request.state)).length > 8192)
       return yield* new Wire.ServerError({ message: "Presence state too large" })
     yield* transaction(

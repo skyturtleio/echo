@@ -1,4 +1,5 @@
 import * as Arr from "effect/Array"
+import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as DateTime from "effect/DateTime"
 import * as Deferred from "effect/Deferred"
@@ -9,6 +10,7 @@ import * as Fiber from "effect/Fiber"
 import * as Option from "effect/Option"
 import * as Record from "effect/Record"
 import * as Schema from "effect/Schema"
+import * as SchemaGetter from "effect/SchemaGetter"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as Str from "effect/String"
@@ -1884,6 +1886,29 @@ const durableRefresh = (profile: string) =>
   Effect.scoped(
     Effect.gen(function* () {
       const name = `echo:token-test:${profile}`
+      // Synchronous platform refusal is recoverable; a programming exception is not.
+      // oxlint-disable-next-line typescript/unbound-method -- Restore the native open method after injecting synchronous failures; never invoke it unbound.
+      const open = IDBFactory.prototype.open
+      for (const cause of [new DOMException("Storage denied", "SecurityError"), new Error("storage defect")]) {
+        IDBFactory.prototype.open = () => {
+          throw cause
+        }
+        const failed = yield* Effect.scoped(Client.open(options(`${profile}-denied`))).pipe(
+          Effect.exit,
+          Effect.ensuring(
+            Effect.sync(() => {
+              IDBFactory.prototype.open = open
+            })
+          )
+        )
+        yield* check(
+          Exit.isFailure(failed) &&
+            (cause instanceof DOMException
+              ? Option.getOrUndefined(Cause.findErrorOption(failed.cause)) instanceof Storage.StorageError
+              : Cause.hasDies(failed.cause) && !Cause.hasFails(failed.cause)),
+          "synchronous storage failure entered the wrong error channel"
+        )
+      }
       const legacy = yield* Effect.callback<IDBDatabase, Storage.StorageError>((resume) => {
         const request = indexedDB.open(name, 1)
         request.addEventListener("upgradeneeded", () => request.result.createObjectStore("data"))
@@ -1943,6 +1968,37 @@ const durableRefresh = (profile: string) =>
         (yield* decode(changed)).revision === 2 && changed !== first && changed !== callerValue,
         "missed peer write or cached caller-owned value"
       )
+      // Native DataCloneError, not a mocked transaction failure.
+      const uncloneable = yield* Storage.save(db, () => undefined).pipe(Effect.flip)
+      yield* check(uncloneable._tag === "StorageError", "DataCloneError escaped the typed storage channel")
+      // A token failure after enqueueing the snapshot must roll back both keys.
+      // oxlint-disable-next-line typescript/unbound-method -- Fault injection preserves the native receiver and restores its original identity.
+      const put = IDBObjectStore.prototype.put
+      IDBObjectStore.prototype.put = function (snapshotValue: unknown, key?: IDBValidKey) {
+        if (this.transaction.db.name === name && key === "token")
+          throw new DOMException("Token write refused", "QuotaExceededError")
+        return put.call(this, snapshotValue, key)
+      }
+      const failedToken = yield* Storage.save(db, { revision: 9 }).pipe(
+        Effect.flip,
+        Effect.ensuring(
+          Effect.sync(() => {
+            IDBObjectStore.prototype.put = put
+          })
+        )
+      )
+      yield* check(
+        failedToken._tag === "StorageError" &&
+          Option.isNone(yield* Storage.loadIfChanged(peer, token)) &&
+          // A hot cache could hide a wrongly committed snapshot under the unchanged token.
+          (yield* Effect.scoped(
+            Effect.gen(function* () {
+              const fresh = yield* Storage.openDatabase(name)
+              return yield* decode(yield* Storage.load(fresh))
+            })
+          )).revision === 2,
+        "synchronous token failure committed a partial snapshot or changed its token"
+      )
       // oxlint-disable-next-line typescript/unbound-method -- Fault injection calls the native method with .call(this) and restores its original identity.
       const transaction = IDBDatabase.prototype.transaction
       Object.defineProperty(IDBDatabase.prototype, "transaction", {
@@ -1976,6 +2032,14 @@ const durableRefresh = (profile: string) =>
       )
       db.database.close()
       peer.database.close()
+      for (const operation of [Storage.load(db), Storage.save(db, { revision: 10 })]) {
+        const closed = yield* operation.pipe(Effect.exit)
+        yield* check(
+          Exit.isFailure(closed) &&
+            Option.getOrUndefined(Cause.findErrorOption(closed.cause)) instanceof Storage.StorageError,
+          "closed database transaction escaped the typed channel"
+        )
+      }
       yield* Effect.callback<void, Storage.StorageError>((resume) => {
         // A leaked handle from the failed open would block this later schema change.
         const request = indexedDB.open(name, 4)
@@ -2244,7 +2308,7 @@ const incompatibleCommands = (profile: string) =>
         yield* check((yield* add(client, 1))._tag === "Pending" && value(client) === 6, "replay did not resume")
       }
       // A SchemaError thrown by domain code must not masquerade as a command codec mismatch.
-      for (const fault of ["decide", "evolve", "state"]) {
+      for (const fault of ["decide", "evolve", "state", "async-codec"]) {
         const faultProfile = `${profile}-${fault}`
         const namespace = `${encodeURIComponent(faultProfile)}:${encodeURIComponent(principal)}`
         const journalDb = yield* Storage.openDatabase(`echo:journal:${namespace}`)
@@ -2260,8 +2324,22 @@ const incompatibleCommands = (profile: string) =>
               ? [{ aggregate: "Counter", id: "one", seq: 1, scope: `user:${principal}`, state: { value: "invalid" } }]
               : []
         })
+        const AsyncAdd = Domain.Command("Add", {
+          target: Id,
+          input: {
+            amount: Schema.Finite.pipe(
+              Schema.decodeTo(Schema.Finite, {
+                decode: SchemaGetter.transformEffect((amount) => Effect.promise(() => Promise.resolve(amount))),
+                encode: SchemaGetter.passthrough()
+              })
+            )
+          },
+          events: [Added],
+          rejects: [Limit]
+        })
         const broken = Domain.Aggregate("Counter", {
           ...Counter.definition,
+          commands: fault === "async-codec" ? [AsyncAdd] : [Add],
           indexes: Domain.Index(Id, State, {}),
           decide: {
             Add: (state, command, ctx) => {

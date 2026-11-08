@@ -1,6 +1,7 @@
 import type * as DateTime from "effect/DateTime"
 import * as Schema from "effect/Schema"
 import type * as Aggregate from "../domain/Aggregate.ts"
+import type { Codec } from "../domain/internal/classes.ts"
 import type { Grant, Principal, Scope } from "../domain/Scope.ts"
 
 export interface Read {
@@ -33,13 +34,13 @@ export interface Context {
 export type Plan = { readonly operations: ReadonlyArray<Operation> } | { readonly rejection: unknown }
 export interface Action {
   readonly name: string
-  readonly input: Schema.Top
+  readonly input: Codec
   readonly reads: ReadonlyArray<Aggregate.Any>
   readonly decide: (input: unknown, context: Context) => Plan
 }
 
 /** Trusted pure planner, re-run on serialization retry. Never perform external effects here. */
-export const make = <S extends Schema.Top>(options: {
+export const make = <S extends Codec>(options: {
   readonly name: string
   readonly input: S
   readonly reads: ReadonlyArray<Aggregate.Any>
@@ -47,8 +48,7 @@ export const make = <S extends Schema.Top>(options: {
 }): Action => ({
   ...options,
   decide: (input, context) => {
-    // Platform boundary: actions, like domain definitions, require synchronous service-free codecs.
-    const schema = Schema.make<Schema.Codec<S["Type"], unknown>>(Schema.toCodecJson(options.input).ast)
+    const schema = Schema.toCodecJson(options.input)
     // oxlint-disable-next-line effecttsgo/schema-sync -- action planners are pure and require synchronous service-free codecs
     return options.decide(Schema.decodeUnknownSync(schema)(input), context)
   }

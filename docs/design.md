@@ -529,6 +529,21 @@ behaviour adds or amends an item here in the same branch.
     sql-pg patch remains necessary in that release; dependency patches are not inherited by
     consumers, so applications must retain it at their package-manager root.
 
+34. **Codec requirements are enforced before registry erasure; browser failures keep their error channel**
+    (2026-11-08). Domain state, ids, command/event/rejection fields and action input codecs
+    require no decoding or encoding services. The registry preserves that constraint instead
+    of casting arbitrary `Schema.Top` values or rebuilding their ASTs with invented service
+    types. Transformations must additionally be synchronous and pure; Effect's service types
+    cannot prove that a service-free transformation never suspends. Unsupported asynchronous
+    codecs are programming errors, not incompatible-command quarantine candidates.
+    Expected synchronous IndexedDB DOM exceptions become `StorageError`, just like request
+    errors; ordinary thrown application errors remain defects. A synchronous failure after
+    enqueueing a snapshot aborts its transaction, so snapshot and token cannot diverge.
+    Rejected: async domain evaluation, supplying hidden services to pure codecs, treating all
+    thrown values as recoverable storage failures, and ignoring a failed token write.
+    SQL retries match the driver's `SerializationError` and `DeadlockError` reasons, preserving
+    the existing eight-retry limit rather than broadening to every retryable SQL error.
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -548,7 +563,7 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
 - **INV-SCHEMA-2:** Incompatible unsent commands become durable Unknown notices without
   partial predictions or sending; dismissal retains payloads. Sent/Accepted outcomes still
   recover by original identity and revision; their missing predictions block dependent
-  decisions until recovery. State/handler defects are not quarantined.
+  decisions until recovery. State/handler defects and unsupported asynchronous codecs are not quarantined.
 
 - **INV-SERVER-7:** Shared grants authorize reads and writes by role; scope moves invalidate
   old and new readers, and revoked readers lose the entire scope on their next pull.
@@ -567,6 +582,8 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
   visible without notifications, including journal-only writes and resets. Aborted transactions
   cannot poison the cache. Version-1 snapshots survive upgrade, old writers cannot reopen, and
   blocked upgrade attempts fail without leaking late handles.
+  Synchronous IndexedDB DOM failures are typed StorageErrors, not defects; programming errors
+  remain defects. A failed snapshot/token write never commits either half of a new snapshot.
   A client's own committed replica needs only a token check while still current; this never
   hides journal identity/epoch changes or aliases callers' saved values in ordinary storage reads.
 - **INV-PRESENCE-1:** Scope presence authenticates room membership, removes disconnected and

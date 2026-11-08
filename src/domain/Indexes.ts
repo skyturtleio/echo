@@ -1,8 +1,8 @@
 import * as Record from "effect/Record"
-import type * as Schema from "effect/Schema"
+import type { Codec } from "./internal/classes.ts"
 
 /** The schema of an aggregate id: a string, usually branded. */
-export type IdSchema = Schema.Top & { readonly Type: string; readonly Encoded: string }
+export type IdSchema = Codec & { readonly Type: string; readonly Encoded: string }
 
 /** The string keys of any member of a (possibly union) state type. */
 export type KeysOf<S> = S extends unknown ? keyof S & string : never
@@ -21,7 +21,7 @@ export type Spec<S> = { readonly [name: string]: ReadonlyArray<KeysOf<S>> }
  * the named state fields, queries use it, and `decide` reads other streams through it
  * (design §1, §2 item 2).
  */
-export interface Index<Id extends IdSchema, S extends Schema.Top, Fields extends ReadonlyArray<string>> {
+export interface Index<Id extends IdSchema, S extends Codec, Fields extends ReadonlyArray<string>> {
   readonly kind: "Index"
   readonly name: string
   readonly id: Id
@@ -29,9 +29,9 @@ export interface Index<Id extends IdSchema, S extends Schema.Top, Fields extends
   readonly fields: Fields
 }
 
-export type Any = Index<IdSchema, Schema.Top, ReadonlyArray<string>>
+export type Any = Index<IdSchema, Codec, ReadonlyArray<string>>
 
-export type Set<Id extends IdSchema, S extends Schema.Top, X extends Spec<S["Type"]>> = {
+export type Set<Id extends IdSchema, S extends Codec, X extends Spec<S["Type"]>> = {
   readonly [K in keyof X]: Index<Id, S, X[K]>
 }
 
@@ -54,7 +54,7 @@ export type Entry<I extends Any> =
  * name one of its own aggregate's indexes in `reads` without importing the aggregate (which
  * imports the command). `Aggregate.make` binds them to the aggregate.
  */
-export const make = <Id extends IdSchema, S extends Schema.Top, const X extends Spec<S["Type"]>>(
+export const make = <Id extends IdSchema, S extends Codec, const X extends Spec<S["Type"]>>(
   id: Id,
   state: S,
   spec: X

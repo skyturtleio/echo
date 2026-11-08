@@ -130,8 +130,8 @@ export const httpTransport = Effect.fnUntraced(function* (
     Layer.provide(RpcSerialization.layerNdjsonWith({ maxBufferSize: 64 * 1024 * 1024 })),
     Layer.provide(httpClient)
   )
-  // Browser transport entry point: its RPC and HTTP resources belong to the caller's scope.
-  // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Browser transport entry point owns RPC resources in the caller's scope.
+  // RPC fibers use the caller's Scope; these unbatched HTTP/Fetch layers acquire no lasting resources.
+  // oxlint-disable-next-line effecttsgo/strict-effect-provide -- only the resource-free protocol layer's build scope closes here; RPC lifetime uses the caller's Scope
   const rpc = yield* RpcClient.make(Protocol.EchoRpcs).pipe(Effect.provide(protocol))
   return {
     execute: (request) =>
@@ -932,5 +932,5 @@ export const open = Effect.fnUntraced(function* (options: Options) {
   }
 })
 
-const ProtocolEpoch = Schema.Struct({ _tag: Schema.Literal("ResyncRequired"), epoch: Schema.String })
+const ProtocolEpoch = Schema.TaggedStruct("ResyncRequired", { epoch: Schema.String })
 export type Client = Effect.Success<ReturnType<typeof open>>

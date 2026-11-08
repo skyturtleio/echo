@@ -1,6 +1,6 @@
 import type * as Cause from "effect/Cause"
 import type * as Schema from "effect/Schema"
-import { type Fields, taggedError } from "./internal/classes.ts"
+import { type Codec, type Fields, taggedError } from "./internal/classes.ts"
 
 /** Instance type of a rejection class: its `_tag` plus its evidence. */
 export type Instance<Tag extends string, F extends Fields> = { readonly _tag: Tag } & Schema.Struct.Type<F>
@@ -16,7 +16,7 @@ export interface RejectionClass<Tag extends string, F extends Fields> extends Sc
 }
 
 /** Structural constraint satisfied by every class produced by {@link make}. */
-export interface Any extends Schema.Top {
+export interface Any extends Codec {
   readonly kind: "Rejection"
   readonly tag: string
   readonly Type: { readonly _tag: string }

@@ -12,22 +12,20 @@ import type * as Stream from "effect/Stream"
 import * as Str from "effect/String"
 import { HttpServerRequest } from "effect/http"
 import { RpcSerialization, RpcServer } from "effect/rpc"
-import { SqlClient } from "effect/sql"
+import { SqlClient, SqlError } from "effect/sql"
 import * as Aggregate from "../domain/Aggregate.ts"
 import type * as Command from "../domain/Command.ts"
 import type * as Index from "../domain/Indexes.ts"
+import type { Codec } from "../domain/internal/classes.ts"
 import { canRead, canWrite, Grant, privateScope, type Principal, Scope, ScopeForbidden } from "../domain/Scope.ts"
 import * as Wire from "../protocol.ts"
 import type * as Action from "./Action.ts"
 import * as Changes from "./Changes.ts"
 export * as Action from "./Action.ts"
 
-// Platform boundary: registered domain codecs are synchronous and service-free, as decide/evolve are.
-const codec = <S extends Schema.Top>(schema: S) =>
-  // oxlint-disable-next-line typescript/consistent-type-assertions -- domain codecs are synchronous and service-free at this erased boundary
-  Schema.toCodecJson(schema) as unknown as Schema.Codec<S["Type"], Schema.Json>
-const decode = <S extends Schema.Top>(schema: S, value: unknown) => Schema.decodeUnknownEffect(codec(schema))(value)
-const encode = (schema: Schema.Top, value: unknown) => Schema.encodeEffect(codec(schema))(value)
+const decode = <S extends Codec>(schema: S, value: unknown) =>
+  Schema.decodeUnknownEffect(Schema.toCodecJson(schema))(value)
+const encode = (schema: Codec, value: unknown) => Schema.encodeEffect(Schema.toCodecJson(schema))(value)
 const fail = (message: string): never => {
   throw new Wire.ServerError({ message })
 }
@@ -169,11 +167,9 @@ export const make = Effect.fn("Echo.Server.make")(function* (
       .pipe(
         Effect.retry({
           times: 8,
-          while: (error) => {
-            if (!Predicate.hasProperty(error, "reason") || !Predicate.hasProperty(error.reason, "cause")) return false
-            const cause = error.reason.cause
-            return Predicate.hasProperty(cause, "code") && (cause.code === "40001" || cause.code === "40P01")
-          }
+          while: (error) =>
+            SqlError.isSqlError(error) &&
+            (error.reason._tag === "SerializationError" || error.reason._tag === "DeadlockError")
         })
       )
   const engine = Effect.gen(function* () {

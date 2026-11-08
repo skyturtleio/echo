@@ -2,7 +2,7 @@ import type * as Schema from "effect/Schema"
 import type * as Aggregate from "./Aggregate.ts"
 import type * as Event from "./Event.ts"
 import type * as Index from "./Indexes.ts"
-import { type Fields, taggedClass } from "./internal/classes.ts"
+import { type Codec, type Fields, taggedClass } from "./internal/classes.ts"
 import type * as Rejection from "./Rejection.ts"
 
 /** The fields of a command instance: the id of the stream it addresses, then its input. */
@@ -39,7 +39,7 @@ export interface CommandClass<
 }
 
 /** Structural constraint satisfied by every class produced by {@link make}. */
-export interface Any extends Schema.Top {
+export interface Any extends Codec {
   readonly kind: "Command"
   readonly tag: string
   readonly target: Index.IdSchema

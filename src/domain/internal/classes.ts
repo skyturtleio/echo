@@ -1,7 +1,13 @@
 import type * as Cause from "effect/Cause"
 import * as Schema from "effect/Schema"
 
-export type Fields = Schema.Struct.Fields
+/** Domain codecs run without services on both server and device. Transformations must also be synchronous. */
+export interface Codec extends Schema.Top {
+  readonly DecodingServices: never
+  readonly EncodingServices: never
+}
+
+export type Fields = { readonly [key: PropertyKey]: Schema.ConstraintCodec<unknown, unknown> }
 
 // `Schema.TaggedClass<Self>` and `Schema.TaggedError<Self>` give a type that is conditional on
 // `Self` ("did the caller pass the generic?"). It resolves at a call site with a concrete `Self`,

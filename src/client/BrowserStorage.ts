@@ -10,6 +10,10 @@ export class CompatibilityError extends Data.TaggedError("CompatibilityError")<{
   readonly reason: "blocked" | "outdated" | "superseded" | "invalidGeneration" | "predictionUnavailable"
 }> {}
 
+// DOM failures are operational; thrown application errors must remain defects.
+const storageFailure = (cause: unknown) =>
+  cause instanceof DOMException ? Effect.fail(new StorageError({ cause })) : Effect.die(cause)
+
 const Generation = Schema.Int.check(
   Schema.isGreaterThanOrEqualTo(1),
   Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER - 2)
@@ -22,7 +26,7 @@ export const randomId = Effect.sync(() => crypto.randomUUID())
 /** Browser platform edge: the lock is held until the owning Effect scope closes. */
 export const ownProfile = (profile: string, wait = false) =>
   Effect.acquireRelease(
-    Effect.callback<Effect.Effect<void>, StorageError | ProfileBusy>((resume) => {
+    Effect.callback<Effect.Effect<void>, StorageError | ProfileBusy>((resume, signal) => {
       if (globalThis.navigator?.locks === undefined) {
         resume(Effect.fail(new StorageError({ cause: "Web Locks unavailable" })))
         return
@@ -33,9 +37,8 @@ export const ownProfile = (profile: string, wait = false) =>
       const held = new Promise<void>((resolve) => {
         release = resolve
       })
-      const controller = new AbortController()
       const finished = navigator.locks
-        .request(`echo:${profile}`, wait ? { signal: controller.signal } : { ifAvailable: true }, (lock) => {
+        .request(`echo:${profile}`, wait ? { signal } : { ifAvailable: true }, (lock) => {
           if (lock === null) {
             resume(Effect.fail(new ProfileBusy({ profile })))
             return
@@ -52,7 +55,6 @@ export const ownProfile = (profile: string, wait = false) =>
         })
         .catch((cause: unknown) => resume(Effect.fail(new StorageError({ cause }))))
       return Effect.sync(() => {
-        controller.abort()
         release()
       })
     }),
@@ -80,13 +82,24 @@ export const openDatabase = (name: string, compatibilityGeneration = 1) =>
         return
       }
       let abandoned = false
-      const request = indexedDB.open(name, 2 + compatibilityGeneration)
+      let request: IDBOpenDBRequest
+      try {
+        request = indexedDB.open(name, 2 + compatibilityGeneration)
+      } catch (cause) {
+        resume(storageFailure(cause))
+        return
+      }
       request.addEventListener("upgradeneeded", () => {
         if (abandoned) {
           request.transaction?.abort()
           return
         }
-        if (!request.result.objectStoreNames.contains("data")) request.result.createObjectStore("data")
+        try {
+          if (!request.result.objectStoreNames.contains("data")) request.result.createObjectStore("data")
+        } catch (cause) {
+          request.transaction?.abort()
+          resume(storageFailure(cause))
+        }
       })
       request.addEventListener("blocked", () => {
         abandoned = true
@@ -137,19 +150,33 @@ export const loadIfChanged = (db: Database, acknowledgedToken?: string) =>
       resume(Effect.fail(new CompatibilityError({ reason: "superseded" })))
       return
     }
-    const tx = db.database.transaction("data", "readonly")
-    const store = tx.objectStore("data")
-    const request = store.get("token")
+    let tx: IDBTransaction
+    let store: IDBObjectStore
+    let request: IDBRequest<unknown>
+    try {
+      tx = db.database.transaction("data", "readonly")
+      store = tx.objectStore("data")
+      request = store.get("token")
+    } catch (cause) {
+      resume(storageFailure(cause))
+      return
+    }
     let value: unknown
     let unchanged = false
     request.addEventListener("success", () => {
       if (acknowledgedToken !== undefined && acknowledgedToken === request.result) unchanged = true
       else if (db.cache !== undefined && db.cache.token === request.result) value = db.cache.value
       else {
-        const snapshot = store.get("snapshot")
-        snapshot.addEventListener("success", () => {
-          value = snapshot.result
-        })
+        try {
+          const snapshot = store.get("snapshot")
+          snapshot.addEventListener("success", () => {
+            value = snapshot.result
+          })
+        } catch (cause) {
+          // Prevent complete from installing an absent snapshot in the cache after a failed read.
+          tx.abort()
+          resume(storageFailure(cause))
+        }
       }
     })
     tx.addEventListener("complete", () => {
@@ -171,12 +198,25 @@ export const save = (db: Database, value: unknown) =>
       resume(Effect.fail(new CompatibilityError({ reason: "superseded" })))
       return
     }
-    const tx = db.database.transaction("data", "readwrite", { durability: "strict" })
-    tx.objectStore("data").put(value, "snapshot")
     // Browser platform edge: a unique token also fences reset/recreation (no counter ABA).
     // oxlint-disable-next-line effecttsgo/crypto-random-uuid-in-effect -- native token fences cross-tab reset and recreation
     const token = crypto.randomUUID()
-    tx.objectStore("data").put(token, "token")
+    let tx: IDBTransaction
+    try {
+      tx = db.database.transaction("data", "readwrite", { durability: "strict" })
+    } catch (cause) {
+      resume(storageFailure(cause))
+      return
+    }
+    try {
+      tx.objectStore("data").put(value, "snapshot")
+      tx.objectStore("data").put(token, "token")
+    } catch (cause) {
+      // A successful first put must never commit without its matching token.
+      tx.abort()
+      resume(storageFailure(cause))
+      return
+    }
     tx.addEventListener("complete", () => resume(Effect.succeed(token)))
     tx.addEventListener("abort", () => resume(Effect.fail(new StorageError({ cause: tx.error }))))
     tx.addEventListener("error", () => resume(Effect.fail(new StorageError({ cause: tx.error }))))

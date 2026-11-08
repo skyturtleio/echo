@@ -6,7 +6,9 @@ import { TagId } from "./Tag.id.ts"
 export class TagRemoved extends Domain.Event("TagRemoved", {}) {}
 
 /** Notes still carry the tag; `notes` is how many. */
-export class TagInUse extends Domain.Rejection("TagInUse", { notes: Schema.Int }) {}
+export class TagInUse extends Domain.Rejection("TagInUse", {
+  notes: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER))
+}) {}
 
 export class NoSuchTag extends Domain.Rejection("NoSuchTag", {}) {}
 

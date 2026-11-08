@@ -1,5 +1,5 @@
 import type * as Schema from "effect/Schema"
-import { type Fields, taggedClass } from "./internal/classes.ts"
+import { type Codec, type Fields, taggedClass } from "./internal/classes.ts"
 
 export type { Fields }
 
@@ -17,7 +17,7 @@ export interface EventClass<Tag extends string, F extends Fields> extends Schema
 }
 
 /** Structural constraint satisfied by every class produced by {@link make}. */
-export interface Any extends Schema.Top {
+export interface Any extends Codec {
   readonly kind: "Event"
   readonly tag: string
   readonly Type: { readonly _tag: string }

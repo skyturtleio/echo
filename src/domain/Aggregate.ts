@@ -2,11 +2,10 @@ import * as Arr from "effect/Array"
 import type * as DateTime from "effect/DateTime"
 import * as Option from "effect/Option"
 import * as Record from "effect/Record"
-import type * as Schema from "effect/Schema"
 import type * as Command from "./Command.ts"
 import type * as Event from "./Event.ts"
 import type * as Index from "./Indexes.ts"
-import type { Bivariant } from "./internal/classes.ts"
+import type { Bivariant, Codec } from "./internal/classes.ts"
 import type { Grant, Principal, Scope } from "./Scope.ts"
 
 /**
@@ -43,7 +42,7 @@ export interface DecideContext {
 /** The pure definition of an aggregate: identity, state, scope, indexes, the commands it decides and the events it folds. */
 export interface Definition<
   Id extends Index.IdSchema,
-  S extends Schema.Top,
+  S extends Codec,
   C extends ReadonlyArray<Command.Any>,
   X extends Index.Spec<S["Type"]>,
   E extends ReadonlyArray<Event.Any> = readonly []
@@ -85,7 +84,7 @@ export interface Definition<
 /** A {@link Definition} with its types erased, as the story runner and the engine see one. */
 export interface AnyDefinition {
   readonly id: Index.IdSchema
-  readonly state: Schema.Top
+  readonly state: Codec
   readonly initial: unknown
   readonly commands: ReadonlyArray<Command.Any>
   readonly events?: ReadonlyArray<Event.Any>
@@ -120,7 +119,7 @@ export type EventInstance<A extends Any> = A extends Any
 export type AggregateClass<
   Name extends string,
   Id extends Index.IdSchema,
-  S extends Schema.Top,
+  S extends Codec,
   C extends ReadonlyArray<Command.Any>,
   X extends Index.Spec<S["Type"]>,
   E extends ReadonlyArray<Event.Any> = readonly []
@@ -140,7 +139,7 @@ const owners = new WeakMap<Index.Any, Any>()
 export const make = <
   const Name extends string,
   Id extends Index.IdSchema,
-  S extends Schema.Top,
+  S extends Codec,
   const C extends ReadonlyArray<Command.Any>,
   const X extends Index.Spec<S["Type"]>,
   const E extends ReadonlyArray<Event.Any> = readonly []

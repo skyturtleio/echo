@@ -133,7 +133,7 @@ export const make = Effect.fnUntraced(function* (sql: PgClient.PgClient) {
     Effect.gen(function* () {
       // Dedicated session; never reserve the application's query pool for LISTEN.
       const listener = yield* PgClient.makeClient({ ...sql.config, acquireForStream: false }).pipe(
-        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- driver construction is owned by this listener-attempt scope
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Reactivity has no scoped resources; the driver acquires into the surrounding listener-attempt Scope
         Effect.provide(Reactivity.layer)
       )
       const notifications = yield* listener.listen("echo_changes")

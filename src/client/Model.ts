@@ -11,6 +11,7 @@ import * as Schema from "effect/Schema"
 import * as Aggregate from "../domain/Aggregate.ts"
 import type * as Command from "../domain/Command.ts"
 import type * as Index from "../domain/Indexes.ts"
+import type { Codec } from "../domain/internal/classes.ts"
 import { canRead, canWrite, Grant, type Principal, ScopeForbidden } from "../domain/Scope.ts"
 import { Batch, Position, Receipt } from "../protocol.ts"
 
@@ -62,13 +63,12 @@ export interface Read {
 }
 
 /** Schema registry is the boundary where persisted unknown values regain domain types. */
-const codec = memoize((schema: Schema.Top) => {
-  // Platform serialization boundary: domain schemas must be synchronous and service-free.
-  const json = Schema.make<Schema.Codec<unknown, unknown>>(Schema.toCodecJson(schema).ast)
+const codec = memoize((schema: Codec) => {
+  const json = Schema.toCodecJson(schema)
   return { decode: Schema.decodeUnknownSync(json), encode: Schema.encodeSync(json) }
 })
-export const decode = (schema: Schema.Top, value: unknown): unknown => codec(schema).decode(value)
-export const encode = (schema: Schema.Top, value: unknown): unknown => codec(schema).encode(value)
+export const decode = (schema: Codec, value: unknown): unknown => codec(schema).decode(value)
+export const encode = (schema: Codec, value: unknown): unknown => codec(schema).encode(value)
 
 export class IncompatibleCommand extends Data.TaggedError("IncompatibleCommand")<{
   readonly reason: "aggregate" | "command" | "payload"
@@ -91,8 +91,9 @@ export type DomainRejection<A extends Aggregate.Any> =
 /** Restore named domain rejection classes at the public local-execution boundary. */
 export const decodeRejection = <A extends Aggregate.Any>(aggregate: A, value: unknown): DomainRejection<A> => {
   const schemas = [...Array.flatMap(aggregate.definition.commands, (command) => command.rejects), ScopeForbidden]
-  const schema = Schema.make<Schema.Codec<DomainRejection<A>, unknown>>(Schema.toCodecJson(Schema.Union(schemas)).ast)
-  return Schema.decodeUnknownSync(schema)(value)
+  const decoded = Schema.decodeUnknownSync(Schema.toCodecJson(Schema.Union(schemas)))(value)
+  // oxlint-disable-next-line typescript/consistent-type-assertions -- the erased registry contains exactly A's declared rejections plus ScopeForbidden; decoding has validated the value
+  return decoded as DomainRejection<A>
 }
 
 /** One cache per client principal. Engine rows and domain definitions are immutable once installed. */

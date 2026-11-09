@@ -14,9 +14,11 @@ import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
+import * as Str from "effect/String"
 import { FetchHttpClient, HttpClient, HttpClientRequest, HttpEffect } from "effect/http"
 import { Reactivity } from "effect/reactivity"
 import { RpcClient, RpcSerialization } from "effect/rpc"
+import { SqlClient } from "effect/sql"
 import { TestClock } from "effect/testing"
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- real socket fixture in Vitest's Node runtime, not an engine dependency
 import { createServer } from "node:http"
@@ -32,7 +34,7 @@ import * as Wire from "../protocol.ts"
 import * as Server from "./index.ts"
 
 // oxlint-disable-next-line effecttsgo/process-env -- test discovery happens before the Effect runtime
-const url = process.env["ECHO_PG_URL"]
+const url = process.env["ECHOSYNC_PG_URL"]
 const alice = Principal.make("alice")
 const bob = Principal.make("bob")
 class UndeclaredCommand extends DefineTag {
@@ -67,7 +69,7 @@ const scenario = <A, E>(
 ) =>
   Effect.scoped(
     Effect.gen(function* () {
-      const schema = `echo_test_${process.pid}_${nextSchema++}`
+      const schema = `echosync_test_${process.pid}_${nextSchema++}`
       const layer = PgClient.layer({
         url: Redacted.make(url ?? ""),
         startupParameters: { search_path: schema, application_name: schema },
@@ -85,6 +87,97 @@ const scenario = <A, E>(
   )
 
 describe.skipIf(url === undefined)("Postgres server", () => {
+  it.effect("INV-SERVER-11 naming cutover cannot split rows, reset sequences or partially commit", () =>
+    scenario(
+      Effect.fnUntraced(function* (server, sql) {
+        const migrate = Server.migrate.pipe(Effect.provideService(SqlClient.SqlClient, sql))
+        const accepted = yield* server.execute(alice, request("retained"))
+        yield* server.importStreams({
+          id: "retained-import",
+          principal: alice,
+          streams: [
+            Server.importedStream(Tag, TagId.make("shared"), [
+              new TagHistoryImported({
+                snapshot: { name: "shared", scope: VisibilityScope.make("shared:room"), removed: false }
+              })
+            ])
+          ],
+          grants: [{ scope: VisibilityScope.make("shared:room"), principal: bob, role: "reader" }]
+        })
+        yield* server.ingestCatalog({ scope: "catalog:tags", release: "retained", rows: [] })
+        yield* sql`INSERT INTO echosync_connections VALUES ('retained-connection','alice',now()+interval '1 hour')`
+        yield* sql`INSERT INTO echosync_presence VALUES ('retained-connection','user:alice','tab','{}',now()+interval '1 hour')`
+        yield* sql`CREATE INDEX echosync_events_batch ON echosync_events(batch_id)`
+        const tables = [
+          "engine",
+          "scopes",
+          "streams",
+          "events",
+          "receipts",
+          "catalog_releases",
+          "grants",
+          "grant_events",
+          "imports",
+          "connections",
+          "presence"
+        ]
+        const snapshots = new Map<string, unknown>()
+        for (const suffix of tables) {
+          snapshots.set(
+            suffix,
+            yield* sql`SELECT to_jsonb(t) AS row FROM ${sql(`echosync_${suffix}`)} t ORDER BY to_jsonb(t)::text`
+          )
+          // Reconstruct the previous released naming, including dependent objects, without changing any data.
+          const constraints = yield* sql<{
+            readonly conname: string
+          }>`SELECT conname FROM pg_constraint WHERE conrelid=${`echosync_${suffix}`}::regclass`
+          for (const { conname } of constraints)
+            yield* sql`ALTER TABLE ${sql(`echosync_${suffix}`)} RENAME CONSTRAINT ${sql(conname)} TO ${sql(Str.replace(/^echosync_/, "echo_")(conname))}`
+          yield* sql`ALTER TABLE ${sql(`echosync_${suffix}`)} RENAME TO ${sql(`echo_${suffix}`)}`
+        }
+        yield* sql`ALTER INDEX echosync_events_batch RENAME TO echo_events_batch`
+        yield* sql`ALTER SEQUENCE echosync_grant_events_position_seq RENAME TO echo_grant_events_position_seq`
+        // Collision appears after earlier tables in migration order: every prior rename must roll back.
+        yield* sql`CREATE TABLE echosync_events (sentinel text)`
+        yield* sql`INSERT INTO echosync_events VALUES ('do-not-merge')`
+        expect((yield* Effect.result(migrate))._tag).toBe("Failure")
+        for (const suffix of tables)
+          expect(
+            yield* sql`SELECT to_jsonb(t) AS row FROM ${sql(`echo_${suffix}`)} t ORDER BY to_jsonb(t)::text`
+          ).toEqual(snapshots.get(suffix))
+        expect(yield* sql`SELECT * FROM echosync_events`).toEqual([{ sentinel: "do-not-merge" }])
+        yield* sql`DROP TABLE echosync_events`
+        // App migrations wrap this effect: a successful inner migration must not commit its caller.
+        expect(
+          (yield* Effect.result(sql.withTransaction(migrate.pipe(Effect.andThen(Effect.fail("outer rollback"))))))._tag
+        ).toBe("Failure")
+        expect(yield* sql`SELECT count(*)::integer AS count FROM echo_receipts`).toEqual([{ count: 1 }])
+        yield* migrate
+        yield* migrate
+        for (const suffix of tables)
+          expect(
+            yield* sql`SELECT to_jsonb(t) AS row FROM ${sql(`echosync_${suffix}`)} t ORDER BY to_jsonb(t)::text`
+          ).toEqual(snapshots.get(suffix))
+        expect(
+          yield* sql`SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND starts_with(c.relname,'echo_')`
+        ).toEqual([])
+        expect(
+          yield* sql`SELECT conname FROM pg_constraint WHERE connamespace=current_schema()::regnamespace AND starts_with(conname,'echo_')`
+        ).toEqual([])
+        expect(yield* sql`SELECT pg_get_serial_sequence('echosync_grant_events','position') AS name`).toEqual([
+          {
+            name: `${(yield* sql<{ readonly name: string }>`SELECT current_schema() AS name`)[0]?.name}.echosync_grant_events_position_seq`
+          }
+        ])
+        expect(yield* sql`SELECT nextval('echosync_grant_events_position_seq')::integer AS position`).toEqual([
+          { position: 2 }
+        ])
+        expect(yield* server.execute(alice, request("retained"))).toEqual(accepted)
+        expect(yield* server.get(alice, Tag, TagId.make("retained"))).toMatchObject({ name: "retained" })
+      })
+    )
+  )
+
   it.effect("INV-SERVER-7 reader grants cannot write and moves evict old readers", () =>
     scenario(
       Effect.fnUntraced(function* (server) {
@@ -178,7 +271,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           batches: [{ id: "bad", commands: [], action: { name: "transition", input: { fail: true } } }]
         }
         expect((yield* server.execute(alice, rejected)).receipts[0]?._tag).toBe("Rejected")
-        expect(yield* sql`SELECT * FROM echo_grants`).toHaveLength(0)
+        expect(yield* sql`SELECT * FROM echosync_grants`).toHaveLength(0)
         expect(yield* server.get(alice, Tag, id)).toMatchObject({ scope: privateScope(alice) })
         const accepted = {
           ...rejected,
@@ -189,7 +282,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         expect(yield* server.execute(alice, accepted)).toEqual(result)
         expect(yield* server.get(alice, Tag, id)).toBeNull()
         expect(yield* server.get(bob, Tag, id)).toMatchObject({ scope: shared })
-        expect(yield* sql`SELECT * FROM echo_events WHERE id=${id}`).toHaveLength(2)
+        expect(yield* sql`SELECT * FROM echosync_events WHERE id=${id}`).toHaveLength(2)
         const pulled = yield* server.pull(alice, { epoch: null, cursors: {} })
         const receipt = result.receipts[0]
         expect(receipt?._tag === "Accepted" && pulled.revision >= receipt.revision).toBe(true)
@@ -218,7 +311,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         expect(yield* server.get(alice, Tag, TagId.make("imported"))).toBeNull()
         yield* server.importStreams(input)
         yield* server.importStreams(input)
-        expect(yield* sql`SELECT payload,principal FROM echo_events`).toMatchObject([
+        expect(yield* sql`SELECT payload,principal FROM echosync_events`).toMatchObject([
           { principal: "alice", payload: { _tag: "TagHistoryImported", snapshot: { name: "historical" } } }
         ])
         expect((yield* server.importStreams({ ...input, id: "conflict" }).pipe(Effect.flip))._tag).toBe("ServerError")
@@ -259,7 +352,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         yield* server.presence(bob, { connectionId, room, clientId: "tab", state: { active: true } })
         expect((yield* Queue.take(queue)).presence).toMatchObject([{ principal: "bob", state: { active: true } }])
         // No write/notification is needed to discover a crashed participant's expired lease.
-        yield* sql`UPDATE echo_presence SET expires_at=now()-interval '1 second' WHERE client_id='tab'`
+        yield* sql`UPDATE echosync_presence SET expires_at=now()-interval '1 second' WHERE client_id='tab'`
         yield* TestClock.adjust("25 seconds")
         expect((yield* Queue.take(queue)).presence).toEqual([])
         yield* server.presence(bob, { connectionId, room, clientId: "living", state: {} })
@@ -334,7 +427,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         expect(yield* observed.execute(alice, rejected)).toEqual(refusal)
         expect(rejections).toEqual([{ operation: "Batch", rejectionTag: "DuplicateName" }])
         expect(entries(yield* server.pull(alice, { epoch: first.epoch, cursors: {} }))).toHaveLength(1)
-        expect(yield* sql`SELECT * FROM echo_events`).toHaveLength(1)
+        expect(yield* sql`SELECT * FROM echosync_events`).toHaveLength(1)
         const collision = yield* Effect.result(server.execute(alice, request("accepted", "other", "changed")))
         expect(collision._tag).toBe("Failure")
         const other = yield* server.execute(bob, request("accepted", "bob-tag", "accepted"))
@@ -347,8 +440,8 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         const decoded = yield* Schema.decodeEffect(Schema.toCodecJson(TagHistoryImported))(payload)
         const state = Tag.definition.evolve.TagHistoryImported(Tag.definition.initial, decoded)
         expect(state).toEqual({ name: "historical", scope: "user:alice", removed: false })
-        yield* sql`INSERT INTO echo_events VALUES ('Tag','imported',1,${sql.json(payload)},'trusted-import','operator',now())`
-        yield* sql`INSERT INTO echo_streams VALUES ('Tag','imported','user:alice',1,${sql.json(state)})`
+        yield* sql`INSERT INTO echosync_events VALUES ('Tag','imported',1,${sql.json(payload)},'trusted-import','operator',now())`
+        yield* sql`INSERT INTO echosync_streams VALUES ('Tag','imported','user:alice',1,${sql.json(state)})`
         const remove: Wire.ExecuteRequest = {
           epoch: first.epoch,
           clientId: "device",
@@ -363,10 +456,10 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           _tag: "Accepted",
           seqs: [{ id: "imported", seq: 2 }]
         })
-        expect(yield* sql`SELECT state FROM echo_streams WHERE id='imported'`).toEqual([
+        expect(yield* sql`SELECT state FROM echosync_streams WHERE id='imported'`).toEqual([
           { state: { name: "historical", scope: "user:alice", removed: true } }
         ])
-        expect(yield* sql`SELECT seq,payload FROM echo_events WHERE id='imported' ORDER BY seq`).toEqual([
+        expect(yield* sql`SELECT seq,payload FROM echosync_events WHERE id='imported' ORDER BY seq`).toEqual([
           { seq: 1, payload },
           { seq: 2, payload: { _tag: "TagRemoved" } }
         ])
@@ -382,8 +475,8 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           Effect.provideService(PgClient.PgClient, sql)
         )
         expect((yield* Effect.exit(invalidServer.execute(alice, request("illegal-import"))))._tag).toBe("Failure")
-        expect(yield* sql`SELECT * FROM echo_events WHERE id='illegal-import'`).toHaveLength(0)
-        expect(yield* sql`SELECT * FROM echo_receipts WHERE batch_id='illegal-import'`).toHaveLength(0)
+        expect(yield* sql`SELECT * FROM echosync_events WHERE id='illegal-import'`).toHaveLength(0)
+        expect(yield* sql`SELECT * FROM echosync_receipts WHERE batch_id='illegal-import'`).toHaveLength(0)
 
         const batch = (id: string, commands: Wire.ExecuteRequest["batches"][number]["commands"]) =>
           server.execute(alice, { epoch: first.epoch, clientId: "device", batches: [{ id, commands }] })
@@ -397,7 +490,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           _tag: "Rejected",
           rejection: { _tag: "TagInUse", notes: 1 }
         })
-        expect(yield* sql`SELECT * FROM echo_streams WHERE id IN ('in-batch','in-batch-note')`).toHaveLength(0)
+        expect(yield* sql`SELECT * FROM echosync_streams WHERE id IN ('in-batch','in-batch-note')`).toHaveLength(0)
         expect((yield* batch("id-overlay", [define, write])).receipts[0]).toMatchObject({
           _tag: "Accepted",
           seqs: [
@@ -418,7 +511,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
             }
           ])).receipts[0]
         ).toMatchObject({ _tag: "Accepted", seqs: [{ id: "ephemeral", seq: 2 }] })
-        expect(yield* sql`SELECT state->'removed' AS removed FROM echo_streams WHERE id='ephemeral'`).toEqual([
+        expect(yield* sql`SELECT state->'removed' AS removed FROM echosync_streams WHERE id='ephemeral'`).toEqual([
           { removed: true }
         ])
         yield* server.execute(alice, request("persisted-overlay"))
@@ -433,7 +526,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           rejection: { _tag: "NoSuchTag" }
         })
         expect(
-          yield* sql`SELECT seq,state->'removed' AS removed FROM echo_streams WHERE id='persisted-overlay'`
+          yield* sql`SELECT seq,state->'removed' AS removed FROM echosync_streams WHERE id='persisted-overlay'`
         ).toEqual([{ seq: 1, removed: false }])
         expect(
           (yield* batch("rejection-precedence", [
@@ -467,7 +560,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           { concurrency: "unbounded" }
         )
         expect(Arr.every(rejected, (r) => r.receipts[0]?._tag === "Rejected")).toBe(true)
-        expect(yield* sql`SELECT * FROM echo_events`).toHaveLength(2)
+        expect(yield* sql`SELECT * FROM echosync_events`).toHaveLength(2)
         const inBatch = yield* server.execute(alice, {
           epoch: null,
           clientId: "device",
@@ -482,7 +575,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           ]
         })
         expect(inBatch.receipts[0]).toMatchObject({ _tag: "Rejected", rejection: { _tag: "DuplicateName" } })
-        expect(yield* sql`SELECT * FROM echo_events`).toHaveLength(2)
+        expect(yield* sql`SELECT * FROM echosync_events`).toHaveLength(2)
       })
     )
   )
@@ -537,7 +630,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
 
         // Removing a tag reads Notes, not other Tags. Unrelated corrupt state must not be decoded.
         yield* server.execute(alice, request("isolated-target"))
-        yield* sql`INSERT INTO echo_streams VALUES ('Tag','unrelated','catalog:tags',1,'{}'::jsonb)`
+        yield* sql`INSERT INTO echosync_streams VALUES ('Tag','unrelated','catalog:tags',1,'{}'::jsonb)`
         const removeIsolated: Wire.ExecuteRequest = {
           epoch: null,
           clientId: "device",
@@ -552,9 +645,9 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           _tag: "Accepted",
           seqs: [{ id: "isolated-target", seq: 2 }]
         })
-        expect(yield* sql`SELECT state FROM echo_streams WHERE id='unrelated'`).toEqual([{ state: {} }])
+        expect(yield* sql`SELECT state FROM echosync_streams WHERE id='unrelated'`).toEqual([{ state: {} }])
         // The same malformed shape must still fail when it belongs to a declared read aggregate.
-        yield* sql`INSERT INTO echo_streams VALUES ('Note','selected','catalog:notes',1,'{}'::jsonb)`
+        yield* sql`INSERT INTO echosync_streams VALUES ('Note','selected','catalog:notes',1,'{}'::jsonb)`
         expect(
           (yield* Effect.result(
             server.execute(alice, {
@@ -568,7 +661,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
             })
           ))._tag
         ).toBe("Failure")
-        expect(yield* sql`SELECT * FROM echo_receipts WHERE batch_id='selected-invalid'`).toHaveLength(0)
+        expect(yield* sql`SELECT * FROM echosync_receipts WHERE batch_id='selected-invalid'`).toHaveLength(0)
         expect(
           (yield* server.execute(alice, {
             epoch: null,
@@ -633,8 +726,8 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           reset: false,
           entries: []
         })
-        expect(yield* sql`SELECT * FROM echo_events`).toHaveLength(1)
-        expect(yield* sql`SELECT * FROM echo_catalog_releases`).toHaveLength(1)
+        expect(yield* sql`SELECT * FROM echosync_events`).toHaveLength(1)
+        expect(yield* sql`SELECT * FROM echosync_catalog_releases`).toHaveLength(1)
         // A duplicate id fails during insertion, after DELETE; the previous snapshot must survive rollback.
         const duplicate = {
           aggregate: "Tag",
@@ -654,7 +747,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
             )
           )
         ).toEqual(Option.getOrUndefined(Arr.findFirst(before.scopes, (s) => s.scope === catalog.scope)))
-        expect(yield* sql`SELECT * FROM echo_catalog_releases`).toHaveLength(1)
+        expect(yield* sql`SELECT * FROM echosync_catalog_releases`).toHaveLength(1)
         yield* server.ingestCatalog({ ...catalog, release: "empty", rows: [] })
         const emptied = yield* server.pull(alice, { epoch: before.epoch, cursors: cursors(before) })
         expect(Option.getOrUndefined(Arr.findFirst(emptied.scopes, (s) => s.scope === catalog.scope))).toMatchObject({
@@ -670,7 +763,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
             })
           ))._tag
         ).toBe("Failure")
-        expect(yield* sql`SELECT * FROM echo_catalog_releases`).toHaveLength(2)
+        expect(yield* sql`SELECT * FROM echosync_catalog_releases`).toHaveLength(2)
       })
     )
   )
@@ -683,7 +776,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         const acquiring = yield* Deferred.make<void>()
         const releaseAcquisition = yield* Deferred.make<void>()
         const name = `${sql.config.startupParameters?.["application_name"]}-acquire`
-        const parameters: Record<string, string> = { ...sql.config.startupParameters, echo_invalid_setting: "on" }
+        const parameters: Record<string, string> = { ...sql.config.startupParameters, echosync_invalid_setting: "on" }
         const acquisitionClient = yield* PgClient.make({
           ...sql.config,
           maxConnections: 3,
@@ -701,7 +794,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           Effect.provideService(PgClient.PgClient, acquisitionClient)
         )
         expect((yield* Effect.result(construct))._tag).toBe("Failure")
-        delete parameters["echo_invalid_setting"]
+        delete parameters["echosync_invalid_setting"]
         yield* TestClock.adjust("2 seconds")
         expect(yield* sql`SELECT pid FROM pg_stat_activity WHERE application_name=${name}`).toHaveLength(0)
         blockAcquisition = true
@@ -764,7 +857,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         for (let i = 0; i < 8; i++) {
           yield* server.execute(alice, request(`shared-listener-${i}`))
           yield* nextPoke(first.queue)
-          yield* sql`SELECT pg_notify('echo_changes','presence')`
+          yield* sql`SELECT pg_notify('echosync_changes','presence')`
         }
         // A presence refresh after the data refresh must not overwrite slow reader's sticky Poke.
         yield* Queue.take(first.queue)
@@ -785,7 +878,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         const locker = yield* acquisitionClient
           .withTransaction(
             Effect.gen(function* () {
-              yield* acquisitionClient`LOCK TABLE echo_presence IN ACCESS EXCLUSIVE MODE`
+              yield* acquisitionClient`LOCK TABLE echosync_presence IN ACCESS EXCLUSIVE MODE`
               yield* Deferred.succeed(locked, undefined)
               yield* Deferred.await(unlock)
             })
@@ -810,25 +903,25 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         yield* Scope.close(remoteScope, Exit.void)
         // Unknown notifications and accepted no-ops conservatively wake unrelated readers too.
         yield* Queue.clear(unrelated.queue)
-        yield* sql`SELECT pg_notify('echo_changes','unknown-future-format')`
+        yield* sql`SELECT pg_notify('echosync_changes','unknown-future-format')`
         yield* nextPoke(unrelated.queue)
         yield* server.execute(alice, { epoch: null, clientId: "device", batches: [{ id: "no-op", commands: [] }] })
         yield* nextPoke(unrelated.queue)
-        yield* sql`SELECT pg_notify('echo_changes',(SELECT json_agg('unreadable:' || i)::text FROM generate_series(1,257) AS i))`
+        yield* sql`SELECT pg_notify('echosync_changes',(SELECT json_agg('unreadable:' || i)::text FROM generate_series(1,257) AS i))`
         yield* nextPoke(unrelated.queue)
         // A silent epoch change is discovered by shared maintenance, not a client poll.
         yield* Queue.clear(first.queue)
-        yield* sql`UPDATE echo_engine SET epoch='silent-reset'`
+        yield* sql`UPDATE echosync_engine SET epoch='silent-reset'`
         yield* TestClock.adjust("25 seconds")
         expect((yield* Queue.take(first.queue)).epoch).toBe("silent-reset")
         // Expired connection tokens are not silently revived by batch maintenance.
-        yield* sql`UPDATE echo_connections SET expires_at=now()-interval '1 second' WHERE id=${unrelated.initial.connectionId}`
+        yield* sql`UPDATE echosync_connections SET expires_at=now()-interval '1 second' WHERE id=${unrelated.initial.connectionId}`
         yield* TestClock.adjust("25 seconds")
         expect((yield* Fiber.join(unrelated.fiber))._tag).toBe("Failure")
         // Exhaust the real query pool: refresh must fail by its deadline, not keep streams healthy.
         const blocked = yield* Scope.fork(yield* Effect.scope)
         yield* Scope.provide(sql.reserve, blocked)
-        yield* acquisitionClient`SELECT pg_notify('echo_changes','presence')`
+        yield* acquisitionClient`SELECT pg_notify('echosync_changes','presence')`
         while ((yield* sql.poolStats).pending === 0) yield* Effect.yieldNow
         yield* TestClock.adjust("20 seconds")
         // Socket shutdown is real I/O; wait until the readers actually enter their cleanup deadline.
@@ -837,7 +930,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         for (const reader of readers) expect((yield* Fiber.join(reader.fiber))._tag).toBe("Failure")
         yield* Scope.close(blocked, Exit.void)
         // Failed immediate cleanup is safe: lease expiry clears stale tokens on the next open.
-        yield* sql`UPDATE echo_connections SET expires_at=now()-interval '1 second'`
+        yield* sql`UPDATE echosync_connections SET expires_at=now()-interval '1 second'`
         yield* TestClock.adjust("1 second")
         const recovered = yield* server.changes(alice).pipe(
           Stream.take(1),
@@ -853,7 +946,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         yield* Scope.close(owned, Exit.void)
         expect((yield* Fiber.join(liveAtShutdown.fiber))._tag).toBe("Failure")
         expect((yield* listeners)[0]?.count).toBe(1)
-        expect(yield* sql`SELECT * FROM echo_connections`).toHaveLength(0)
+        expect(yield* sql`SELECT * FROM echosync_connections`).toHaveLength(0)
       }),
       1
     )
@@ -928,7 +1021,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           Layer.provide([FetchHttpClient.layer, RpcSerialization.layerNdjson])
         )
         const denied = yield* Effect.gen(function* () {
-          const client = yield* RpcClient.make(Wire.EchoRpcs)
+          const client = yield* RpcClient.make(Wire.EchoSyncRpcs)
           return yield* Effect.result(client.Execute(request("unauthorized")))
           // oxlint-disable-next-line effecttsgo/strict-effect-provide -- unauthenticated RPC test runtime
         }).pipe(Effect.provide(unauthenticated))
@@ -940,7 +1033,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
             HttpClient.mapRequest(client, HttpClientRequest.setHeader("authorization", "Bearer fixture"))
         }).pipe(Layer.provide([FetchHttpClient.layer, RpcSerialization.layerNdjson]))
         yield* Effect.gen(function* () {
-          const client = yield* RpcClient.make(Wire.EchoRpcs)
+          const client = yield* RpcClient.make(Wire.EchoSyncRpcs)
           const queue = yield* Queue.unbounded<Wire.Change>()
           const fiber = yield* client.Changes({}).pipe(
             Stream.take(2),

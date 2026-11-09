@@ -1,5 +1,5 @@
-import * as Domain from "echo-sync/domain"
-import { Story } from "echo-sync/domain/testing"
+import * as Domain from "echosync/domain"
+import { Story } from "echosync/domain/testing"
 import { idea, ideaAgain, member, noteId, otherNoteId, todo } from "../fixtures.ts"
 import { Note } from "../Note/Note.aggregate.ts"
 import { NoteWritten } from "../Note/WriteNote.command.ts"

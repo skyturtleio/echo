@@ -55,7 +55,7 @@
             ],
             "patterns": [
               {
-                "group": ["**/server", "**/server/**", "echo-sync/server"],
+                "group": ["**/server", "**/server/**", "echosync/server"],
                 "message": "Domain and browser code never import src/server."
               },
               {
@@ -80,13 +80,13 @@
                 "group": [
                   "**/server",
                   "**/server/**",
-                  "echo-sync/server",
+                  "echosync/server",
                   "**/client",
                   "**/client/**",
-                  "echo-sync/client",
+                  "echosync/client",
                   "**/protocol",
                   "**/protocol.ts",
-                  "echo-sync/protocol"
+                  "echosync/protocol"
                 ],
                 "message": "The pure domain layer must not depend on client, server, or wire protocol."
               },

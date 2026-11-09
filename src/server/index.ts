@@ -47,18 +47,54 @@ const sanitize = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
 /** Run explicitly during application migration, never automatically during request handling. */
 export const migrate = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient
-  yield* sql`CREATE TABLE IF NOT EXISTS echo_engine (singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton), epoch text NOT NULL, cursor bigint NOT NULL DEFAULT 0)`
-  yield* sql`INSERT INTO echo_engine(singleton,epoch) VALUES(true,gen_random_uuid()::text) ON CONFLICT DO NOTHING`
-  yield* sql`CREATE TABLE IF NOT EXISTS echo_scopes (scope text PRIMARY KEY,cursor bigint NOT NULL)`
-  yield* sql`CREATE TABLE IF NOT EXISTS echo_streams (aggregate text NOT NULL,id text NOT NULL,scope text NOT NULL,seq integer NOT NULL,state jsonb NOT NULL,PRIMARY KEY(aggregate,id))`
-  yield* sql`CREATE TABLE IF NOT EXISTS echo_events (aggregate text NOT NULL,id text NOT NULL,seq integer NOT NULL,payload jsonb NOT NULL,batch_id text NOT NULL,principal text NOT NULL,at timestamptz NOT NULL,PRIMARY KEY(aggregate,id,seq))`
-  yield* sql`CREATE TABLE IF NOT EXISTS echo_receipts (principal text NOT NULL,client_id text NOT NULL,batch_id text NOT NULL,request jsonb NOT NULL,receipt jsonb NOT NULL,PRIMARY KEY(principal,client_id,batch_id))`
-  yield* sql`CREATE TABLE IF NOT EXISTS echo_catalog_releases (scope text NOT NULL,release text NOT NULL,cursor bigint NOT NULL,PRIMARY KEY(scope,release))`
-  yield* sql`CREATE TABLE IF NOT EXISTS echo_grants (scope text NOT NULL,principal text NOT NULL,role text NOT NULL CHECK(role IN ('reader','writer','owner')),PRIMARY KEY(scope,principal))`
-  yield* sql`CREATE TABLE IF NOT EXISTS echo_grant_events (position bigserial PRIMARY KEY,scope text NOT NULL,subject text NOT NULL,role text,actor text NOT NULL,batch_id text NOT NULL,at timestamptz NOT NULL)`
-  yield* sql`CREATE TABLE IF NOT EXISTS echo_imports (id text PRIMARY KEY,request jsonb NOT NULL)`
-  yield* sql`CREATE TABLE IF NOT EXISTS echo_connections (id text PRIMARY KEY,principal text NOT NULL,expires_at timestamptz NOT NULL)`
-  yield* sql`CREATE TABLE IF NOT EXISTS echo_presence (connection_id text NOT NULL REFERENCES echo_connections(id) ON DELETE CASCADE,room text NOT NULL,client_id text NOT NULL,state jsonb NOT NULL,expires_at timestamptz NOT NULL,PRIMARY KEY(connection_id,room,client_id))`
+  return yield* sql.withTransaction(
+    Effect.gen(function* () {
+      yield* sql`SELECT pg_advisory_xact_lock(hashtextextended('echosync:migrate:' || current_schema(),0))`
+      // One-time in-place naming migration. These source names are not runtime aliases.
+      yield* sql`DO $echosync$
+    DECLARE
+      suffix text;
+      old_name text;
+      new_name text;
+      table_id oid;
+      item record;
+    BEGIN
+      FOREACH suffix IN ARRAY ARRAY['engine','scopes','streams','events','receipts','catalog_releases','grants','grant_events','imports','connections','presence'] LOOP
+        old_name := 'echo_' || suffix;
+        new_name := 'echosync_' || suffix;
+        IF to_regclass(format('%I.%I',current_schema(),old_name)) IS NOT NULL THEN
+          IF to_regclass(format('%I.%I',current_schema(),new_name)) IS NOT NULL THEN
+            RAISE EXCEPTION 'EchoSync naming collision for %', new_name;
+          END IF;
+          EXECUTE format('ALTER TABLE %I.%I RENAME TO %I',current_schema(),old_name,new_name);
+        END IF;
+        table_id := to_regclass(format('%I.%I',current_schema(),new_name));
+        FOR item IN SELECT conname FROM pg_constraint WHERE conrelid=table_id AND starts_with(conname,'echo_') LOOP
+          EXECUTE format('ALTER TABLE %I.%I RENAME CONSTRAINT %I TO %I',current_schema(),new_name,item.conname,'echosync_' || substr(item.conname,6));
+        END LOOP;
+        FOR item IN SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid WHERE i.indrelid=table_id AND starts_with(c.relname,'echo_') LOOP
+          EXECUTE format('ALTER INDEX %I.%I RENAME TO %I',current_schema(),item.relname,'echosync_' || substr(item.relname,6));
+        END LOOP;
+      END LOOP;
+      IF to_regclass(format('%I.echo_grant_events_position_seq',current_schema())) IS NOT NULL THEN
+        EXECUTE format('ALTER SEQUENCE %I.echo_grant_events_position_seq RENAME TO echosync_grant_events_position_seq',current_schema());
+      END IF;
+    END
+  $echosync$`
+      yield* sql`CREATE TABLE IF NOT EXISTS echosync_engine (singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton), epoch text NOT NULL, cursor bigint NOT NULL DEFAULT 0)`
+      yield* sql`INSERT INTO echosync_engine(singleton,epoch) VALUES(true,gen_random_uuid()::text) ON CONFLICT DO NOTHING`
+      yield* sql`CREATE TABLE IF NOT EXISTS echosync_scopes (scope text PRIMARY KEY,cursor bigint NOT NULL)`
+      yield* sql`CREATE TABLE IF NOT EXISTS echosync_streams (aggregate text NOT NULL,id text NOT NULL,scope text NOT NULL,seq integer NOT NULL,state jsonb NOT NULL,PRIMARY KEY(aggregate,id))`
+      yield* sql`CREATE TABLE IF NOT EXISTS echosync_events (aggregate text NOT NULL,id text NOT NULL,seq integer NOT NULL,payload jsonb NOT NULL,batch_id text NOT NULL,principal text NOT NULL,at timestamptz NOT NULL,PRIMARY KEY(aggregate,id,seq))`
+      yield* sql`CREATE TABLE IF NOT EXISTS echosync_receipts (principal text NOT NULL,client_id text NOT NULL,batch_id text NOT NULL,request jsonb NOT NULL,receipt jsonb NOT NULL,PRIMARY KEY(principal,client_id,batch_id))`
+      yield* sql`CREATE TABLE IF NOT EXISTS echosync_catalog_releases (scope text NOT NULL,release text NOT NULL,cursor bigint NOT NULL,PRIMARY KEY(scope,release))`
+      yield* sql`CREATE TABLE IF NOT EXISTS echosync_grants (scope text NOT NULL,principal text NOT NULL,role text NOT NULL CHECK(role IN ('reader','writer','owner')),PRIMARY KEY(scope,principal))`
+      yield* sql`CREATE TABLE IF NOT EXISTS echosync_grant_events (position bigserial PRIMARY KEY,scope text NOT NULL,subject text NOT NULL,role text,actor text NOT NULL,batch_id text NOT NULL,at timestamptz NOT NULL)`
+      yield* sql`CREATE TABLE IF NOT EXISTS echosync_imports (id text PRIMARY KEY,request jsonb NOT NULL)`
+      yield* sql`CREATE TABLE IF NOT EXISTS echosync_connections (id text PRIMARY KEY,principal text NOT NULL,expires_at timestamptz NOT NULL)`
+      yield* sql`CREATE TABLE IF NOT EXISTS echosync_presence (connection_id text NOT NULL REFERENCES echosync_connections(id) ON DELETE CASCADE,room text NOT NULL,client_id text NOT NULL,state jsonb NOT NULL,expires_at timestamptz NOT NULL,PRIMARY KEY(connection_id,room,client_id))`
+    })
+  )
 })
 
 interface Row {
@@ -151,7 +187,7 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
     return yield* new Wire.ServerError({ message: "Duplicate action" })
   const loadGrants = Effect.gen(function* () {
     return yield* Schema.decodeUnknownEffect(Schema.Array(Grant))(
-      yield* sql`SELECT scope,principal,role FROM echo_grants`
+      yield* sql`SELECT scope,principal,role FROM echosync_grants`
     )
   })
   const transaction = <A, E, R>(body: Effect.Effect<A, E, R>) =>
@@ -160,7 +196,7 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
         Effect.gen(function* () {
           yield* sql`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`
           // Even a rejected/no-op batch must invalidate a waiting writer's old MVCC snapshot.
-          yield* sql`UPDATE echo_engine SET cursor=cursor`
+          yield* sql`UPDATE echosync_engine SET cursor=cursor`
           return yield* body
         })
       )
@@ -173,14 +209,14 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
         })
       )
   const engine = Effect.gen(function* () {
-    const rows = yield* sql<Engine>`SELECT epoch,cursor::text FROM echo_engine`
+    const rows = yield* sql<Engine>`SELECT epoch,cursor::text FROM echosync_engine`
     return rows[0] ?? fail("Run EchoSync migrate before serving requests")
   })
   const changed = Effect.fnUntraced(function* (scopes: ReadonlyArray<string>, global: boolean = false) {
-    yield* sql`UPDATE echo_engine SET cursor=cursor+1`
+    yield* sql`UPDATE echosync_engine SET cursor=cursor+1`
     for (const scope of new Set(scopes))
-      yield* sql`INSERT INTO echo_scopes(scope,cursor) SELECT ${scope},cursor FROM echo_engine ON CONFLICT(scope) DO UPDATE SET cursor=EXCLUDED.cursor`
-    yield* sql`SELECT pg_notify('echo_changes',${global ? "" : Changes.notification(scopes)})`
+      yield* sql`INSERT INTO echosync_scopes(scope,cursor) SELECT ${scope},cursor FROM echosync_engine ON CONFLICT(scope) DO UPDATE SET cursor=EXCLUDED.cursor`
+    yield* sql`SELECT pg_notify('echosync_changes',${global ? "" : Changes.notification(scopes)})`
   })
   const execute = Effect.fn("EchoSync.Execute")(function* (principal: Principal, request: Wire.ExecuteRequest) {
     const now = yield* DateTime.now
@@ -194,7 +230,7 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
           const prior = yield* sql<{
             readonly receipt: unknown
             readonly same: boolean
-          }>`SELECT receipt, request = ${sql.json(batch)} AS same FROM echo_receipts WHERE principal=${principal} AND client_id=${request.clientId} AND batch_id=${batch.id}`
+          }>`SELECT receipt, request = ${sql.json(batch)} AS same FROM echosync_receipts WHERE principal=${principal} AND client_id=${request.clientId} AND batch_id=${batch.id}`
           if (prior[0] !== undefined) {
             if (!prior[0].same)
               return yield* new Wire.ServerError({ message: "Batch id reused with different commands" })
@@ -220,7 +256,7 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
                 return yield* new Wire.ServerError({ message: "Action cannot include commands" })
               const action = actions.get(batch.action.name)
               if (action === undefined) return yield* new Wire.ServerError({ message: "Unknown action" })
-              const stored = yield* sql<Row>`SELECT aggregate,id,scope,seq,state FROM echo_streams WHERE ${sql.in(
+              const stored = yield* sql<Row>`SELECT aggregate,id,scope,seq,state FROM echosync_streams WHERE ${sql.in(
                 "aggregate",
                 Arr.map(action.reads, (a) => a.tag)
               )}`
@@ -286,7 +322,7 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
               }
               // Targets include hidden rows for authorization; declared reads include only visible scopes.
               // Load per command so an earlier rejection still wins over a malformed later command.
-              const stored = yield* sql<Row>`SELECT aggregate,id,scope,seq,state FROM echo_streams
+              const stored = yield* sql<Row>`SELECT aggregate,id,scope,seq,state FROM echosync_streams
                 WHERE (aggregate=${a.tag} AND id=${command.target})
                    OR (${sql.in("aggregate", [...readTags])} AND (scope=${privateScope(principal)} OR scope LIKE 'catalog:%' OR ${sql.in(
                      "scope",
@@ -408,18 +444,18 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
               const subject = change.kind === "grant" ? change.grant.principal : change.principal
               const role = change.kind === "grant" ? change.grant.role : null
               if (role === null) {
-                yield* sql`DELETE FROM echo_grants WHERE scope=${scope} AND principal=${subject}`
-                yield* sql`DELETE FROM echo_presence p USING echo_connections c WHERE p.connection_id=c.id AND p.room=${scope} AND c.principal=${subject}`
+                yield* sql`DELETE FROM echosync_grants WHERE scope=${scope} AND principal=${subject}`
+                yield* sql`DELETE FROM echosync_presence p USING echosync_connections c WHERE p.connection_id=c.id AND p.room=${scope} AND c.principal=${subject}`
               } else
-                yield* sql`INSERT INTO echo_grants VALUES(${scope},${subject},${role}) ON CONFLICT(scope,principal) DO UPDATE SET role=EXCLUDED.role`
-              yield* sql`INSERT INTO echo_grant_events(scope,subject,role,actor,batch_id,at) VALUES(${scope},${subject},${role},${principal},${batch.id},${DateTime.formatIso(now)})`
+                yield* sql`INSERT INTO echosync_grants VALUES(${scope},${subject},${role}) ON CONFLICT(scope,principal) DO UPDATE SET role=EXCLUDED.role`
+              yield* sql`INSERT INTO echosync_grant_events(scope,subject,role,actor,batch_id,at) VALUES(${scope},${subject},${role},${principal},${batch.id},${DateTime.formatIso(now)})`
             }
           }
           for (const event of planned.events)
-            yield* sql`INSERT INTO echo_events VALUES (${event.aggregate},${event.id},${event.seq},${sql.json(event.payload)},${batch.id},${principal},${DateTime.formatIso(now)})`
+            yield* sql`INSERT INTO echosync_events VALUES (${event.aggregate},${event.id},${event.seq},${sql.json(event.payload)},${batch.id},${principal},${DateTime.formatIso(now)})`
           for (const row of planned.touched)
-            yield* sql`INSERT INTO echo_streams VALUES (${row.aggregate},${row.id},${row.scope},${row.seq},${sql.json(yield* encode(aggregate(row.aggregate).definition.state, row.state))}) ON CONFLICT(aggregate,id) DO UPDATE SET scope=EXCLUDED.scope,seq=EXCLUDED.seq,state=EXCLUDED.state`
-          yield* sql`INSERT INTO echo_receipts VALUES (${principal},${request.clientId},${batch.id},${sql.json(batch)},${sql.json(planned.receipt)})`
+            yield* sql`INSERT INTO echosync_streams VALUES (${row.aggregate},${row.id},${row.scope},${row.seq},${sql.json(yield* encode(aggregate(row.aggregate).definition.state, row.state))}) ON CONFLICT(aggregate,id) DO UPDATE SET scope=EXCLUDED.scope,seq=EXCLUDED.seq,state=EXCLUDED.state`
+          yield* sql`INSERT INTO echosync_receipts VALUES (${principal},${request.clientId},${batch.id},${sql.json(batch)},${sql.json(planned.receipt)})`
           if (planned.receipt._tag === "Accepted") yield* changed([...changedScopes], grantChanges.length > 0)
           return { epoch: current.epoch, receipt: planned.receipt, fresh: true }
         })
@@ -457,7 +493,7 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
         const positions = yield* sql<{
           readonly scope: string
           readonly cursor: string
-        }>`SELECT scope,cursor::text FROM echo_scopes WHERE scope=${privateScope(principal)} OR scope LIKE 'catalog:%' OR ${sql.in(
+        }>`SELECT scope,cursor::text FROM echosync_scopes WHERE scope=${privateScope(principal)} OR scope LIKE 'catalog:%' OR ${sql.in(
           "scope",
           Arr.map(grants, (g) => g.scope)
         )}`
@@ -469,7 +505,7 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
         for (const [scope, cursor] of scopes) {
           const reset = request.cursors[scope] !== cursor
           const rows = reset
-            ? yield* sql<Row>`SELECT aggregate,id,scope,seq,state FROM echo_streams WHERE scope=${scope}`
+            ? yield* sql<Row>`SELECT aggregate,id,scope,seq,state FROM echosync_streams WHERE scope=${scope}`
             : []
           result.push({
             scope,
@@ -505,15 +541,15 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
             return { ...row, state: yield* encode(a.definition.state, state) }
           })
         )
-        const existing = yield* sql<Row>`SELECT aggregate,id,scope,seq,state FROM echo_streams`
+        const existing = yield* sql<Row>`SELECT aggregate,id,scope,seq,state FROM echosync_streams`
         for (const row of rows)
           if (Arr.some(existing, (r) => r.aggregate === row.aggregate && r.id === row.id && r.scope !== catalog.scope))
             return yield* new Wire.ServerError({ message: "Catalog id belongs to another scope" })
-        yield* sql`DELETE FROM echo_streams WHERE scope=${catalog.scope}`
+        yield* sql`DELETE FROM echosync_streams WHERE scope=${catalog.scope}`
         for (const row of rows)
-          yield* sql`INSERT INTO echo_streams VALUES (${row.aggregate},${row.id},${catalog.scope},${(Option.getOrUndefined(Arr.findFirst(existing, (r) => r.aggregate === row.aggregate && r.id === row.id))?.seq ?? 0) + 1},${sql.json(row.state)})`
+          yield* sql`INSERT INTO echosync_streams VALUES (${row.aggregate},${row.id},${catalog.scope},${(Option.getOrUndefined(Arr.findFirst(existing, (r) => r.aggregate === row.aggregate && r.id === row.id))?.seq ?? 0) + 1},${sql.json(row.state)})`
         yield* changed([catalog.scope])
-        yield* sql`INSERT INTO echo_catalog_releases(scope,release,cursor) SELECT ${catalog.scope},${catalog.release},cursor FROM echo_engine`
+        yield* sql`INSERT INTO echosync_catalog_releases(scope,release,cursor) SELECT ${catalog.scope},${catalog.release},cursor FROM echosync_engine`
       })
     )
   }, protect("ingestCatalog"))
@@ -528,7 +564,7 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
     // Composes with an application's migration transaction; do not change its isolation level.
     return yield* sql.withTransaction(
       Effect.gen(function* () {
-        yield* sql`UPDATE echo_engine SET cursor=cursor`
+        yield* sql`UPDATE echosync_engine SET cursor=cursor`
         const canonical: Array<ImportedStream> = []
         for (const stream of input.streams) {
           const a = aggregate(stream.aggregate)
@@ -551,14 +587,15 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
         const request = { ...input, streams: canonical }
         const prior = yield* sql<{
           readonly same: boolean
-        }>`SELECT request=${sql.json(request)} AS same FROM echo_imports WHERE id=${input.id}`
+        }>`SELECT request=${sql.json(request)} AS same FROM echosync_imports WHERE id=${input.id}`
         if (prior[0] !== undefined) {
           if (!prior[0].same) return yield* new Wire.ServerError({ message: "Import identity conflict" })
           return
         }
         const scopes = new Set<string>()
         for (const stream of canonical) {
-          const exists = yield* sql`SELECT 1 FROM echo_streams WHERE aggregate=${stream.aggregate} AND id=${stream.id}`
+          const exists =
+            yield* sql`SELECT 1 FROM echosync_streams WHERE aggregate=${stream.aggregate} AND id=${stream.id}`
           if (exists.length > 0) return yield* new Wire.ServerError({ message: "Import stream already exists" })
           const a = aggregate(stream.aggregate)
           let state = a.definition.initial
@@ -575,31 +612,31 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
             const event = yield* decode(schema, payload)
             state = (a.definition.evolve[tag] ?? fail("Missing evolve handler"))(state, event)
             seq++
-            yield* sql`INSERT INTO echo_events VALUES(${a.tag},${stream.id},${seq},${sql.json(payload)},${input.id},${input.principal},${DateTime.formatIso(now)})`
+            yield* sql`INSERT INTO echosync_events VALUES(${a.tag},${stream.id},${seq},${sql.json(payload)},${input.id},${input.principal},${DateTime.formatIso(now)})`
           }
           const scope = a.definition.scope(state)
           if (scope === null || Str.startsWith("catalog:")(scope))
             return yield* new Wire.ServerError({ message: "Import requires noncatalog scope" })
-          yield* sql`INSERT INTO echo_streams VALUES(${a.tag},${stream.id},${scope},${seq},${sql.json(yield* encode(a.definition.state, state))})`
+          yield* sql`INSERT INTO echosync_streams VALUES(${a.tag},${stream.id},${scope},${seq},${sql.json(yield* encode(a.definition.state, state))})`
           scopes.add(scope)
         }
         for (const value of input.grants ?? []) {
           const grant = yield* Schema.decodeEffect(Grant)(value)
           if (Str.startsWith("user:")(grant.scope) || Str.startsWith("catalog:")(grant.scope))
             return yield* new Wire.ServerError({ message: "Intrinsic scope grants cannot change" })
-          yield* sql`INSERT INTO echo_grants VALUES(${grant.scope},${grant.principal},${grant.role})`
-          yield* sql`INSERT INTO echo_grant_events(scope,subject,role,actor,batch_id,at) VALUES(${grant.scope},${grant.principal},${grant.role},${input.principal},${input.id},${DateTime.formatIso(now)})`
+          yield* sql`INSERT INTO echosync_grants VALUES(${grant.scope},${grant.principal},${grant.role})`
+          yield* sql`INSERT INTO echosync_grant_events(scope,subject,role,actor,batch_id,at) VALUES(${grant.scope},${grant.principal},${grant.role},${input.principal},${input.id},${DateTime.formatIso(now)})`
           scopes.add(grant.scope)
         }
-        yield* sql`INSERT INTO echo_imports VALUES(${input.id},${sql.json(request)})`
+        yield* sql`INSERT INTO echosync_imports VALUES(${input.id},${sql.json(request)})`
         if (scopes.size > 0) yield* changed([...scopes], (input.grants?.length ?? 0) > 0)
       })
     )
   }, protect("importStreams"))
   const resetEpoch = transaction(
     Effect.gen(function* () {
-      yield* sql`UPDATE echo_engine SET epoch=gen_random_uuid()::text,cursor=cursor+1`
-      yield* sql`SELECT pg_notify('echo_changes','')`
+      yield* sql`UPDATE echosync_engine SET epoch=gen_random_uuid()::text,cursor=cursor+1`
+      yield* sql`SELECT pg_notify('echosync_changes','')`
       return (yield* engine).epoch
     })
   ).pipe(protect("resetEpoch"))
@@ -613,7 +650,7 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
         yield* sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY`
         const grants = yield* loadGrants
         const rows =
-          yield* sql<Row>`SELECT aggregate,id,scope,seq,state FROM echo_streams WHERE aggregate=${ref.tag} AND id=${id}`
+          yield* sql<Row>`SELECT aggregate,id,scope,seq,state FROM echosync_streams WHERE aggregate=${ref.tag} AND id=${id}`
         const row = rows[0]
         if (row === undefined) return null
         const state = yield* decode(ref.definition.state, row.state)
@@ -628,20 +665,20 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
     yield* transaction(
       Effect.gen(function* () {
         const connection =
-          yield* sql`SELECT 1 FROM echo_connections WHERE id=${request.connectionId} AND principal=${principal} AND expires_at>now()`
+          yield* sql`SELECT 1 FROM echosync_connections WHERE id=${request.connectionId} AND principal=${principal} AND expires_at>now()`
         if (connection.length === 0) return yield* new Wire.ServerError({ message: "Presence connection expired" })
         if (!canRead(principal, Scope.make(request.room), yield* loadGrants))
           return yield* new Wire.ServerError({ message: "Presence scope forbidden" })
         if (request.state === null)
-          yield* sql`DELETE FROM echo_presence WHERE connection_id=${request.connectionId} AND room=${request.room} AND client_id=${request.clientId}`
+          yield* sql`DELETE FROM echosync_presence WHERE connection_id=${request.connectionId} AND room=${request.room} AND client_id=${request.clientId}`
         else {
-          yield* sql`DELETE FROM echo_presence WHERE expires_at<now()`
+          yield* sql`DELETE FROM echosync_presence WHERE expires_at<now()`
           const rows =
-            yield* sql`SELECT 1 FROM echo_presence WHERE connection_id=${request.connectionId} AND NOT (room=${request.room} AND client_id=${request.clientId})`
+            yield* sql`SELECT 1 FROM echosync_presence WHERE connection_id=${request.connectionId} AND NOT (room=${request.room} AND client_id=${request.clientId})`
           if (rows.length >= 64) return yield* new Wire.ServerError({ message: "Presence room limit" })
-          yield* sql`INSERT INTO echo_presence VALUES(${request.connectionId},${request.room},${request.clientId},${sql.json(request.state)},now()+interval '60 seconds') ON CONFLICT(connection_id,room,client_id) DO UPDATE SET state=EXCLUDED.state,expires_at=EXCLUDED.expires_at`
+          yield* sql`INSERT INTO echosync_presence VALUES(${request.connectionId},${request.room},${request.clientId},${sql.json(request.state)},now()+interval '60 seconds') ON CONFLICT(connection_id,room,client_id) DO UPDATE SET state=EXCLUDED.state,expires_at=EXCLUDED.expires_at`
         }
-        yield* sql`SELECT pg_notify('echo_changes','presence')`
+        yield* sql`SELECT pg_notify('echosync_changes','presence')`
       })
     )
   }, protect("Presence"))
@@ -656,13 +693,13 @@ export const httpApp = Effect.fnUntraced(function* <E, R>(
 ) {
   const request = yield* HttpServerRequest.HttpServerRequest
   const principal = yield* authenticate(request)
-  const handlers = Wire.EchoRpcs.toLayer({
+  const handlers = Wire.EchoSyncRpcs.toLayer({
     Execute: (input) => server.execute(principal, input),
     Pull: (input) => server.pull(principal, input),
     Changes: () => server.changes(principal),
     Presence: (input) => server.presence(principal, input)
   })
-  const app = yield* RpcServer.toHttpEffect(Wire.EchoRpcs).pipe(
+  const app = yield* RpcServer.toHttpEffect(Wire.EchoSyncRpcs).pipe(
     Effect.provide([handlers, RpcSerialization.layerNdjson])
   )
   return yield* app

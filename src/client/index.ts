@@ -132,7 +132,7 @@ export const httpTransport = Effect.fnUntraced(function* (
   )
   // RPC fibers use the caller's Scope; these unbatched HTTP/Fetch layers acquire no lasting resources.
   // oxlint-disable-next-line effecttsgo/strict-effect-provide -- only the resource-free protocol layer's build scope closes here; RPC lifetime uses the caller's Scope
-  const rpc = yield* RpcClient.make(Protocol.EchoRpcs).pipe(Effect.provide(protocol))
+  const rpc = yield* RpcClient.make(Protocol.EchoSyncRpcs).pipe(Effect.provide(protocol))
   return {
     execute: (request) =>
       rpc.Execute(request).pipe(
@@ -171,8 +171,8 @@ export const resetProfile = Effect.fn("EchoSync.resetProfile")(function* (option
     Storage.withLock(
       namespace,
       Effect.gen(function* () {
-        const journalDb = yield* Storage.openDatabase(`echo:journal:${namespace}`, options.compatibilityGeneration)
-        const replicaDb = yield* Storage.openDatabase(`echo:replica:${namespace}`, options.compatibilityGeneration)
+        const journalDb = yield* Storage.openDatabase(`echosync:journal:${namespace}`, options.compatibilityGeneration)
+        const replicaDb = yield* Storage.openDatabase(`echosync:replica:${namespace}`, options.compatibilityGeneration)
         const saved = yield* Storage.load(journalDb)
         const journal = saved === undefined ? undefined : yield* Schema.decodeUnknownEffect(Model.Journal)(saved)
         const count = Arr.filter(journal?.intents ?? [], (intent) => intent.phase !== "Rejected").length
@@ -181,7 +181,7 @@ export const resetProfile = Effect.fn("EchoSync.resetProfile")(function* (option
         yield* Effect.uninterruptible(
           Effect.gen(function* () {
             yield* Storage.save(journalDb, undefined)
-            const channel = new BroadcastChannel(`echo:${namespace}`)
+            const channel = new BroadcastChannel(`echosync:${namespace}`)
             // Peers check durable identity rather than withdrawing a newly opened generation.
             channel.postMessage("replica")
             channel.close()
@@ -212,11 +212,11 @@ export const open = Effect.fnUntraced(function* (options: Options) {
       )
   const namespace = profileNamespace(options)
   const channel = yield* Effect.acquireRelease(
-    Effect.sync(() => new BroadcastChannel(`echo:${namespace}`)),
+    Effect.sync(() => new BroadcastChannel(`echosync:${namespace}`)),
     (value) => Effect.sync(() => value.close())
   )
-  const journalDb = yield* Storage.openDatabase(`echo:journal:${namespace}`, options.compatibilityGeneration)
-  const replicaDb = yield* Storage.openDatabase(`echo:replica:${namespace}`, options.compatibilityGeneration)
+  const journalDb = yield* Storage.openDatabase(`echosync:journal:${namespace}`, options.compatibilityGeneration)
+  const replicaDb = yield* Storage.openDatabase(`echosync:replica:${namespace}`, options.compatibilityGeneration)
   const hydrated = yield* Storage.withLock(
     namespace,
     Effect.gen(function* () {

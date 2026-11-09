@@ -1,10 +1,10 @@
 /**
- * `echo-sync/domain`: the building blocks an app's domain package is written against (design §1).
+ * `echosync/domain`: the building blocks an app's domain package is written against (design §1).
  * Every block is `Domain.<Noun>(...)` and its types live on the same name
  * (`Domain.Event.Any`, `Domain.Aggregate.StateOf<typeof Note>`), as in Alchemy.
  *
  * ```ts
- * import * as Domain from "echo-sync/domain"
+ * import * as Domain from "echosync/domain"
  *
  * export class TagRemoved extends Domain.Event("TagRemoved", {}) {}
  * ```
@@ -73,5 +73,5 @@ export const Aggregate = AggregateModule.make
 /** Principals, scopes, the Phase 0 grant rule and the engine's `ScopeForbidden` (design §1). */
 export * as Scope from "./Scope.ts"
 
-/** The pure story runner; `echo-sync/domain/testing` binds it to vitest. */
+/** The pure story runner; `echosync/domain/testing` binds it to vitest. */
 export * as Story from "./Story.ts"

@@ -1,22 +1,19 @@
 # EchoSync — an aggregate-based, offline-first sync engine for Effect v4 + FoldKit
 
 Status: design, 2026-10-29; cut to its five jobs 2026-10-30 (§2 item 13). This repository
-(`skyturtleio/echo-sync`, package `echo-sync`, formerly `skyturtleio/echo` / `echo`) replaces
-the legacy engine that previously occupied `skyturtleio/echo-sync`. That legacy engine's
+(`skyturtleio/echosync`, package `echosync`) replaces a separate retired engine. That legacy engine's
 code and SPEC are the previous design and are not references (§5).
 The vocabulary is `@alchemy.run/domain`'s.
 
-**Naming** (2026-11-08). EchoSync is the display name; `echo-sync` is the repository and
-package name; `echosync` / `ECHOSYNC` are the target storage, SQL and environment prefixes.
-Code identifiers use `EchoSync`. Permanent old-name aliases are not the target design.
-The initial package/branding rename did not migrate durable data: existing `echo` SQL
-tables/notifications, IndexedDB names, Web Locks, BroadcastChannels, profile namespaces,
-protocol symbols and environment variables are unfinished cutover work. Renaming those
-requires coordinating server data, browser journals and older clients before switching
-names; do not strand offline intents or run split coordination namespaces. The current
-cosmetic follow-up changes error text, trace labels and the scenario page title only.
-Consumers retain their existing engine commit until they explicitly adopt a new pin;
-renaming the dependency key alone does not upgrade engine code.
+**Naming** (2026-11-09). EchoSync is the display name and PascalCase identifier prefix;
+`echosync` is the repository, package, import and lowercase namespace. SQL objects and
+notifications use `echosync_`; IndexedDB, Web Locks and BroadcastChannels use `echosync:`;
+environment variables use `ECHOSYNC_`. There are no old-name runtime aliases. `Server.migrate`
+transactionally renames existing engine database objects in place before canonical DDL
+(§2 item 35). Apps adopt the new engine pin, canonicalize their own metadata, and remove
+the old transport endpoint in the same deployment. Browser profiles deliberately start
+fresh at this owner-authorized, noncritical-data cutover: old offline intents are not imported.
+Subsequent reload/reset durability promises apply within the canonical namespace.
 
 This document has five jobs and nothing else: the **model** (§1, what the engine is), the
 **decisions** (§2, why, with what each was chosen over), the **invariants catalogue** (§3, what
@@ -34,7 +31,7 @@ Device-decides logs (Effect `eventlog`, LiveStore) cannot refuse a write, and on
 engines cannot write before their first sync; this design is the remaining quadrant.
 
 **Domain package.** An app is a domain package (one block per file, a folder per aggregate,
-importing only `effect` and `echo-sync/domain`) plus thin server and client wiring. The blocks:
+importing only `effect` and `echosync/domain`) plus thin server and client wiring. The blocks:
 
 | Block | Shape |
 |---|---|
@@ -44,7 +41,7 @@ importing only `effect` and `echo-sync/domain`) plus thin server and client wiri
 | `Aggregate` | `id`, `state` schema (`null` while the stream has no events), `initial`, `commands`, `scope(state)`, `indexes`, `decide` and `evolve` as one handler per tag (§2 item 7) |
 | `Index` | `Domain.Index(id, state, spec)`, field lists over state, bound to the aggregate and exposed as statics (§2 item 9) |
 | `Scope` | `Principal`, `Scope` (opaque id), `privateScope`, `catalogScope`, the pre-grants rule, and `ScopeForbidden` (§2 item 8) |
-| `Story` | the domain test: *given* events (one stream, or several seeded with `Story.stream(Aggregate, id, events)`), *when* command, *as* principal, *then* events or rejection; pure runner in `echo-sync/domain`, vitest binding in `echo-sync/domain/testing` (§2 item 10) |
+| `Story` | the domain test: *given* events (one stream, or several seeded with `Story.stream(Aggregate, id, events)`), *when* command, *as* principal, *then* events or rejection; pure runner in `echosync/domain`, vitest binding in `echosync/domain/testing` (§2 item 10) |
 | `Policy`, `Batch`, versioning | server-side reaction to events; several commands committed atomically under one id; `(name, version)` on events, state and commands with upcasters. Not built yet (§4) |
 
 `decide` is pure and sees only its stream's state, the command and `ctx = { principal, now,
@@ -166,7 +163,7 @@ whether or not the app uses presence.
 **FoldKit integration.** Apps use the framework's real branded `Command.define`,
 `Subscription.make` and `ManagedResource` constructors. `Client.open` hydrates offline and
 owns a scoped connection loop by default (`autoConnect: false` selects manual sync); there
-is no public `connect` method or `echo-sync/foldkit` adapter. Closing the client releases storage,
+is no public `connect` method or `echosync/foldkit` adapter. Closing the client releases storage,
 connection and profile lock and ends query/status/notice streams. Apps still gate late messages
 by readiness and resource generation.
 
@@ -212,7 +209,7 @@ behaviour adds or amends an item here in the same branch.
    match. Rejected: `Match.valueTags`, which needs the union assembled at the call site and
    gives one return type for all branches. Additional aggregate `events` also contribute
    evolution handlers and historical Story inputs (item 21), never command outputs.
-8. **`ScopeForbidden`, `Principal`, `Scope` and the pre-grants rule live in `echo-sync/domain`**
+8. **`ScopeForbidden`, `Principal`, `Scope` and the pre-grants rule live in `echosync/domain`**
    (Phase 0, 2026-10-29), not in an engine module. Writing the ownership story showed the check
    is the same for every aggregate and depends only on `scope(state)` and the principal's
    grants, so it is the engine's job; a story asserts the rejection, so the domain package must
@@ -226,7 +223,7 @@ behaviour adds or amends an item here in the same branch.
    of its own aggregate in `reads`, and the aggregate imports its commands, so an index declared
    only inside the aggregate would be an import cycle. Rejected: `indexes: {...}` inline only,
    which would make own-aggregate `reads` strings or late-bound thunks.
-10. **The story runner is pure and lives in `echo-sync/domain`; `echo-sync/domain/testing` binds it to
+10. **The story runner is pure and lives in `echosync/domain`; `echosync/domain/testing` binds it to
     vitest** (Phase 0, 2026-10-29). `given` is a list (the target stream) or seeds
     `Story.stream(Aggregate, id, events)`; seeded streams must belong to the aggregate under
     test or to a declared read; `ctx.read` answers only declared reads and only streams the
@@ -558,6 +555,20 @@ behaviour adds or amends an item here in the same branch.
     SQL retries match the driver's `SerializationError` and `DeadlockError` reasons, preserving
     the existing eight-retry limit rather than broadening to every retryable SQL error.
 
+35. **One canonical name, with a transactional database cutover and no runtime aliases**
+    (2026-11-09). Use EchoSync / `echosync` throughout source, imports, SQL, browser namespaces,
+    environment and tooling. The engine's explicit `migrate` transaction renames its eleven
+    existing tables, their constraints/indexes and the grant-event sequence, preserving rows,
+    receipt/import identities, epoch/cursors and sequence ownership. A collision fails the
+    entire migration rather than merging or silently hiding either dataset. Repeat runs and
+    fresh databases converge on the same canonical schema; only this migration and its fixture
+    may name source objects. Apps own their migration ledgers and metadata. Deploy new pins
+    with canonical profiles and transport paths, removing old request routes so stale bundles
+    cannot write through a separate coordination namespace. The owner explicitly accepts a
+    fresh browser namespace and abandoned old offline work for this noncritical-data cutover.
+    Do not use this one-time exception to weaken normal journal durability. Rejected: permanent
+    aliases, dual reads/writes, three app copies of engine DDL, and a browser compatibility bridge.
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -627,6 +638,9 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
   Unrelated private-scope writes do not poke other readers. Closing a reader preserves its peers;
   closing the server releases its listener and terminates its streams. Shared lease/epoch/presence
   refresh performs no per-reader snapshot transactions and refuses expired connection tokens.
+- **INV-SERVER-11:** Explicit naming migration preserves all engine rows, epoch/cursors,
+  receipt/import identity and sequence ownership under canonical SQL names, atomically and
+  idempotently. Colliding source/destination objects fail without partially renaming the schema.
 - **INV-CLIENT-1:** Journal survives offline reload and replica reset. Persisted positions
   are nonnegative safe integers; intent times are finite milliseconds within the inclusive
   Date range, including negative and fractional values. Malformed numbers fail snapshot
@@ -667,7 +681,7 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
 
 ## 4. Phases
 
-0. **Domain building blocks and the fixture domain, no engine.** Done 2026-10-30: `echo-sync/domain`
+0. **Domain building blocks and the fixture domain, no engine.** Done 2026-10-30: `echosync/domain`
    (`src/domain`) and `examples/fixture/domain` (item 14): `Note` and `Tag`, five stories, one
    per engine surface a domain can touch (an accepted command and its scope stamp, a read by
    id across scopes, `ScopeForbidden`, a read over an own index, a read over another
@@ -693,8 +707,7 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
 
 ## 5. Working rules
 
-**Clean start.** This repository is not a branch of the legacy engine formerly named
-`echo-sync` (the repository name is now reused); the old engine stays frozen
+**Clean start.** This repository is not a branch of the separate retired engine; that engine stays frozen
 for the current apps until each is ported. Nothing was copied from it but the environment
 scripts and toolchain configuration, which are generic. The old engine, its SPEC and the
 apps' sync code are not references and are not read (`AGENTS.md`); the inputs are this

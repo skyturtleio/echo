@@ -7,8 +7,7 @@ the invariants catalogue (§3), the phase plan (§4) and the working rules (§5)
 
 ## Not references
 
-This repository (formerly `skyturtleio/echo`) replaces the legacy engine that previously
-occupied `skyturtleio/echo-sync`, not this repository's current design. That legacy engine,
+This repository replaces a separate retired engine, not this repository's current design. That legacy engine,
 its `docs/SPEC.md`, and the
 sync code of the owner's two private apps written against it (a shared one and a single-user
 one) are the previous design. Do not read them, clone them, or borrow from
@@ -23,21 +22,21 @@ in `node_modules/effect/src/**` and `node_modules/@effect/*`.
 
 ## Repo shape
 
-- The repository root is the package (`echo-sync`), consumed as a git dependency pinned to a
+- The repository root is the package (`echosync`), consumed as a git dependency pinned to a
   commit SHA; it ships TypeScript source, no build step, no npm publish.
-- Current entry points are `echo-sync/domain`, `echo-sync/domain/testing`, `echo-sync/protocol`,
-  `echo-sync/server`, and `echo-sync/client` (see `package.json`). Domain rules are pure and do not
+- Current entry points are `echosync/domain`, `echosync/domain/testing`, `echosync/protocol`,
+  `echosync/server`, and `echosync/client` (see `package.json`). Domain rules are pure and do not
   import client, server, or protocol code. Client code never imports server code or server
   platform packages. No engine entry point imports a UI framework; examples may do so.
   Tabs run queries locally and coordinate IndexedDB writes with Web Locks; one elected tab
   owns networking. A worker implementation, FoldKit adapter, and policies remain deferred;
   historical proposals in design §1 are not instructions to add them.
-- Naming: use `EchoSync` for display names and identifiers, `echo-sync` for the package,
-  import paths and repository, and `echosync` / `ECHOSYNC` for storage, SQL and environment
-  prefixes. Do not introduce permanent old-name aliases. Existing `echo` storage and API
-  names are unfinished migration work, not the desired convention. Replace them through
-  an explicitly coordinated data/client cutover, never a cosmetic search-and-replace that
-  strands journals or splits old and new clients' coordination.
+- Naming: use `EchoSync` for display/PascalCase identifiers, `echosync` for the package,
+  imports, repository and lowercase namespaces, and `ECHOSYNC_` for environment variables.
+  SQL uses `echosync_`; browser storage/coordination uses `echosync:`. No old-name runtime
+  aliases. Source names belong only in the one-time database migration and its regression
+  fixture. The coordinated cutover deliberately starts fresh browser profiles and removes
+  old transport routes (§2 item 35); normal journal durability remains unchanged afterward.
 - Runtime: Bun. Tooling: TypeScript strict (`exactOptionalPropertyTypes`,
   `noUncheckedIndexedAccess`), `oxlint`, `oxfmt`, `vitest` + `@effect/vitest`.
 - Runtime dependencies are Effect packages only, exact-pinned to one version.
@@ -104,7 +103,7 @@ name cites no existing `INV` id and is not a `Story`.
 
 - `.agents/setup` installs locked dependencies and prepares a disposable PostgreSQL 18 on
   `127.0.0.1:5432` with trust auth; `.agents/resume` makes sure it is running via
-  `.amp/services.yaml`. Any machine with Bun and a PostgreSQL reachable at `ECHO_PG_URL`
+  `.amp/services.yaml`. Any machine with Bun and a PostgreSQL reachable at `ECHOSYNC_PG_URL`
   works the same way.
 - `bun run check` is the infrastructure-free gate (test declarations, types, lint, format,
   Stories). `bun run check:integration` separately runs the existing Postgres and browser

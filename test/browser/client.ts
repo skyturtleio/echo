@@ -148,7 +148,7 @@ const prepareReload = Effect.fnUntraced(function* (profile: string) {
     writable: true,
     value: function (this: IDBDatabase, ...args: Parameters<typeof original>) {
       const tx = original.call(this, ...args)
-      if (Str.startsWith("echo:journal:")(this.name) && args[1] === "readwrite" && ++journalWrites === 2)
+      if (Str.startsWith("echosync:journal:")(this.name) && args[1] === "readwrite" && ++journalWrites === 2)
         queueMicrotask(() => tx.abort())
       return tx
     }
@@ -182,8 +182,8 @@ const verifyReload = (profile: string) =>
       // IndexedDB structured clone preserves non-finite numbers; JSON fixtures would hide this corruption.
       const numericProfile = `${profile}-numbers`
       const namespace = `${encodeURIComponent(numericProfile)}:${encodeURIComponent(principal)}`
-      const journalDb = yield* Storage.openDatabase(`echo:journal:${namespace}`)
-      const replicaDb = yield* Storage.openDatabase(`echo:replica:${namespace}`)
+      const journalDb = yield* Storage.openDatabase(`echosync:journal:${namespace}`)
+      const replicaDb = yield* Storage.openDatabase(`echosync:replica:${namespace}`)
       const intent: Model.Intent = {
         id: "numeric-intent",
         commands: [{ aggregate: "Counter", command: { _tag: "Add", target: "one", amount: 2 } }],
@@ -408,7 +408,7 @@ const rebaseAndEpoch = (profile: string) =>
             writable: true,
             value: function (this: IDBDatabase, ...args: Parameters<typeof original>) {
               const tx = original.call(this, ...args)
-              if (abortReplica && Str.startsWith("echo:replica:")(this.name) && args[1] === "readwrite") {
+              if (abortReplica && Str.startsWith("echosync:replica:")(this.name) && args[1] === "readwrite") {
                 abortReplica = false
                 queueMicrotask(() => tx.abort())
               }
@@ -510,8 +510,8 @@ const rebaseAndEpoch = (profile: string) =>
           value: function (this: IDBDatabase, ...args: Parameters<typeof transaction>) {
             const tx = transaction.call(this, ...args)
             if (args[1] === "readwrite" && remoteValue !== 0) {
-              if (Str.startsWith("echo:replica:")(this.name)) armed = true
-              else if (armed && !aborted && Str.startsWith("echo:journal:")(this.name)) {
+              if (Str.startsWith("echosync:replica:")(this.name)) armed = true
+              else if (armed && !aborted && Str.startsWith("echosync:journal:")(this.name)) {
                 aborted = true
                 queueMicrotask(() => tx.abort())
               }
@@ -878,7 +878,7 @@ const queries = (profile: string) =>
         value: function (this: IDBObjectStore, key: IDBValidKey | IDBKeyRange) {
           if (key === "snapshot") {
             snapshotReads++
-            if (Str.startsWith("echo:replica:")(this.transaction.db.name)) replicaReads++
+            if (Str.startsWith("echosync:replica:")(this.transaction.db.name)) replicaReads++
           }
           return get.call(this, key)
         }
@@ -953,7 +953,7 @@ const queries = (profile: string) =>
       // A peer can replace a same-sized snapshot without changing revision or seq.
       // Exercise refresh without BroadcastChannel, not just Pull's in-memory path.
       const namespace = `${encodeURIComponent(`${profile}-references`)}:${encodeURIComponent(principal)}`
-      const peer = yield* Storage.openDatabase(`echo:replica:${namespace}`)
+      const peer = yield* Storage.openDatabase(`echosync:replica:${namespace}`)
       const saved = yield* Schema.decodeUnknownEffect(Model.Replica)(yield* Storage.load(peer))
       const reopened = yield* Client.open({ ...options(`${profile}-references`), aggregates: [Counter, Reference] })
       yield* check(
@@ -1010,7 +1010,7 @@ const queries = (profile: string) =>
         "reset reused cached rows or changed a retained snapshot"
       )
       yield* references.sync
-      const journalPeer = yield* Storage.openDatabase(`echo:journal:${namespace}`)
+      const journalPeer = yield* Storage.openDatabase(`echosync:journal:${namespace}`)
       const journal = yield* Schema.decodeUnknownEffect(Model.Journal)(yield* Storage.load(journalPeer))
       yield* Storage.save(journalPeer, { ...journal, epoch: "peer-epoch" })
       yield* references.dismiss("absent")
@@ -1653,7 +1653,7 @@ const batches = (profile: string) =>
       yield* check(value(peer) === 5 && (yield* peer.pending).length === 2, "journal hydration lost action or batch")
       const clock = yield* Clock.Clock
       const journalDb = yield* Storage.openDatabase(
-        `echo:journal:${encodeURIComponent(profile)}:${encodeURIComponent(principal)}`
+        `echosync:journal:${encodeURIComponent(profile)}:${encodeURIComponent(principal)}`
       )
       const before = yield* Storage.load(journalDb)
       for (const now of [-8640000000000001, 8640000000000001, NaN, Infinity, -Infinity]) {
@@ -1744,7 +1744,8 @@ const ownership = (profile: string) =>
         writable: true,
         value: function (this: IDBDatabase, ...args: Parameters<typeof transaction>) {
           const tx = transaction.call(this, ...args)
-          if (Str.startsWith("echo:replica:")(this.name) && args[1] === "readwrite") queueMicrotask(() => tx.abort())
+          if (Str.startsWith("echosync:replica:")(this.name) && args[1] === "readwrite")
+            queueMicrotask(() => tx.abort())
           return tx
         }
       })
@@ -1885,7 +1886,7 @@ const ownership = (profile: string) =>
 const durableRefresh = (profile: string) =>
   Effect.scoped(
     Effect.gen(function* () {
-      const name = `echo:token-test:${profile}`
+      const name = `echosync:token-test:${profile}`
       // Synchronous platform refusal is recoverable; a programming exception is not.
       // oxlint-disable-next-line typescript/unbound-method -- Restore the native open method after injecting synchronous failures; never invoke it unbound.
       const open = IDBFactory.prototype.open
@@ -2060,7 +2061,7 @@ const durableRefresh = (profile: string) =>
 const compatibility = (profile: string) =>
   Effect.scoped(
     Effect.gen(function* () {
-      const name = `echo:journal:${encodeURIComponent(profile)}:${encodeURIComponent(principal)}`
+      const name = `echosync:journal:${encodeURIComponent(profile)}:${encodeURIComponent(principal)}`
       const legacy = yield* Effect.callback<IDBDatabase>((resume) => {
         const request = indexedDB.open(name, 2)
         request.addEventListener("upgradeneeded", () => request.result.createObjectStore("data"))
@@ -2133,7 +2134,7 @@ const compatibility = (profile: string) =>
 const incompatibleCommands = (profile: string) =>
   Effect.scoped(
     Effect.gen(function* () {
-      const name = `echo:journal:${encodeURIComponent(profile)}:${encodeURIComponent(principal)}`
+      const name = `echosync:journal:${encodeURIComponent(profile)}:${encodeURIComponent(principal)}`
       yield* Effect.scoped(
         Effect.gen(function* () {
           const seed = yield* Client.open(options(profile))
@@ -2240,7 +2241,7 @@ const incompatibleCommands = (profile: string) =>
       const phases: ReadonlyArray<"Sent" | "Accepted"> = ["Sent", "Accepted"]
       for (const phase of phases) {
         const nextProfile = `${profile}-${phase}`
-        const nextName = `echo:journal:${encodeURIComponent(nextProfile)}:${encodeURIComponent(principal)}`
+        const nextName = `echosync:journal:${encodeURIComponent(nextProfile)}:${encodeURIComponent(principal)}`
         const journal = yield* Storage.openDatabase(nextName)
         const missing = incompatible[1]
         if (missing === undefined) throw new Error("missing fixture")
@@ -2311,8 +2312,8 @@ const incompatibleCommands = (profile: string) =>
       for (const fault of ["decide", "evolve", "state", "async-codec"]) {
         const faultProfile = `${profile}-${fault}`
         const namespace = `${encodeURIComponent(faultProfile)}:${encodeURIComponent(principal)}`
-        const journalDb = yield* Storage.openDatabase(`echo:journal:${namespace}`)
-        const replicaDb = yield* Storage.openDatabase(`echo:replica:${namespace}`)
+        const journalDb = yield* Storage.openDatabase(`echosync:journal:${namespace}`)
+        const replicaDb = yield* Storage.openDatabase(`echosync:replica:${namespace}`)
         yield* Storage.save(journalDb, initial)
         yield* Storage.save(replicaDb, {
           epoch: null,
@@ -2371,7 +2372,7 @@ const incompatibleCommands = (profile: string) =>
 
 const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect)
 Object.assign(globalThis, {
-  echoScenarios: {
+  echosyncScenarios: {
     compatibility: (profile: string) => run(compatibility(profile)),
     incompatibleCommands: (profile: string) => run(incompatibleCommands(profile)),
     durableRefresh: (profile: string) => run(durableRefresh(profile)),

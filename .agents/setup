@@ -26,7 +26,7 @@ fi
 
 echo "[setup] Preparing local test database"
 # Versioned path: never open or overwrite a stale snapshot's PostgreSQL 15 data.
-pgdata="$HOME/.local/share/echo/postgres-18"
+pgdata="$HOME/.local/share/echosync/postgres-18"
 if [[ ! -f "$pgdata/PG_VERSION" ]]; then
   # Trust is only for this disposable, loopback-only orb database. No credentials
   # or user/thread authentication are stored in the shared project snapshot.

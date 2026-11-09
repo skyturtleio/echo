@@ -1,4 +1,4 @@
-import * as Domain from "echo-sync/domain"
+import * as Domain from "echosync/domain"
 import * as Arr from "effect/Array"
 import * as Option from "effect/Option"
 import { NoteIndexes } from "../Note/Note.indexes.ts"

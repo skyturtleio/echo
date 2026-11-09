@@ -1,4 +1,4 @@
-import * as Domain from "echo-sync/domain"
+import * as Domain from "echosync/domain"
 import * as Schema from "effect/Schema"
 
 /** A defined tag. `null` is the state of a tag stream nothing has happened to. */

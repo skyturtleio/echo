@@ -1,4 +1,4 @@
-import * as Domain from "echo-sync/domain"
+import * as Domain from "echosync/domain"
 import { TagState } from "./Tag.state.ts"
 
 /** A known snapshot imported now, not a reconstruction of unknown past actions. */

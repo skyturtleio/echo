@@ -80,17 +80,17 @@ export const make = Effect.fnUntraced(function* (sql: PgClient.PgClient) {
         const live = yield* renew
           ? sql<{
               readonly id: string
-            }>`UPDATE echo_connections SET expires_at=now()+interval '60 seconds' WHERE ${sql.in("id", ids)} AND expires_at>now() RETURNING id`
+            }>`UPDATE echosync_connections SET expires_at=now()+interval '60 seconds' WHERE ${sql.in("id", ids)} AND expires_at>now() RETURNING id`
           : sql<{
               readonly id: string
-            }>`SELECT id FROM echo_connections WHERE ${sql.in("id", ids)} AND expires_at>now()`
+            }>`SELECT id FROM echosync_connections WHERE ${sql.in("id", ids)} AND expires_at>now()`
         const grants = yield* Schema.decodeUnknownEffect(Schema.Array(Grant))(
-          yield* sql`SELECT scope,principal,role FROM echo_grants`
+          yield* sql`SELECT scope,principal,role FROM echosync_grants`
         )
         const members = yield* Schema.decodeUnknownEffect(Schema.Array(Wire.PresenceMember))(
-          yield* sql`SELECT p.room,c.principal,p.client_id AS "clientId",p.state FROM echo_presence p JOIN echo_connections c ON c.id=p.connection_id WHERE c.expires_at>now() AND p.expires_at>now()`
+          yield* sql`SELECT p.room,c.principal,p.client_id AS "clientId",p.state FROM echosync_presence p JOIN echosync_connections c ON c.id=p.connection_id WHERE c.expires_at>now() AND p.expires_at>now()`
         )
-        const engine = yield* sql<{ readonly epoch: string }>`SELECT epoch FROM echo_engine`
+        const engine = yield* sql<{ readonly epoch: string }>`SELECT epoch FROM echosync_engine`
         const epoch = engine[0]?.epoch
         if (epoch === undefined) return yield* unavailable()
         return { live: new Set(Arr.map(live, (row) => row.id)), grants, members, epoch }
@@ -136,7 +136,7 @@ export const make = Effect.fnUntraced(function* (sql: PgClient.PgClient) {
         // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Reactivity has no scoped resources; the driver acquires into the surrounding listener-attempt Scope
         Effect.provide(Reactivity.layer)
       )
-      const notifications = yield* listener.listen("echo_changes")
+      const notifications = yield* listener.listen("echosync_changes")
       generation++
       ready = true
       yield* Deferred.succeed(started, undefined)
@@ -174,10 +174,10 @@ export const make = Effect.fnUntraced(function* (sql: PgClient.PgClient) {
         const owner = generation
         const id = yield* Effect.acquireRelease(
           Effect.gen(function* () {
-            yield* sql`DELETE FROM echo_connections WHERE expires_at<now()`
+            yield* sql`DELETE FROM echosync_connections WHERE expires_at<now()`
             const rows = yield* sql<{
               readonly id: string
-            }>`INSERT INTO echo_connections SELECT gen_random_uuid()::text,${principal},now()+interval '60 seconds' RETURNING id`
+            }>`INSERT INTO echosync_connections SELECT gen_random_uuid()::text,${principal},now()+interval '60 seconds' RETURNING id`
             const created = rows[0]?.id
             if (created === undefined) return yield* unavailable()
             return created
@@ -185,8 +185,8 @@ export const make = Effect.fnUntraced(function* (sql: PgClient.PgClient) {
           (released) =>
             Effect.gen(function* () {
               subscribers.delete(released)
-              yield* sql`DELETE FROM echo_connections WHERE id=${released}`
-              yield* sql`SELECT pg_notify('echo_changes','presence')`
+              yield* sql`DELETE FROM echosync_connections WHERE id=${released}`
+              yield* sql`SELECT pg_notify('echosync_changes','presence')`
             }).pipe(Effect.timeout("5 seconds"), Effect.ignore)
         )
         if (!ready || owner !== generation) return yield* unavailable()

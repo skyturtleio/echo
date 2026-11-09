@@ -38,7 +38,7 @@ export const ownProfile = (profile: string, wait = false) =>
         release = resolve
       })
       const finished = navigator.locks
-        .request(`echo:${profile}`, wait ? { signal } : { ifAvailable: true }, (lock) => {
+        .request(`echosync:${profile}`, wait ? { signal } : { ifAvailable: true }, (lock) => {
           if (lock === null) {
             resume(Effect.fail(new ProfileBusy({ profile })))
             return

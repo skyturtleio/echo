@@ -84,7 +84,7 @@ export class ResyncRequired extends Schema.TaggedError<ResyncRequired, { readonl
 export class ServerError extends Schema.TaggedError<ServerError, { readonly brand: unique symbol }>()("ServerError", {
   message: Schema.String
 }) {}
-export const EchoRpcs = RpcGroup.make(
+export const EchoSyncRpcs = RpcGroup.make(
   Rpc.make("Execute", {
     payload: ExecuteRequest,
     success: ExecuteResponse,

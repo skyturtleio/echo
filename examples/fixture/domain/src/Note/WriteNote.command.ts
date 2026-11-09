@@ -1,4 +1,4 @@
-import * as Domain from "echo-sync/domain"
+import * as Domain from "echosync/domain"
 import * as Schema from "effect/Schema"
 import { Tag } from "../Tag/Tag.aggregate.ts"
 import { TagId } from "../Tag/Tag.id.ts"

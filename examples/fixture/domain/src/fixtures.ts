@@ -1,5 +1,5 @@
 /** Shared story fixtures: two members and the ids the stories use. */
-import * as Domain from "echo-sync/domain"
+import * as Domain from "echosync/domain"
 import { NoteId } from "./Note/Note.id.ts"
 import { TagId } from "./Tag/Tag.id.ts"
 

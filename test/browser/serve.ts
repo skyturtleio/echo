@@ -10,14 +10,14 @@ import * as Server from "../../src/server/index.ts"
 // Dedicated disposable schema, never app data; this runner only connects to the orb's local test database.
 const postgres = PgClient.layer({
   url: Redacted.make("postgres://postgres@127.0.0.1:5432/postgres"),
-  startupParameters: { search_path: "echo_browser_fixture" }
+  startupParameters: { search_path: "echosync_browser_fixture" }
 })
 await Effect.runPromise(
   Effect.scoped(
     Effect.gen(function* () {
       const sql = yield* PgClient.PgClient
-      yield* sql`DROP SCHEMA IF EXISTS echo_browser_fixture CASCADE`
-      yield* sql`CREATE SCHEMA echo_browser_fixture`
+      yield* sql`DROP SCHEMA IF EXISTS echosync_browser_fixture CASCADE`
+      yield* sql`CREATE SCHEMA echosync_browser_fixture`
       yield* Server.migrate
       const server = yield* Server.make({ aggregates: [Note, Tag] })
       const rpc = HttpEffect.toWebHandler(
@@ -84,7 +84,7 @@ await Effect.runPromise(
               if (path === "/shell-worker.js")
                 return new Response(
                   `
-                const name = "echo-browser-${script.hash}";
+                const name = "echosync-browser-${script.hash}";
                 self.addEventListener("install", event => event.waitUntil(caches.open(name).then(cache => cache.addAll(["/", "/client.js"])).then(() => self.skipWaiting())));
                 self.addEventListener("activate", event => event.waitUntil(self.clients.claim()));
                 self.addEventListener("fetch", event => {

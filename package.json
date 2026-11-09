@@ -1,5 +1,5 @@
 {
-  "name": "echo-sync",
+  "name": "echosync",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -15,7 +15,7 @@
     "typecheck": "effect-tsgo tsc@7.1.0-beta --noEmit && effect-tsgo tsc@7.1.0-beta --noEmit -p tsconfig.browser.json",
     "lint": "effect-tsgo --tsrs-lint=0.21.0-ts7.1.0-beta oxlint --config .oxlintrc.type-aware.json --type-aware --deny-warnings",
     "test": "vitest run",
-    "test:pg": "ECHO_PG_URL=${ECHO_PG_URL:-postgres://postgres@127.0.0.1:5432/postgres} vitest run src/server test/",
+    "test:pg": "ECHOSYNC_PG_URL=${ECHOSYNC_PG_URL:-postgres://postgres@127.0.0.1:5432/postgres} vitest run src/server test/",
     "test:browser": "bash test/browser/run.sh",
     "check:integration": "bun run test:pg && bun run test:browser",
     "fmt:check": "oxfmt --check",

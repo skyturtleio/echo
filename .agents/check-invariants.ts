@@ -33,6 +33,18 @@ try {
   for (const path of sources) {
     const source = await Bun.file(path).text()
     await using lease = await api.createSourceFile(path, source)
+    visit(lease.sourceFile, (node) => {
+      if (
+        Ast.isImportDeclaration(node) &&
+        Ast.isStringLiteral(node.moduleSpecifier) &&
+        /^echo(?:-sync)?(?:\/|$)/.test(node.moduleSpecifier.text)
+      ) {
+        failures.push(`${path}: use canonical echosync imports, not old package names`)
+      }
+      if (Ast.isIdentifier(node) && /^(?:EchoRpcs|echoScenarios|ECHO_[A-Z_]+)$/.test(node.text)) {
+        failures.push(`${path}: use canonical EchoSync / echosync / ECHOSYNC identifiers`)
+      }
+    })
     const comments = new Map<number, Ast.CommentRange>()
     const collect = (node: Ast.Node): void => {
       for (const range of [
@@ -110,9 +122,9 @@ try {
     if (Ast.isVariableDeclaration(node) && Ast.isIdentifier(node.name) && node.initializer !== undefined) {
       definitions.set(node.name.text, node.initializer)
     }
-    if (!Ast.isPropertyAssignment(node) || node.name.getText() !== "echoScenarios") return
+    if (!Ast.isPropertyAssignment(node) || node.name.getText() !== "echosyncScenarios") return
     if (!Ast.isObjectLiteralExpression(node.initializer)) {
-      failures.push(`${path}: echoScenarios must be an explicit object`)
+      failures.push(`${path}: echosyncScenarios must be an explicit object`)
       return
     }
     for (const entry of node.initializer.properties) {
@@ -142,11 +154,11 @@ try {
   const runner = await Bun.file("test/browser/run.sh").text()
   const invoked = new Set<string>()
   // Recognize actual eval command lines, not comments or arbitrary mentions. This is not a shell interpreter.
-  for (const match of Str.matchAll(/^agent-browser .* eval "echoScenarios\.([A-Za-z]+)\(/gm)(runner)) {
+  for (const match of Str.matchAll(/^agent-browser .* eval "echosyncScenarios\.([A-Za-z]+)\(/gm)(runner)) {
     if (match[1] !== undefined) invoked.add(match[1])
   }
   for (const match of Str.matchAll(
-    /^for scenario in ([A-Za-z ]+); do\n  agent-browser .* eval "echoScenarios\.\$scenario\([^\n]+\ndone/gm
+    /^for scenario in ([A-Za-z ]+); do\n  agent-browser .* eval "echosyncScenarios\.\$scenario\([^\n]+\ndone/gm
   )(runner)) {
     for (const name of Str.split(match[1] ?? "", " ")) invoked.add(name)
   }

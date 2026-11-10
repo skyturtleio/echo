@@ -9,8 +9,8 @@
  * export class TagRemoved extends Domain.Event("TagRemoved", {}) {}
  * ```
  *
- * `Policy`, `Batch`, command `authority` and versioning (design §1) arrive with the phases
- * that need them; no Phase 0 story did.
+ * Command `access` declares the minimum scope role; `authority` restricts trusted commands.
+ * `capabilities` inspects these declarations without running a domain decision.
  */
 import * as AggregateModule from "./Aggregate.ts"
 import * as CommandModule from "./Command.ts"
@@ -70,7 +70,9 @@ export declare namespace Aggregate {
 /** One kind of stream: state, scope, indexes, `decide` and `evolve`. See {@link AggregateModule.make}. */
 export const Aggregate = AggregateModule.make
 
-/** Principals, scopes, the Phase 0 grant rule and the engine's `ScopeForbidden` (design §1). */
+export { capabilities } from "./Aggregate.ts"
+
+/** Principals, scope roles and the engine's `ScopeForbidden` (design §1). */
 export * as Scope from "./Scope.ts"
 
 /** The pure story runner; `echosync/domain/testing` binds it to vitest. */

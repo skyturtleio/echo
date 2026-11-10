@@ -354,7 +354,7 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
               if (
                 row !== undefined &&
                 c.authority !== "server" &&
-                !canWrite(principal, Scope.make(row.scope), grants)
+                !canWrite(principal, Scope.make(row.scope), grants, c.access)
               ) {
                 return {
                   receipt: rejected(
@@ -422,7 +422,7 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
               }
               if (decision.length > 0) {
                 const scope = a.definition.scope(state)
-                if (scope === null || (c.authority !== "server" && !canWrite(principal, scope, grants))) {
+                if (scope === null || (c.authority !== "server" && !canWrite(principal, scope, grants, c.access))) {
                   return {
                     receipt: rejected(
                       yield* encode(ScopeForbidden, new ScopeForbidden({ scope: privateScope(principal) }))

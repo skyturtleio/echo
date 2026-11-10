@@ -4,6 +4,7 @@ import type * as Event from "./Event.ts"
 import type * as Index from "./Indexes.ts"
 import { type Codec, type Fields, taggedClass } from "./internal/classes.ts"
 import type * as Rejection from "./Rejection.ts"
+import type { WriteAccess } from "./Scope.ts"
 
 /** The fields of a command instance: the id of the stream it addresses, then its input. */
 export type InputFields<Target extends Index.IdSchema, F extends Fields> = { readonly target: Target } & F
@@ -36,6 +37,7 @@ export interface CommandClass<
   readonly rejects: Rejects | readonly []
   readonly reads: Reads | readonly []
   readonly authority: "both" | "server"
+  readonly access: WriteAccess
 }
 
 /** Structural constraint satisfied by every class produced by {@link make}. */
@@ -47,6 +49,7 @@ export interface Any extends Codec {
   readonly rejects: ReadonlyArray<Rejection.Any>
   readonly reads: ReadonlyArray<Read>
   readonly authority: "both" | "server"
+  readonly access: WriteAccess
   readonly Type: { readonly _tag: string; readonly target: string }
 }
 
@@ -54,7 +57,19 @@ export interface Any extends Codec {
  * A request to change one stream. It names the stream (`target`), carries its input, and
  * declares the events it may record, the rejections it may return and the other streams its
  * `decide` reads. Server-authority commands run only inside registered trusted actions;
- * ordinary commands run on both device and server.
+ * ordinary commands run on both device and server. `access` defaults to writer; owner is a
+ * stricter gate on both the original and resulting scope, independent of domain rules.
+ * Keep protected state fields out of input and compute them in decide/evolve instead.
+ *
+ * @example
+ * ```ts
+ * class MoveTag extends Domain.Command("MoveTag", {
+ *   target: TagId,
+ *   input: { scope: Domain.Scope.Scope },
+ *   events: [TagMoved],
+ *   access: "owner"
+ * }) {}
+ * ```
  */
 export const make = <
   const Tag extends string,
@@ -72,6 +87,8 @@ export const make = <
     readonly rejects?: Rejects
     readonly reads?: Reads
     readonly authority?: "both" | "server"
+    /** Minimum role at both the original and resulting scope. Defaults to writer. Server authority bypasses this gate. */
+    readonly access?: WriteAccess
   }
 ): CommandClass<Tag, Target, F, Events, Rejects, Reads> => {
   // `input` may be absent (then `F` is `{}`); `Object.assign` keeps the generic where a spread of an optional loses it.
@@ -83,6 +100,7 @@ export const make = <
     events: options.events,
     rejects: options.rejects ?? ([] as const),
     reads: options.reads ?? ([] as const),
-    authority: options.authority ?? "both"
+    authority: options.authority ?? "both",
+    access: options.access ?? "writer"
   })
 }

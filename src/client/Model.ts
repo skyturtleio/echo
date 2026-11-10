@@ -213,7 +213,7 @@ const decideCommand = (
   )
   let state = row === undefined ? aggregate.definition.initial : decode(aggregate.definition.state, row.state)
   const scope = aggregate.definition.scope(state)
-  if (scope !== null && !canWrite(principal, scope, grants))
+  if (scope !== null && !canWrite(principal, scope, grants, commandClass.access))
     return { rows, rejection: encode(ScopeForbidden, new ScopeForbidden({ scope })) }
   const read = reader(rows, principal, grants)
   function declared<R extends Aggregate.Any>(ref: R, id: Aggregate.IdOf<R>): Aggregate.StateOf<R> | null
@@ -255,7 +255,7 @@ const decideCommand = (
     state = evolve(state, { ...event, _tag: tagged._tag })
   }
   const nextScope = aggregate.definition.scope(state)
-  if (nextScope !== null && !canWrite(principal, nextScope, grants))
+  if (nextScope !== null && !canWrite(principal, nextScope, grants, commandClass.access))
     return { rows, rejection: encode(ScopeForbidden, new ScopeForbidden({ scope: nextScope })) }
   return {
     rows: [

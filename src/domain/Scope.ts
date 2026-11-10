@@ -40,14 +40,21 @@ export const role = (principal: Principal, scope: Scope, grants: ReadonlyArray<G
 export const canRead = (principal: Principal, scope: Scope, grants: ReadonlyArray<Grant> = []): boolean =>
   role(principal, scope, grants) !== null
 
-export const canWrite = (principal: Principal, scope: Scope, grants: ReadonlyArray<Grant> = []): boolean => {
+/** Minimum role for a command; reader access never permits mutation. */
+export type WriteAccess = "writer" | "owner"
+
+export const canWrite = (
+  principal: Principal,
+  scope: Scope,
+  grants: ReadonlyArray<Grant> = [],
+  access: WriteAccess = "writer"
+): boolean => {
   const permission = role(principal, scope, grants)
-  return permission === "writer" || permission === "owner"
+  return permission === "owner" || (access === "writer" && permission === "writer")
 }
 
 /**
- * The engine's answer when a principal commands a stream whose scope they hold no writer grant
- * on. It is checked once, generically, before `decide` runs, so no aggregate repeats the
- * ownership rule (design §2 item 8).
+ * The engine's answer when a principal lacks a command's required scope role. Checked before
+ * decide and against the resulting scope, so aggregates do not repeat role gates.
  */
 export class ScopeForbidden extends Rejection.make("ScopeForbidden", { scope: Scope }) {}

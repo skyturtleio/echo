@@ -154,7 +154,11 @@ export const run = <A extends Aggregate.Any, W extends Aggregate.CommandInstance
   const state = Option.isSome(target) ? target.value.state : aggregate.definition.initial
   if (Option.isSome(target)) {
     const scope = aggregate.definition.scope(state)
-    if (scope !== null && command.value.authority !== "server" && !canWrite(principal, scope, grants))
+    if (
+      scope !== null &&
+      command.value.authority !== "server" &&
+      !canWrite(principal, scope, grants, command.value.access)
+    )
       return new ScopeForbidden({ scope })
   }
 
@@ -206,7 +210,11 @@ export const run = <A extends Aggregate.Any, W extends Aggregate.CommandInstance
       next = evolve(next, { ...event, _tag: event._tag })
     }
     const scope = aggregate.definition.scope(next)
-    if (scope !== null && command.value.authority !== "server" && !canWrite(principal, scope, grants))
+    if (
+      scope !== null &&
+      command.value.authority !== "server" &&
+      !canWrite(principal, scope, grants, command.value.access)
+    )
       return new ScopeForbidden({ scope })
   }
   return decision

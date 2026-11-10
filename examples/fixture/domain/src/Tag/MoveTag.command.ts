@@ -5,6 +5,7 @@ import { NoSuchTag } from "./RemoveTag.command.ts"
 export class TagMoved extends Domain.Event("TagMoved", { scope: Domain.Scope.Scope }) {}
 export class MoveTag extends Domain.Command("MoveTag", {
   target: TagId,
+  access: "owner",
   input: { scope: Domain.Scope.Scope },
   events: [TagMoved],
   rejects: [NoSuchTag]

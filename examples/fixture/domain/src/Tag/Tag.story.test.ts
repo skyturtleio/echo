@@ -12,18 +12,26 @@ import { MoveTag, TagMoved } from "./MoveTag.command.ts"
 const { catalogScope, privateScope, ScopeForbidden } = Domain.Scope
 
 const shared = Domain.Scope.Scope.make("shared:fixture")
-Story.make(Tag, "a writer can move a private tag into a granted scope", {
+Story.make(Tag, "an owner can move a private tag into an owned scope", {
+  given: [new TagDefined({ name: "move", scope: privateScope(member) })],
+  when: new MoveTag({ target: idea, scope: shared }),
+  as: member,
+  grants: [{ scope: shared, principal: member, role: "owner" }],
+  then: [new TagMoved({ scope: shared })]
+})
+Story.make(Tag, "a writer cannot receive an owner-only transfer", {
   given: [new TagDefined({ name: "move", scope: privateScope(member) })],
   when: new MoveTag({ target: idea, scope: shared }),
   as: member,
   grants: [{ scope: shared, principal: member, role: "writer" }],
-  then: [new TagMoved({ scope: shared })]
+  then: new ScopeForbidden({ scope: shared })
 })
-Story.make(Tag, "a reader cannot move a private tag into a shared scope", {
-  given: [new TagDefined({ name: "move", scope: privateScope(member) })],
-  when: new MoveTag({ target: idea, scope: shared }),
+
+Story.make(Tag, "destination ownership cannot replace source ownership", {
+  given: [new TagDefined({ name: "move", scope: shared })],
+  when: new MoveTag({ target: idea, scope: privateScope(member) }),
   as: member,
-  grants: [{ scope: shared, principal: member, role: "reader" }],
+  grants: [{ scope: shared, principal: member, role: "writer" }],
   then: new ScopeForbidden({ scope: shared })
 })
 

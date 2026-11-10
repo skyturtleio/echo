@@ -23,12 +23,15 @@ import { TestClock } from "effect/testing"
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- real socket fixture in Vitest's Node runtime, not an engine dependency
 import { createServer } from "node:http"
 import { Note } from "../../examples/fixture/domain/src/Note/Note.aggregate.ts"
+import { NoteId } from "../../examples/fixture/domain/src/Note/Note.id.ts"
+import { WriteNote } from "../../examples/fixture/domain/src/Note/WriteNote.command.ts"
 import { DefineTag } from "../../examples/fixture/domain/src/Tag/DefineTag.command.ts"
 import { Tag } from "../../examples/fixture/domain/src/Tag/Tag.aggregate.ts"
 import { TagHistoryImported } from "../../examples/fixture/domain/src/Tag/TagHistoryImported.event.ts"
 import { MoveTag, RelocateTag } from "../../examples/fixture/domain/src/Tag/MoveTag.command.ts"
 import { TagId } from "../../examples/fixture/domain/src/Tag/Tag.id.ts"
 import type * as Aggregate from "../domain/Aggregate.ts"
+import { capabilities } from "../domain/index.ts"
 import { Principal, privateScope, Scope as VisibilityScope, Grant } from "../domain/Scope.ts"
 import * as Wire from "../protocol.ts"
 import * as Server from "./index.ts"
@@ -46,6 +49,15 @@ class UndeclaredTag extends Tag {
     commands: [UndeclaredCommand, Tag.definition.commands[1], Tag.definition.commands[2], Tag.definition.commands[3]]
   }
 }
+class TrustedWriteNote extends WriteNote {
+  static override readonly authority = "server" as const
+}
+class TrustedNote extends Note {
+  static override readonly definition: typeof Note.definition = {
+    ...Note.definition,
+    commands: [TrustedWriteNote]
+  }
+}
 const request = (id: string, target = id, name = id): Wire.ExecuteRequest => ({
   epoch: null,
   clientId: "device",
@@ -58,6 +70,12 @@ const note = (id: string, tagId: string): Wire.ExecuteRequest => ({
   epoch: null,
   clientId: "device",
   batches: [{ id, commands: [{ aggregate: "Note", command: { _tag: "WriteNote", target: id, tagId, text: "text" } }] }]
+})
+
+const transfer = (batchId: string, target: string, scope: VisibilityScope): Wire.ExecuteRequest => ({
+  epoch: null,
+  clientId: "device",
+  batches: [{ id: batchId, commands: [{ aggregate: "Tag", command: { _tag: "MoveTag", target, scope } }] }]
 })
 
 // Every scenario owns a temporary schema, including its engine singleton and listener connections.
@@ -390,7 +408,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
             ])
           ],
           grants: [
-            { scope: shared, principal: alice, role: "writer" },
+            { scope: shared, principal: alice, role: "owner" },
             { scope: shared, principal: bob, role: "reader" }
           ]
         })
@@ -418,7 +436,113 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         })
         expect(yield* server.get(bob, Tag, id)).toBeNull()
         expect(yield* server.get(alice, Tag, id)).toMatchObject({ scope: privateScope(alice) })
-      })
+
+        // A source-only gate would accept an owner transferring into a merely writable scope.
+        const writable = VisibilityScope.make("shared:writable")
+        yield* server.importStreams({
+          id: "roles",
+          principal: alice,
+          streams: [],
+          grants: [
+            { scope: writable, principal: alice, role: "writer" },
+            { scope: writable, principal: bob, role: "owner" }
+          ]
+        })
+        expect((yield* server.execute(alice, transfer("writer-destination", id, writable))).receipts[0]).toMatchObject({
+          _tag: "Rejected",
+          rejection: { _tag: "ScopeForbidden" }
+        })
+        expect(yield* server.get(alice, Tag, id)).toMatchObject({ scope: privateScope(alice) })
+        expect((yield* server.execute(bob, request("bob-owned"))).receipts[0]?._tag).toBe("Accepted")
+        expect(
+          (yield* server.execute(bob, transfer("owner-destination", "bob-owned", writable))).receipts[0]?._tag
+        ).toBe("Accepted")
+        const visible = yield* server.get(alice, Tag, TagId.make("bob-owned"))
+        const writerGrants: ReadonlyArray<Grant> = [{ scope: writable, principal: alice, role: "writer" }]
+        const inspected = capabilities(Tag, visible, alice, writerGrants)
+        expect(inspected).toMatchObject({ role: "writer", read: true })
+        expect(inspected.commands).toContainEqual({
+          tag: "MoveTag",
+          access: "owner",
+          authority: "both",
+          allowed: false
+        })
+        expect(inspected.commands).toContainEqual({
+          tag: "RemoveTag",
+          access: "writer",
+          authority: "both",
+          allowed: true
+        })
+        expect(inspected.commands).toContainEqual({
+          tag: "RelocateTag",
+          access: "writer",
+          authority: "server",
+          allowed: false
+        })
+        expect(capabilities(Tag, null, alice).commands).toContainEqual({
+          tag: "DefineTag",
+          access: "writer",
+          authority: "both",
+          allowed: null
+        })
+        expect(
+          (yield* server.execute(alice, transfer("writer-source", "bob-owned", privateScope(alice)))).receipts[0]
+        ).toMatchObject({
+          _tag: "Rejected",
+          rejection: { _tag: "ScopeForbidden" }
+        })
+        // Default writer access still accepts a real server command; owner is a tightening, not a new default.
+        expect(
+          (yield* server.execute(alice, {
+            epoch: null,
+            clientId: "device",
+            batches: [
+              {
+                id: "writer-remove",
+                commands: [{ aggregate: "Tag", command: { _tag: "RemoveTag", target: "bob-owned" } }]
+              }
+            ]
+          })).receipts[0]?._tag
+        ).toBe("Accepted")
+        expect(yield* server.get(bob, Tag, TagId.make("bob-owned"))).toMatchObject({ removed: true })
+        const ownerGrants: ReadonlyArray<Grant> = [{ scope: writable, principal: bob, role: "owner" }]
+        expect(capabilities(Tag, visible, bob, ownerGrants).commands).toContainEqual({
+          tag: "MoveTag",
+          access: "owner",
+          authority: "both",
+          allowed: true
+        })
+        expect(
+          (yield* server.execute(alice, {
+            epoch: null,
+            clientId: "device",
+            batches: [{ id: "revoke-owner", commands: [], action: { name: "revoke-owner", input: {} } }]
+          })).receipts[0]?._tag
+        ).toBe("Accepted")
+        // The stale capability remains true, but admission reloads grants and denies the old owner.
+        expect(
+          (yield* server.execute(bob, transfer("revoked-owner", "bob-owned", privateScope(bob)))).receipts[0]
+        ).toMatchObject({
+          _tag: "Rejected",
+          rejection: { _tag: "ScopeForbidden" }
+        })
+        expect(yield* server.get(bob, Tag, TagId.make("bob-owned"))).toBeNull()
+        expect(
+          Arr.some((yield* server.pull(bob, { epoch: null, cursors: {} })).scopes, (scope) => scope.scope === writable)
+        ).toBe(false)
+      }),
+      12,
+      [
+        Server.Action.make({
+          name: "revoke-owner",
+          input: Schema.Struct({}),
+          reads: [],
+          decide: (_, ctx) =>
+            ctx.principal === alice
+              ? { operations: [Server.Action.revoke(VisibilityScope.make("shared:writable"), bob)] }
+              : { rejection: { _tag: "Denied" } }
+        })
+      ]
     )
   )
 
@@ -453,7 +577,10 @@ describe.skipIf(url === undefined)("Postgres server", () => {
             { id: "raw", commands: [{ aggregate: "Tag", command: new RelocateTag({ target: id, scope: shared }) }] }
           ]
         }
-        expect((yield* server.execute(alice, raw)).receipts[0]?._tag).toBe("Rejected")
+        expect((yield* server.execute(alice, raw)).receipts[0]).toMatchObject({
+          _tag: "Rejected",
+          rejection: { _tag: "ServerOnly" }
+        })
         const rejected = {
           epoch: null,
           clientId: "device",
@@ -475,9 +602,56 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         const pulled = yield* server.pull(alice, { epoch: null, cursors: {} })
         const receipt = result.receipts[0]
         expect(receipt?._tag === "Accepted" && pulled.revision >= receipt.revision).toBe(true)
+
+        // An action is not blanket authority for the ordinary commands it stages.
+        yield* server.importStreams({
+          id: "writer-role",
+          principal: alice,
+          streams: [],
+          grants: [{ scope: shared, principal: alice, role: "writer" }]
+        })
+        expect((yield* server.execute(alice, request("ordinary"))).receipts[0]?._tag).toBe("Accepted")
+        for (const [target, destination] of [
+          [id, privateScope(alice)],
+          [TagId.make("ordinary"), shared]
+        ] as const) {
+          expect(
+            (yield* server.execute(alice, {
+              epoch: null,
+              clientId: "device",
+              batches: [
+                {
+                  id: `ordinary-${target}`,
+                  commands: [],
+                  action: { name: "ordinary-transfer", input: { target, destination } }
+                }
+              ]
+            })).receipts[0]
+          ).toMatchObject({ _tag: "Rejected", rejection: { _tag: "ScopeForbidden" } })
+        }
+        expect(yield* sql`SELECT * FROM echosync_grants WHERE scope='shared:leak'`).toHaveLength(0)
+        expect(yield* sql`SELECT * FROM echosync_events`).toHaveLength(3)
+        expect(yield* server.get(alice, Tag, id)).toMatchObject({ scope: shared })
+        expect(yield* server.get(alice, Tag, TagId.make("ordinary"))).toMatchObject({ scope: privateScope(alice) })
       }),
       12,
-      [action]
+      [
+        action,
+        Server.Action.make({
+          name: "ordinary-transfer",
+          input: Schema.Struct({ target: TagId, destination: VisibilityScope }),
+          reads: [],
+          decide: ({ target, destination }, ctx) =>
+            ctx.principal === alice
+              ? {
+                  operations: [
+                    Server.Action.grant({ scope: VisibilityScope.make("shared:leak"), principal: bob, role: "reader" }),
+                    Server.Action.command(Tag, new MoveTag({ target, scope: destination }))
+                  ]
+                }
+              : { rejection: { _tag: "Denied" } }
+        })
+      ]
     )
   })
 
@@ -772,6 +946,39 @@ describe.skipIf(url === undefined)("Postgres server", () => {
   it.effect("INV-SERVER-3 hidden targets cannot be overwritten and reads include catalogs but not other users", () =>
     scenario(
       Effect.fnUntraced(function* (server, sql) {
+        // Extra wire fields never become domain inputs or replace authenticated identity.
+        expect(
+          (yield* server.execute(alice, {
+            epoch: null,
+            clientId: "device",
+            batches: [
+              {
+                id: "protected-input",
+                commands: [
+                  {
+                    aggregate: "Tag",
+                    command: {
+                      _tag: "DefineTag",
+                      target: "protected-input",
+                      name: "protected",
+                      scope: "user:bob",
+                      principal: "bob",
+                      authority: "server",
+                      access: "reader",
+                      grants: [{ scope: "user:bob", principal: "alice", role: "owner" }]
+                    }
+                  }
+                ]
+              }
+            ]
+          })).receipts[0]?._tag
+        ).toBe("Accepted")
+        expect(yield* server.get(alice, Tag, TagId.make("protected-input"))).toEqual({
+          name: "protected",
+          scope: privateScope(alice),
+          removed: false
+        })
+        expect(yield* server.get(bob, Tag, TagId.make("protected-input"))).toBeNull()
         yield* server.execute(bob, request("private", "hidden", "secret"))
         yield* server.ingestCatalog({
           scope: "catalog:tags",
@@ -794,6 +1001,46 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           rejection: { _tag: "UnknownTag" }
         })
         expect((yield* server.execute(alice, note("catalog-read", "catalog-tag"))).receipts[0]?._tag).toBe("Accepted")
+        // Privileged action reads do not widen a server-only command's declared reads.
+        const trusted = yield* Server.make({
+          aggregates: [Tag, TrustedNote],
+          actions: [
+            Server.Action.make({
+              name: "trusted-note",
+              input: Schema.Struct({ tagId: TagId }),
+              reads: [Tag],
+              decide: ({ tagId }, ctx) =>
+                ctx.read.get(Tag, tagId) === null
+                  ? { rejection: { _tag: "PlannerMissingTag" } }
+                  : {
+                      operations: [
+                        Server.Action.command(
+                          TrustedNote,
+                          new TrustedWriteNote({
+                            target: NoteId.make(`trusted-${tagId}`),
+                            tagId,
+                            text: "trusted read"
+                          })
+                        )
+                      ]
+                    }
+            })
+          ]
+        })
+        for (const tagId of ["hidden", "catalog-tag"]) {
+          const result = yield* trusted.execute(alice, {
+            epoch: null,
+            clientId: "device",
+            batches: [{ id: `trusted-${tagId}`, commands: [], action: { name: "trusted-note", input: { tagId } } }]
+          })
+          expect(result.receipts[0]).toMatchObject(
+            tagId === "hidden" ? { _tag: "Rejected", rejection: { _tag: "UnknownTag" } } : { _tag: "Accepted" }
+          )
+        }
+        expect(yield* server.get(alice, Note, NoteId.make("trusted-hidden"))).toBeNull()
+        expect(yield* server.get(alice, Note, NoteId.make("trusted-catalog-tag"))).toMatchObject({
+          tagId: "catalog-tag"
+        })
         expect((yield* server.execute(alice, request("catalog-write", "catalog-tag"))).receipts[0]).toMatchObject({
           _tag: "Rejected",
           rejection: { _tag: "ScopeForbidden" }

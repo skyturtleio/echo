@@ -398,7 +398,7 @@ behaviour adds or amends an item here in the same branch.
 25. **Collaboration uses explicit grants and trusted atomic actions** (2026-11-01).
     Shared scopes have reader/writer/owner grants; private ownership and catalog readership
     remain intrinsic. Grants authorize declared reads, prediction, Stories and execution.
-    Moving a stream requires write access at both ends and invalidates both scope snapshots.
+    Moving a stream requires the command's minimum write role at both ends and invalidates both scope snapshots.
     Trusted actions own application membership rules, transactional reads, commands and grant
     transitions; clients journal action requests without predicting them. Server-only commands
     are not directly wire-addressable. Rejected: application SQL against engine tables,
@@ -594,6 +594,23 @@ behaviour adds or amends an item here in the same branch.
     SQLite/Wasm/worker replacement. Serialized payload sizes measure submitted data, not
     browser-internal physical IndexedDB bytes (which the platform does not expose).
 
+38. **Commands declare minimum scope roles; capability inspection is advisory** (2026-11-10).
+    `Command(tag, { access: "owner", ... })` tightens the existing default `"writer"` gate without
+    introducing a second policy engine. The same `Scope.canWrite` role check runs in Stories,
+    prediction/rebase and authoritative admission, on both original and resulting scopes.
+    Intrinsic private ownership/catalog readership and scope-wide visibility do not change.
+    `authority: "server"` remains the explicit trusted-action bypass; ordinary commands inside
+    actions retain their role requirement. Protected fields stay out of command input schemas
+    and are computed in pure decide/evolve. Related reads remain actor-visible even for
+    server-only commands. Application-specific membership rules remain pure domain/action rules.
+    `Domain.capabilities(aggregate, state, principal, grants)` reports scope, role, read access
+    and command authority/access/allowed from these same declarations. It does not run decide,
+    inspect related reads, or authorize a transfer's destination; absent scope reports unknown
+    (`null`) for ordinary commands, and server-only commands always report false. Supplied
+    state must already be visible to the caller. Offline grants are hints; only the server's
+    Accepted receipt proves acceptance. Rejected: arbitrary authorization callbacks, per-field
+    visibility, reader-authorized mutation, and presenting local capability checks as acceptance.
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -624,12 +641,18 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
 
 - **INV-SERVER-7:** Shared grants authorize reads and writes by role; scope moves invalidate
   old and new readers, and revoked readers lose the entire scope on their next pull.
+  Commands may require owner rather than writer at both ends; capability inspection reports
+  the same role gate without implying domain acceptance or trusting stale grants at admission.
 - **INV-SERVER-8:** Trusted actions atomically decide domain commands and grant changes using
   transactional reads, never expose server-only commands to raw Execute, and deduplicate retries.
+  Ordinary commands inside actions retain their minimum role gates; only server-authority
+  commands bypass them, and even those commands retain actor-visible declared reads.
 - **INV-SERVER-9:** Trusted event imports fold registered events from initial state, preserve
   payload audit fields, record actual envelope actor/time, and refuse conflicting streams atomically.
 - **INV-CLIENT-7:** Public batches predict and journal atomically; trusted actions remain
   durably pending without prediction and are inspectable before reconnect.
+  Predictions enforce each command's minimum role at both original and resulting scopes;
+  a denied transfer never enters the journal.
   Intent creation samples and validates the clock once before prediction/append, rejecting
   non-finite or out-of-Date-range values for commands and actions without appending either.
 - **INV-CLIENT-8:** Tabs share durable ownership, survive owner loss and coordinate profile
@@ -655,6 +678,7 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
   claims for the same visible unique value cannot both be accepted.
 - **INV-SERVER-3:** Ordinary writes require writer/owner access; declared reads see authorized
   scopes only, hidden ids read as null, and undeclared reads fail.
+  Undeclared command input fields cannot replace server-computed ownership or authority.
   Unrelated stored states outside the current command's target and declared-read aggregates
   are not decoded; selected persisted states still validate.
 - **INV-SERVER-4:** Pull snapshots and cursors share one transaction snapshot; reconnect

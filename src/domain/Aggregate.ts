@@ -6,7 +6,7 @@ import type * as Command from "./Command.ts"
 import type * as Event from "./Event.ts"
 import type * as Index from "./Indexes.ts"
 import type { Bivariant, Codec } from "./internal/classes.ts"
-import type { Grant, Principal, Scope } from "./Scope.ts"
+import { canWrite, type Grant, type Principal, role, type Scope } from "./Scope.ts"
 
 /**
  * The instance type of a domain class: `InstanceOf<typeof DuplicateName>` is `DuplicateName`.
@@ -177,3 +177,43 @@ export const make = <
 
 /** The aggregate an index is bound to; none until that aggregate's module has loaded. */
 export const ofIndex = (index: Index.Any): Option.Option<Any> => Option.fromNullishOr(owners.get(index))
+
+/**
+ * Advisory authority inventory for a state already visible to the caller. Does not run decide,
+ * inspect related streams, or contact the server. `allowed` checks only this scope; transfers
+ * must also satisfy the resulting scope. Null means creation needs a resulting scope, not
+ * permission. Server-only commands are always false: invoke their trusted action instead.
+ * Grants may be stale offline; only an Accepted server receipt establishes acceptance.
+ *
+ * @example
+ * ```ts
+ * const access = Domain.capabilities(Tag, visibleTag, principal, grants)
+ * const mayMove = access.commands.find((command) => command.tag === "MoveTag")?.allowed === true
+ * // mayMove describes the source role only; execute still checks the destination and domain rules.
+ * ```
+ */
+export const capabilities = <A extends Any>(
+  aggregate: A,
+  state: StateOf<A>,
+  principal: Principal,
+  grants: ReadonlyArray<Grant> = []
+) => {
+  const scope = aggregate.definition.scope(state)
+  const permission = scope === null ? null : role(principal, scope, grants)
+  return {
+    scope,
+    role: permission,
+    read: permission !== null,
+    commands: Arr.map(aggregate.definition.commands, (command) => ({
+      tag: command.tag,
+      authority: command.authority,
+      access: command.access,
+      allowed:
+        command.authority === "server"
+          ? false
+          : scope === null
+            ? null
+            : canWrite(principal, scope, grants, command.access)
+    }))
+  }
+}

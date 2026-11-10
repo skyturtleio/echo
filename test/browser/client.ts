@@ -17,6 +17,7 @@ import * as Str from "effect/String"
 import * as SubscriptionRef from "effect/SubscriptionRef"
 import { FetchHttpClient, HttpClient } from "effect/http"
 import { DefineTag, Note, NoteId, Tag, TagId, WriteNote } from "../../examples/fixture/domain/src/index.ts"
+import { MoveTag } from "../../examples/fixture/domain/src/Tag/MoveTag.command.ts"
 import * as Domain from "../../src/domain/index.ts"
 import * as Client from "../../src/client/index.ts"
 import * as Storage from "../../src/client/BrowserStorage.ts"
@@ -1702,7 +1703,72 @@ const batches = (profile: string) =>
           )
         }
       }
-      return "PASS INV-CLIENT-7 atomic rollback/ordered prediction; one durable batch; unpredicted action survives reopen"
+      // The real client must apply the same owner gate at both ends before journaling.
+      const shared = Domain.Scope.Scope.make("shared:browser-roles")
+      const own = Domain.Scope.privateScope(principal)
+      for (const role of ["writer", "owner"] as const) {
+        for (const source of [own, shared]) {
+          const destination = source === own ? shared : own
+          let downgraded = false
+          const authorized = yield* Client.open({
+            profile: `${profile}-${role}-${source}`,
+            principal,
+            aggregates: [Tag, Note],
+            autoConnect: false,
+            transport: {
+              ...disconnected,
+              pull: () =>
+                Effect.succeed({
+                  epoch: "roles",
+                  revision: 1,
+                  grants: [{ scope: shared, principal, role: downgraded ? "writer" : role }],
+                  scopes: [
+                    {
+                      scope: source,
+                      cursor: 1,
+                      reset: true,
+                      entries: [
+                        {
+                          _tag: "Upsert",
+                          aggregate: "Tag",
+                          id: "role-tag",
+                          seq: 1,
+                          state: { name: "role-tag", scope: source, removed: false }
+                        }
+                      ]
+                    }
+                  ]
+                })
+            }
+          })
+          yield* authorized.sync
+          const result = yield* authorized.execute(
+            Tag,
+            new MoveTag({ target: TagId.make("role-tag"), scope: destination })
+          )
+          yield* check(
+            role === "owner"
+              ? result._tag === "Pending"
+              : result._tag === "Rejected" && result.rejection._tag === "ScopeForbidden",
+            "prediction did not enforce owner access at both scopes"
+          )
+          yield* check(
+            (yield* authorized.pending).length === (role === "owner" ? 1 : 0),
+            "denied transfer entered journal"
+          )
+          if (role === "owner") {
+            downgraded = true
+            // Pull precedes sending unsent work: role loss must rebase away the transfer.
+            yield* authorized.sync
+            yield* check((yield* authorized.pending).length === 0, "role loss retained a pending transfer")
+            yield* check(
+              authorized.query((read) => read.get(Tag, TagId.make("role-tag")))?.scope === source,
+              "role loss retained the optimistic destination"
+            )
+          }
+        }
+      }
+      return "PASS INV-CLIENT-7 atomic rollback/ordered prediction; owner gates at both scopes and downgrade rebase; one durable batch; unpredicted action survives reopen"
     })
   )
 

@@ -335,6 +335,7 @@ export const saveReplica = (db: Database, value: Replica, replace = false) =>
       replace ||
       baseline === undefined ||
       baseline.value.rows.length === 0 ||
+      value.rows.length === 0 ||
       baseline.nextOrder + value.rows.length > Number.MAX_SAFE_INTEGER
     const orders = new Map<string, number>()
     let nextOrder = full ? 0 : baseline.nextOrder

@@ -10,6 +10,7 @@ import * as Wire from "../protocol.ts"
 export const migrate = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient
   yield* sql`UPDATE echosync_engine SET cursor=cursor`
+  yield* sql`ALTER TABLE echosync_engine ADD COLUMN IF NOT EXISTS sync_generation bigint NOT NULL DEFAULT 0`
   yield* sql`CREATE TABLE IF NOT EXISTS echosync_scope_floors(scope text PRIMARY KEY, cursor bigint NOT NULL)`
   yield* sql`INSERT INTO echosync_scope_floors SELECT scope,cursor FROM echosync_scopes ON CONFLICT DO NOTHING`
   yield* sql`CREATE TABLE IF NOT EXISTS echosync_scope_changes(scope text NOT NULL, revision bigint NOT NULL, aggregate text NOT NULL,id text NOT NULL,PRIMARY KEY(scope,revision,aggregate,id))`
@@ -30,7 +31,7 @@ export const migrate = Effect.gen(function* () {
   $body$`
   yield* sql`DROP TRIGGER IF EXISTS echosync_track_stream ON echosync_streams`
   yield* sql`CREATE TRIGGER echosync_track_stream AFTER INSERT OR UPDATE OR DELETE ON echosync_streams FOR EACH ROW EXECUTE FUNCTION echosync_track_stream()`
-  yield* sql`CREATE TABLE IF NOT EXISTS echosync_pull_sessions(id uuid PRIMARY KEY DEFAULT gen_random_uuid(),principal text NOT NULL,epoch text NOT NULL,grant_position bigint NOT NULL,expires_at timestamptz NOT NULL DEFAULT now()+interval '5 minutes',response jsonb NOT NULL)`
+  yield* sql`CREATE TABLE IF NOT EXISTS echosync_pull_sessions(id uuid PRIMARY KEY DEFAULT gen_random_uuid(),principal text NOT NULL,epoch text NOT NULL,grant_position bigint NOT NULL,generation bigint NOT NULL,expires_at timestamptz NOT NULL DEFAULT now()+interval '5 minutes',response jsonb NOT NULL)`
   yield* sql`CREATE INDEX IF NOT EXISTS echosync_pull_expiry ON echosync_pull_sessions(expires_at)`
   yield* sql`CREATE TABLE IF NOT EXISTS echosync_pull_entries(session uuid NOT NULL REFERENCES echosync_pull_sessions(id) ON DELETE CASCADE,position bigint NOT NULL,scope text NOT NULL,entry jsonb NOT NULL,PRIMARY KEY(session,position))`
 })
@@ -55,7 +56,8 @@ export const pull = Effect.fnUntraced(function* (principal: Principal, request: 
       const engines = yield* sql<{
         readonly epoch: string
         readonly revision: string
-      }>`SELECT epoch,cursor::text AS revision FROM echosync_engine`
+        readonly generation: string
+      }>`SELECT epoch,cursor::text AS revision,sync_generation::text AS generation FROM echosync_engine`
       const engine = engines[0]
       if (engine === undefined) return yield* new Wire.ServerError({ message: "Run EchoSync migrate" })
       if (request.epoch !== null && request.epoch !== engine.epoch)
@@ -90,7 +92,7 @@ export const pull = Effect.fnUntraced(function* (principal: Principal, request: 
         }
         const sessions = yield* sql<{
           readonly id: string
-        }>`INSERT INTO echosync_pull_sessions(principal,epoch,grant_position,response) VALUES(${principal},${engine.epoch},${authorization},${sql.json(response)}) RETURNING id::text`
+        }>`INSERT INTO echosync_pull_sessions(principal,epoch,grant_position,generation,response) VALUES(${principal},${engine.epoch},${authorization},${engine.generation},${sql.json(response)}) RETURNING id::text`
         id = sessions[0]?.id
         if (id === undefined) return yield* new Wire.ServerError({ message: "Cannot stage Pull" })
         let offset = 0
@@ -114,7 +116,7 @@ export const pull = Effect.fnUntraced(function* (principal: Principal, request: 
       }
       const sessions = yield* sql<{
         readonly response: unknown
-      }>`SELECT response FROM echosync_pull_sessions WHERE id=${id}::uuid AND principal=${principal} AND epoch=${engine.epoch} AND grant_position=${authorization} AND expires_at>now()`
+      }>`SELECT response FROM echosync_pull_sessions WHERE id=${id}::uuid AND principal=${principal} AND epoch=${engine.epoch} AND grant_position=${authorization} AND generation=${engine.generation} AND expires_at>now()`
       const session = sessions[0]
       // Expiry/revocation is retryable without resetting the durable replica or journal.
       if (session === undefined)

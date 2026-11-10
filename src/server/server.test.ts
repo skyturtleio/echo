@@ -128,7 +128,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         reads: [],
         decide: ({ enabled }) => ({
           operations: enabled
-            ? [Server.Action.grant({ scope: room, principal: alice, role: "writer" })]
+            ? [Server.Action.grant({ scope: room, principal: alice, role: "owner" })]
             : [Server.Action.revoke(room, alice)]
         })
       })
@@ -144,7 +144,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
                 new TagHistoryImported({ snapshot: { name: `name-${i}`, scope: privateScope(alice), removed: false } })
               ])
             ),
-            grants: [{ scope: room, principal: alice, role: "writer" }]
+            grants: [{ scope: room, principal: alice, role: "owner" }]
           })
           const initial = yield* server.pull(alice, { epoch: null, cursors: {}, incremental: true })
           expect(entries(initial)).toHaveLength(2048)
@@ -215,16 +215,18 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           expect(
             entries(yield* server.pull(alice, { epoch: delta.epoch, cursors: cursors(delta), incremental: true }))
           ).toEqual([])
-          yield* server.execute(alice, {
-            epoch: delta.epoch,
-            clientId: "device",
-            batches: [
-              {
-                id: "move",
-                commands: [{ aggregate: "Tag", command: { _tag: "MoveTag", target: "row-2000", scope: room } }]
-              }
-            ]
-          })
+          expect(
+            (yield* server.execute(alice, {
+              epoch: delta.epoch,
+              clientId: "device",
+              batches: [
+                {
+                  id: "move",
+                  commands: [{ aggregate: "Tag", command: { _tag: "MoveTag", target: "row-2000", scope: room } }]
+                }
+              ]
+            })).receipts[0]?._tag
+          ).toBe("Accepted")
           const moved = yield* server.pull(alice, { epoch: delta.epoch, cursors: cursors(delta), incremental: true })
           expect(Option.getOrUndefined(Arr.findFirst(moved.scopes, (s) => s.scope === "user:alice"))?.entries).toEqual([
             { _tag: "Gone", aggregate: "Tag", id: "row-2000" }
@@ -323,15 +325,31 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           const facts = yield* sql`SELECT * FROM echosync_events ORDER BY seq`
           const receipts = yield* sql`SELECT * FROM echosync_receipts ORDER BY batch_id`
           const before = yield* current.pull(alice, { epoch: null, cursors: {} })
+          const staged = yield* current.pull(alice, { epoch: before.epoch, cursors: {}, incremental: true })
           const projected = yield* Server.make({ aggregates: [ProjectedTally] })
           expect(yield* projected.get(alice, ProjectedTally, "one").pipe(Effect.flip)).toMatchObject({
             _tag: "ServerError"
           })
           expect(yield* projected.rebuildProjections([ProjectedTally])).toBe(1)
+          expect(
+            (yield* Effect.result(
+              projected.pull(alice, {
+                epoch: before.epoch,
+                cursors: {},
+                incremental: true,
+                continuation: { id: staged.page?.id ?? "", offset: 0 }
+              })
+            ))._tag
+          ).toBe("Failure")
           expect(yield* projected.get(alice, ProjectedTally, "one")).toEqual({ value: 15, scope: "user:alice" })
           expect(yield* sql`SELECT * FROM echosync_events ORDER BY seq`).toEqual(facts)
           expect(yield* sql`SELECT * FROM echosync_receipts ORDER BY batch_id`).toEqual(receipts)
-          const after = yield* projected.pull(alice, { epoch: before.epoch, cursors: cursors(before) })
+          const after = yield* projected.pull(alice, {
+            epoch: before.epoch,
+            cursors: cursors(before),
+            incremental: true
+          })
+          expect(after.scopes[0]?.reset).toBe(true)
           expect(entries(after)).toEqual([
             {
               _tag: "Upsert",
@@ -1567,9 +1585,21 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         })
         const address = listener.address()
         if (address === null || typeof address === "string") return yield* Effect.die("Missing listener address")
-        const unauthenticated = RpcClient.layerProtocolHttp({ url: `http://127.0.0.1:${address.port}` }).pipe(
-          Layer.provide([FetchHttpClient.layer, RpcSerialization.layerNdjson])
+        const obsolete = yield* Effect.promise(() =>
+          web(
+            new Request("http://localhost/sync", {
+              method: "POST",
+              headers: { authorization: "Bearer fixture" },
+              body: "{}"
+            })
+          )
         )
+        expect(obsolete.status).toBe(426)
+        const unauthenticated = RpcClient.layerProtocolHttp({
+          url: `http://127.0.0.1:${address.port}`,
+          transformClient: (client) =>
+            HttpClient.mapRequest(client, HttpClientRequest.setHeader("x-echosync-protocol", "2"))
+        }).pipe(Layer.provide([FetchHttpClient.layer, RpcSerialization.layerNdjson]))
         const denied = yield* Effect.gen(function* () {
           const client = yield* RpcClient.make(Wire.EchoSyncRpcs)
           return yield* Effect.result(client.Execute(request("unauthorized")))

@@ -232,9 +232,9 @@ export const open = Effect.fnUntraced(function* (options: Options) {
   let committedReplica: { readonly token: string; readonly value: Model.Replica } | undefined
   const saveJournal = (db: Storage.Database, value: Model.Journal) =>
     diagnostics.measure("journal", Storage.save(db, value), () => value.intents.length)
-  const saveReplica = (db: Storage.Database, value: Model.Replica) =>
+  const saveReplica = (db: Storage.Database, value: Model.Replica, replace = false) =>
     diagnostics
-      .measure("replica", Storage.saveReplica(db, value), (result) => result.writes)
+      .measure("replica", Storage.saveReplica(db, value, replace), (result) => result.writes)
       .pipe(
         Effect.tap(({ token }) =>
           Effect.sync(() => {
@@ -612,7 +612,12 @@ export const open = Effect.fnUntraced(function* (options: Options) {
           rows: [...rows.values()],
           cursors
         }
-        yield* saveReplica(replicaDb, next)
+        yield* saveReplica(
+          replicaDb,
+          next,
+          Arr.some(completeScopes, (scope) => scope.reset) ||
+            Arr.some(Record.keys(replica.cursors), (scope) => !scopes.has(scope))
+        )
         replica = next
         channel.postMessage("replica")
         yield* publish(true)

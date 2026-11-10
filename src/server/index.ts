@@ -260,7 +260,12 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
             count++
           }
         }
-        if (count > 0) yield* changed([...scopes])
+        if (count > 0) {
+          // A staged old projection must not finish after a rebuild, even if its staging
+          // transaction commits after this one. A generation check fences that race.
+          yield* sql`UPDATE echosync_engine SET sync_generation=sync_generation+1`
+          yield* changed([...scopes], true)
+        }
         return count
       })
     )

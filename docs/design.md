@@ -579,13 +579,18 @@ behaviour adds or amends an item here in the same branch.
     page its entries, and recheck the principal, epoch and grant generation on every page.
     Clients install only the complete response; intermediate pages advance neither durable
     cursors nor receipt coverage. Grant changes invalidate staged catchups and scope history.
+    Projection rebuilds advance scope floors and a durable engine sync generation, checked
+    on continuation, including staging transactions that commit after the rebuild. Migration
+    holds the engine writer lock before initializing floors and installing stream tracking.
     Rejected: live offset paging (skips concurrent changes), advancing revision per partial
     page (retires pending work early), and sending new semantics to unaware clients.
     Browser persistence keeps a bootstrap base and per-stream replacement/tombstone records.
     A strict IndexedDB transaction commits these changes with epoch, grants, cursors, row order
     and token. Steady-state edits never rewrite the base. Cold/peer reads reconstruct the same
     complete replica; query/rebase CPU is still scope-wide. Full bootstrap and explicit resync
-    may replace the base. IndexedDB admission is now `3 + compatibilityGeneration`; the journal
+    replace the base, as does loss of a scope, removing revoked payloads from local storage.
+    Ordinary deletions use keyed tombstones; cold reads exclude the retained bootstrap value.
+    IndexedDB admission is now `3 + compatibilityGeneration`; the journal
     representation and receipt identities do not change. Valid old snapshots can be read and
     converted on first replica write, but deployments may deliberately start clean profiles.
     The owner accepts loss of old browser-only pending work for this transition, not server
@@ -672,7 +677,8 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
   compacted or missing cursors fall back safely. Deletes, moves and grant transitions cannot
   leak historical access or advance receipt coverage before atomic installation. A steady-state
   row change persists only that record and replica metadata, with atomic abort/reopen recovery;
-  unchanged replicas write no records. Old HTTP protocol clients cannot execute commands.
+  unchanged replicas write no records. Projection rebuilds invalidate old staged pages and
+  force snapshot fallback. Old HTTP protocol clients cannot execute commands.
 
 - **INV-SCHEMA-1:** Browser compatibility generations preserve journal identity and payloads,
   exclude older bundles and supersede live handles without late writes. Blocked upgrades

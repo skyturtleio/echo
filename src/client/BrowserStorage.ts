@@ -1,8 +1,13 @@
+import * as Arr from "effect/Array"
 import * as Data from "effect/Data"
 import * as Effect from "effect/Effect"
+import * as Equal from "effect/Equal"
 import { constVoid } from "effect/Function"
 import * as Option from "effect/Option"
+import * as Order from "effect/Order"
 import * as Schema from "effect/Schema"
+import { Replica, Row } from "./Model.ts"
+import { Position, StreamRef } from "../protocol.ts"
 
 export class StorageError extends Data.TaggedError("StorageError")<{ readonly cause: unknown }> {}
 export class ProfileBusy extends Data.TaggedError("ProfileBusy")<{ readonly profile: string }> {}
@@ -16,7 +21,7 @@ const storageFailure = (cause: unknown) =>
 
 const Generation = Schema.Int.check(
   Schema.isGreaterThanOrEqualTo(1),
-  Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER - 2)
+  Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER - 3)
 )
 
 // Browser platform edge; use the same native cryptographic source as Web Locks/IndexedDB's host.
@@ -70,7 +75,27 @@ export interface Database {
   readonly database: IDBDatabase
   superseded: boolean
   cache: { readonly token: unknown; readonly value: unknown } | undefined
+  replica?:
+    | {
+        readonly token: unknown
+        readonly value: Replica
+        readonly orders: ReadonlyMap<string, number>
+        readonly nextOrder: number
+      }
+    | undefined
 }
+
+const ReplicaHeader = Schema.Struct({
+  _storage: Schema.Literal("rows"),
+  epoch: Replica.fields.epoch,
+  revision: Replica.fields.revision,
+  grants: Replica.fields.grants,
+  cursors: Replica.fields.cursors,
+  nextOrder: Position
+})
+const OrderedRow = Schema.Struct({ order: Position, row: Row })
+const StoredRow = Schema.Union([OrderedRow, Schema.Struct({ gone: StreamRef })])
+const rowKey = (row: typeof StreamRef.Type) => `${row.aggregate.length}:${row.aggregate}${row.id}`
 
 /** Separate databases deliberately prevent cache disposal from deleting pending commands.
  * Version 2 introduced change tokens; later versions fence incompatible app bundles. */
@@ -84,7 +109,7 @@ export const openDatabase = (name: string, compatibilityGeneration = 1) =>
       let abandoned = false
       let request: IDBOpenDBRequest
       try {
-        request = indexedDB.open(name, 2 + compatibilityGeneration)
+        request = indexedDB.open(name, 3 + compatibilityGeneration)
       } catch (cause) {
         resume(storageFailure(cause))
         return
@@ -96,6 +121,7 @@ export const openDatabase = (name: string, compatibilityGeneration = 1) =>
         }
         try {
           if (!request.result.objectStoreNames.contains("data")) request.result.createObjectStore("data")
+          if (!request.result.objectStoreNames.contains("rows")) request.result.createObjectStore("rows")
         } catch (cause) {
           request.transaction?.abort()
           resume(storageFailure(cause))
@@ -154,7 +180,7 @@ export const loadIfChanged = (db: Database, acknowledgedToken?: string) =>
     let store: IDBObjectStore
     let request: IDBRequest<unknown>
     try {
-      tx = db.database.transaction("data", "readonly")
+      tx = db.database.transaction(["data", "rows"], "readonly")
       store = tx.objectStore("data")
       request = store.get("token")
     } catch (cause) {
@@ -162,6 +188,8 @@ export const loadIfChanged = (db: Database, acknowledgedToken?: string) =>
       return
     }
     let value: unknown
+    let storedRows: unknown
+    let baseRows: unknown
     let unchanged = false
     request.addEventListener("success", () => {
       if (acknowledgedToken !== undefined && acknowledgedToken === request.result) unchanged = true
@@ -171,6 +199,21 @@ export const loadIfChanged = (db: Database, acknowledgedToken?: string) =>
           const snapshot = store.get("snapshot")
           snapshot.addEventListener("success", () => {
             value = snapshot.result
+            if (Schema.is(ReplicaHeader)(value)) {
+              try {
+                const base = store.get("base")
+                base.addEventListener("success", () => {
+                  baseRows = base.result
+                })
+                const rows = tx.objectStore("rows").getAll()
+                rows.addEventListener("success", () => {
+                  storedRows = rows.result
+                })
+              } catch (cause) {
+                tx.abort()
+                resume(storageFailure(cause))
+              }
+            }
           })
         } catch (cause) {
           // Prevent complete from installing an absent snapshot in the cache after a failed read.
@@ -180,8 +223,51 @@ export const loadIfChanged = (db: Database, acknowledgedToken?: string) =>
       }
     })
     tx.addEventListener("complete", () => {
-      if (!unchanged) db.cache = { token: request.result, value }
-      resume(Effect.succeed(unchanged ? Option.none() : Option.some(value)))
+      if (unchanged) {
+        resume(Effect.succeed(Option.none()))
+        return
+      }
+      const header = value
+      if (Schema.is(ReplicaHeader)(header)) {
+        resume(
+          Schema.decodeUnknownEffect(Schema.Struct({ base: Schema.Array(Row), changes: Schema.Array(StoredRow) }))({
+            base: baseRows,
+            changes: storedRows
+          }).pipe(
+            Effect.mapError((cause) => new StorageError({ cause })),
+            Effect.map(({ base, changes }) => {
+              const rows = new Map(Arr.map(base, (row, order) => [rowKey(row), { row, order }]))
+              for (const change of changes) {
+                if ("gone" in change) rows.delete(rowKey(change.gone))
+                else rows.set(rowKey(change.row), change)
+              }
+              const sorted = Arr.sort(
+                [...rows.values()],
+                Order.mapInput(Order.Number, (item: typeof OrderedRow.Type) => item.order)
+              )
+              const replica: Replica = {
+                epoch: header.epoch,
+                revision: header.revision,
+                grants: header.grants,
+                cursors: header.cursors,
+                rows: Arr.map(sorted, (item) => item.row)
+              }
+              db.replica = {
+                token: request.result,
+                value: replica,
+                orders: new Map(Arr.map(sorted, (item) => [rowKey(item.row), item.order])),
+                nextOrder: header.nextOrder
+              }
+              db.cache = { token: request.result, value: replica }
+              return Option.some(replica)
+            })
+          )
+        )
+      } else {
+        if (db.replica?.token !== request.result) db.replica = undefined
+        db.cache = { token: request.result, value }
+        resume(Effect.succeed(Option.some(value)))
+      }
     })
     tx.addEventListener("abort", () => resume(Effect.fail(new StorageError({ cause: tx.error }))))
     tx.addEventListener("error", () => resume(Effect.fail(new StorageError({ cause: tx.error }))))
@@ -203,7 +289,7 @@ export const save = (db: Database, value: unknown) =>
     const token = crypto.randomUUID()
     let tx: IDBTransaction
     try {
-      tx = db.database.transaction("data", "readwrite", { durability: "strict" })
+      tx = db.database.transaction(["data", "rows"], "readwrite", { durability: "strict" })
     } catch (cause) {
       resume(storageFailure(cause))
       return
@@ -211,13 +297,122 @@ export const save = (db: Database, value: unknown) =>
     try {
       tx.objectStore("data").put(value, "snapshot")
       tx.objectStore("data").put(token, "token")
+      tx.objectStore("data").delete("base")
+      tx.objectStore("rows").clear()
     } catch (cause) {
       // A successful first put must never commit without its matching token.
       tx.abort()
       resume(storageFailure(cause))
       return
     }
-    tx.addEventListener("complete", () => resume(Effect.succeed(token)))
+    tx.addEventListener("complete", () => {
+      db.replica = undefined
+      resume(Effect.succeed(token))
+    })
+    tx.addEventListener("abort", () => resume(Effect.fail(new StorageError({ cause: tx.error }))))
+    tx.addEventListener("error", () => resume(Effect.fail(new StorageError({ cause: tx.error }))))
+  })
+
+/** A strict transaction installs metadata, changed records and token together. The caller
+ * holds the profile mutation lock; the token check also refuses a stale storage baseline. */
+export const saveReplica = (db: Database, value: Replica, replace = false) =>
+  Effect.callback<{ readonly token: string; readonly writes: number }, StorageError | CompatibilityError>((resume) => {
+    if (db.superseded) {
+      resume(Effect.fail(new CompatibilityError({ reason: "superseded" })))
+      return
+    }
+    // oxlint-disable-next-line effecttsgo/crypto-random-uuid-in-effect -- native token fences cross-tab reset and recreation
+    const token = crypto.randomUUID()
+    let tx: IDBTransaction
+    try {
+      tx = db.database.transaction(["data", "rows"], "readwrite", { durability: "strict" })
+    } catch (cause) {
+      resume(storageFailure(cause))
+      return
+    }
+    const baseline = db.replica
+    const full =
+      replace ||
+      baseline === undefined ||
+      baseline.value.rows.length === 0 ||
+      baseline.nextOrder + value.rows.length > Number.MAX_SAFE_INTEGER
+    const orders = new Map<string, number>()
+    let nextOrder = full ? 0 : baseline.nextOrder
+    let writes = 0
+    const apply = () => {
+      try {
+        const store = tx.objectStore("rows")
+        const prior = new Map(Arr.map(baseline?.value.rows ?? [], (row) => [rowKey(row), row]))
+        let lastOrder = -1
+        let append = false
+        if (full) {
+          store.clear()
+          tx.objectStore("data").put(value.rows, "base")
+        }
+        for (const row of value.rows) {
+          const key = rowKey(row)
+          const old = prior.get(key)
+          const order = baseline?.orders.get(key)
+          if (full) {
+            orders.set(key, nextOrder++)
+            writes++
+          } else if (
+            !append &&
+            old !== undefined &&
+            order !== undefined &&
+            order > lastOrder &&
+            Equal.equals(old, row)
+          ) {
+            orders.set(key, order)
+            lastOrder = order
+          } else {
+            append = true
+            orders.set(key, nextOrder)
+            store.put({ order: nextOrder++, row }, [row.aggregate, row.id])
+            writes++
+          }
+          prior.delete(key)
+        }
+        for (const row of prior.values()) {
+          if (!full) store.put({ gone: { aggregate: row.aggregate, id: row.id } }, [row.aggregate, row.id])
+          writes++
+        }
+        tx.objectStore("data").put(
+          {
+            _storage: "rows",
+            epoch: value.epoch,
+            revision: value.revision,
+            grants: value.grants,
+            cursors: value.cursors,
+            nextOrder
+          },
+          "snapshot"
+        )
+        tx.objectStore("data").put(token, "token")
+      } catch (cause) {
+        tx.abort()
+        resume(storageFailure(cause))
+      }
+    }
+    try {
+      const current = tx.objectStore("data").get("token")
+      current.addEventListener("success", () => {
+        if (baseline !== undefined && baseline.token !== current.result) {
+          tx.abort()
+          resume(Effect.fail(new StorageError({ cause: "Replica changed before commit" })))
+          return
+        }
+        apply()
+      })
+    } catch (cause) {
+      tx.abort()
+      resume(storageFailure(cause))
+      return
+    }
+    tx.addEventListener("complete", () => {
+      db.replica = { token, value, orders, nextOrder }
+      resume(Effect.succeed({ token, writes }))
+    })
     tx.addEventListener("abort", () => resume(Effect.fail(new StorageError({ cause: tx.error }))))
     tx.addEventListener("error", () => resume(Effect.fail(new StorageError({ cause: tx.error }))))
   })

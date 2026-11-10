@@ -4,7 +4,9 @@ import * as Redacted from "effect/Redacted"
 import * as Str from "effect/String"
 import { HttpEffect } from "effect/http"
 import { Note, Tag } from "../../examples/fixture/domain/src/index.ts"
-import { Principal } from "../../src/domain/Scope.ts"
+import { TagHistoryImported } from "../../examples/fixture/domain/src/Tag/TagHistoryImported.event.ts"
+import { TagId } from "../../examples/fixture/domain/src/Tag/Tag.id.ts"
+import { Principal, Scope as SchemaScope } from "../../src/domain/Scope.ts"
 import * as Server from "../../src/server/index.ts"
 
 // Dedicated disposable schema, never app data; this runner only connects to the orb's local test database.
@@ -51,6 +53,41 @@ await Effect.runPromise(
             fetch(request, listener) {
               const path = new URL(request.url).pathname
               if (path === "/sync" || path === "/sync/") return rpc(request)
+              if (path === "/seed-incremental")
+                return run(
+                  Effect.gen(function* () {
+                    yield* server.importStreams({
+                      id: "incremental-fixture",
+                      principal: Principal.make("browser-fixture"),
+                      streams: Array.from({ length: 3001 }, (_, i) =>
+                        Server.importedStream(Tag, TagId.make(`incremental-${i}`), [
+                          new TagHistoryImported({
+                            snapshot: {
+                              name: `incremental-${i}`,
+                              scope: SchemaScope.make("user:browser-fixture"),
+                              removed: false
+                            }
+                          })
+                        ])
+                      )
+                    })
+                    yield* server.ingestCatalog({
+                      scope: "catalog:incremental",
+                      release: "one",
+                      rows: [
+                        {
+                          aggregate: "Tag",
+                          id: "incremental-deleted",
+                          state: { name: "delete", scope: "catalog:incremental", removed: false }
+                        }
+                      ]
+                    })
+                  })
+                ).then(() => Response.json(true))
+              if (path === "/delete-incremental")
+                return run(server.ingestCatalog({ scope: "catalog:incremental", release: "empty", rows: [] })).then(
+                  () => Response.json(true)
+                )
               if (path === "/seed-catalog") {
                 // Administrative fixture ingestion can exceed Bun's idle timeout; RPC deadlines stay unchanged.
                 listener.timeout(request, 0)

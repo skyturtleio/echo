@@ -33,7 +33,9 @@ export const ExecuteResponse = Schema.Struct({ epoch: Schema.String, receipts: S
 export type ExecuteResponse = typeof ExecuteResponse.Type
 export const PullRequest = Schema.Struct({
   epoch: Schema.NullOr(Schema.String),
-  cursors: Schema.Record(Schema.String, Position)
+  cursors: Schema.Record(Schema.String, Position),
+  incremental: Schema.optional(Schema.Boolean),
+  continuation: Schema.optional(Schema.Struct({ id: Schema.String, offset: Position }))
 })
 export type PullRequest = typeof PullRequest.Type
 /**
@@ -46,6 +48,7 @@ export const PullResponse = Schema.Struct({
   epoch: Schema.String,
   revision: Position,
   grants: Schema.Array(Grant),
+  page: Schema.optional(Schema.Struct({ id: Schema.String, next: Schema.NullOr(Position) })),
   scopes: Schema.Array(
     Schema.Struct({
       scope: Schema.String,

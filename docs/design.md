@@ -569,6 +569,31 @@ behaviour adds or amends an item here in the same branch.
     Do not use this one-time exception to weaken normal journal durability. Rejected: permanent
     aliases, dual reads/writes, three app copies of engine DDL, and a browser compatibility bridge.
 
+37. **Incremental Pull is opt-in and installs complete catchups atomically** (2026-11-10).
+    Transactional stream change records share the existing serialized commit revision; deletes
+    and moves retain Gone entries. Compaction advances a durable per-scope floor; migration
+    initializes it at existing cursors without changing epochs, receipts or streams. Initial,
+    future and compacted cursors receive snapshots. Legacy Pull remains snapshot-only.
+    Opted-in catchups materialize a fixed authorized view in expiring server staging tables,
+    page its entries, and recheck the principal, epoch and grant generation on every page.
+    Clients install only the complete response; intermediate pages advance neither durable
+    cursors nor receipt coverage. Grant changes invalidate staged catchups and scope history.
+    Rejected: live offset paging (skips concurrent changes), advancing revision per partial
+    page (retires pending work early), and sending new semantics to unaware clients.
+    Browser persistence keeps a bootstrap base and per-stream replacement/tombstone records.
+    A strict IndexedDB transaction commits these changes with epoch, grants, cursors, row order
+    and token. Steady-state edits never rewrite the base. Cold/peer reads reconstruct the same
+    complete replica; query/rebase CPU is still scope-wide. Full bootstrap and explicit resync
+    may replace the base. IndexedDB admission is now `3 + compatibilityGeneration`; the journal
+    representation and receipt identities do not change. Valid old snapshots can be read and
+    converted on first replica write, but deployments may deliberately start clean profiles.
+    The owner accepts loss of old browser-only pending work for this transition, not server
+    data. HTTP requires `x-echosync-protocol: 2` before RPC dispatch; retire old mounted routes
+    and server processes at rollout. No live reset is performed by the library migration.
+    Rejected: rewriting the replica blob per edit, per-row bootstrap transactions, and a
+    SQLite/Wasm/worker replacement. Serialized payload sizes measure submitted data, not
+    browser-internal physical IndexedDB bytes (which the platform does not expose).
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -581,6 +606,13 @@ on the server, act from a device, assert state after sync or rebase.
 Areas: `SERVER` (execute, receipts, scope log, grants, policies, epoch), `CLIENT` (leader,
 journal, replica, effective state, rebase, outcomes, queries), `SYNC` (end to end across
 devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
+
+- **INV-SYNC-2:** Incremental catchups preserve a transaction-consistent complete scope view
+  across bounded pages and intervening commits. Retries replay the same staged page; expired,
+  compacted or missing cursors fall back safely. Deletes, moves and grant transitions cannot
+  leak historical access or advance receipt coverage before atomic installation. A steady-state
+  row change persists only that record and replica metadata, with atomic abort/reopen recovery;
+  unchanged replicas write no records. Old HTTP protocol clients cannot execute commands.
 
 - **INV-SCHEMA-1:** Browser compatibility generations preserve journal identity and payloads,
   exclude older bundles and supersede live handles without late writes. Blocked upgrades

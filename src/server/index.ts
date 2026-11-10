@@ -10,7 +10,7 @@ import * as Schema from "effect/Schema"
 import type * as ResourceScope from "effect/Scope"
 import type * as Stream from "effect/Stream"
 import * as Str from "effect/String"
-import { HttpServerRequest } from "effect/http"
+import { HttpServerRequest, HttpServerResponse } from "effect/http"
 import { RpcSerialization, RpcServer } from "effect/rpc"
 import { SqlClient, SqlError } from "effect/sql"
 import * as Aggregate from "../domain/Aggregate.ts"
@@ -21,6 +21,7 @@ import { canRead, canWrite, Grant, privateScope, type Principal, Scope, ScopeFor
 import * as Wire from "../protocol.ts"
 import type * as Action from "./Action.ts"
 import * as Changes from "./Changes.ts"
+import * as Sync from "./Sync.ts"
 export * as Action from "./Action.ts"
 
 const decode = <S extends Codec>(schema: S, value: unknown) =>
@@ -93,6 +94,7 @@ export const migrate = Effect.gen(function* () {
       yield* sql`CREATE TABLE IF NOT EXISTS echosync_imports (id text PRIMARY KEY,request jsonb NOT NULL)`
       yield* sql`CREATE TABLE IF NOT EXISTS echosync_connections (id text PRIMARY KEY,principal text NOT NULL,expires_at timestamptz NOT NULL)`
       yield* sql`CREATE TABLE IF NOT EXISTS echosync_presence (connection_id text NOT NULL REFERENCES echosync_connections(id) ON DELETE CASCADE,room text NOT NULL,client_id text NOT NULL,state jsonb NOT NULL,expires_at timestamptz NOT NULL,PRIMARY KEY(connection_id,room,client_id))`
+      yield* Sync.migrate
     })
   )
 })
@@ -159,6 +161,7 @@ export interface Server {
     id: Aggregate.IdOf<A>
   ) => Effect.Effect<Aggregate.StateOf<A> | null, ServerFailure>
   readonly ingestCatalog: (catalog: Catalog) => Effect.Effect<void, ServerFailure>
+  readonly compactScopes: (through: number) => Effect.Effect<void, ServerFailure>
   readonly importStreams: (request: ImportRequest) => Effect.Effect<void, ServerFailure>
   readonly resetEpoch: Effect.Effect<string, ServerFailure>
   readonly changes: (principal: Principal) => Stream.Stream<Wire.Change, Wire.ServerError>
@@ -216,6 +219,10 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
     yield* sql`UPDATE echosync_engine SET cursor=cursor+1`
     for (const scope of new Set(scopes))
       yield* sql`INSERT INTO echosync_scopes(scope,cursor) SELECT ${scope},cursor FROM echosync_engine ON CONFLICT(scope) DO UPDATE SET cursor=EXCLUDED.cursor`
+    if (global) {
+      for (const scope of new Set(scopes))
+        yield* sql`INSERT INTO echosync_scope_floors(scope,cursor) SELECT scope,cursor FROM echosync_scopes WHERE scope=${scope} ON CONFLICT(scope) DO UPDATE SET cursor=EXCLUDED.cursor`
+    }
     yield* sql`SELECT pg_notify('echosync_changes',${global ? "" : Changes.notification(scopes)})`
   })
   const execute = Effect.fn("EchoSync.Execute")(function* (principal: Principal, request: Wire.ExecuteRequest) {
@@ -484,6 +491,8 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
     principal: Principal,
     request: Wire.PullRequest
   ): Effect.fn.Return<Wire.PullResponse, unknown> {
+    if (request.incremental === true)
+      return yield* Sync.pull(principal, request).pipe(Effect.provideService(PgClient.PgClient, sql))
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         yield* sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY`
@@ -682,8 +691,10 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
       })
     )
   }, protect("Presence"))
+  const compactScopes = (through: number) =>
+    transaction(Sync.compact(through)).pipe(Effect.provideService(SqlClient.SqlClient, sql), protect("compactScopes"))
   const changes = yield* Changes.make(sql)
-  return { execute, pull, get, ingestCatalog, importStreams, resetEpoch, changes, presence }
+  return { execute, pull, get, ingestCatalog, compactScopes, importStreams, resetEpoch, changes, presence }
 })
 
 /** Mount this HTTP effect at the application's sync route; authentication runs for every request. */
@@ -692,6 +703,7 @@ export const httpApp = Effect.fnUntraced(function* <E, R>(
   authenticate: (request: HttpServerRequest.HttpServerRequest) => Effect.Effect<Principal, E, R>
 ) {
   const request = yield* HttpServerRequest.HttpServerRequest
+  if (request.headers["x-echosync-protocol"] !== "2") return HttpServerResponse.empty({ status: 426 })
   const principal = yield* authenticate(request)
   const handlers = Wire.EchoSyncRpcs.toLayer({
     Execute: (input) => server.execute(principal, input),

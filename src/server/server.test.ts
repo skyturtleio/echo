@@ -87,6 +87,195 @@ const scenario = <A, E>(
   )
 
 describe.skipIf(url === undefined)("Postgres server", () => {
+  it.effect(
+    "INV-SYNC-2 paged catchup cannot skip concurrent edits, deletes or revoked access",
+    () => {
+      const room = VisibilityScope.make("shared:incremental")
+      const membership = Server.Action.make({
+        name: "membership",
+        input: Schema.Struct({ enabled: Schema.Boolean }),
+        reads: [],
+        decide: ({ enabled }) => ({
+          operations: enabled
+            ? [Server.Action.grant({ scope: room, principal: alice, role: "writer" })]
+            : [Server.Action.revoke(room, alice)]
+        })
+      })
+      return scenario(
+        Effect.fnUntraced(function* (server, sql) {
+          const empty = yield* server.pull(alice, { epoch: null, cursors: {}, incremental: true })
+          expect(empty.scopes).toEqual([{ scope: "user:alice", cursor: 0, reset: true, entries: [] }])
+          yield* server.importStreams({
+            id: "many",
+            principal: alice,
+            streams: Arr.makeBy(2501, (i) =>
+              Server.importedStream(Tag, TagId.make(`row-${Str.padStart(4, "0")(String(i))}`), [
+                new TagHistoryImported({ snapshot: { name: `name-${i}`, scope: privateScope(alice), removed: false } })
+              ])
+            ),
+            grants: [{ scope: room, principal: alice, role: "writer" }]
+          })
+          const initial = yield* server.pull(alice, { epoch: null, cursors: {}, incremental: true })
+          expect(entries(initial)).toHaveLength(2048)
+          expect(initial.page?.next).toBe(2048)
+          const all = [...entries(initial)]
+          const edit: Wire.ExecuteRequest = {
+            epoch: initial.epoch,
+            clientId: "device",
+            batches: [
+              { id: "edit", commands: [{ aggregate: "Tag", command: { _tag: "RemoveTag", target: "row-2000" } }] }
+            ]
+          }
+          const receipt = yield* server.execute(alice, edit)
+          expect(yield* server.execute(alice, edit)).toEqual(receipt)
+          let page = initial.page
+          while (page?.next !== null && page?.next !== undefined) {
+            const input = {
+              epoch: initial.epoch,
+              cursors: {},
+              incremental: true,
+              continuation: { id: page.id, offset: page.next }
+            }
+            const next = yield* server.pull(alice, input)
+            expect(yield* server.pull(alice, input)).toEqual(next)
+            expect(next.revision).toBe(initial.revision)
+            expect(entries(next).length).toBeLessThanOrEqual(2048)
+            all.push(...entries(next))
+            page = next.page
+          }
+          expect(all).toHaveLength(2501)
+          expect(Option.getOrUndefined(Arr.findFirst(all, (entry) => entry.id === "row-2000"))).toMatchObject({
+            state: { removed: false }
+          })
+          const delta = yield* server.pull(alice, {
+            epoch: initial.epoch,
+            cursors: cursors(initial),
+            incremental: true
+          })
+          expect(entries(delta)).toEqual([
+            {
+              _tag: "Upsert",
+              aggregate: "Tag",
+              id: "row-2000",
+              seq: 2,
+              state: { name: "name-2000", scope: "user:alice", removed: true }
+            }
+          ])
+          expect(Arr.every(delta.scopes, (scope) => !scope.reset)).toBe(true)
+          const legacy = yield* server.pull(alice, { epoch: initial.epoch, cursors: cursors(initial) })
+          expect(entries(legacy)).toHaveLength(2501)
+          expect(legacy.page).toBeUndefined()
+          expect(
+            entries(yield* server.pull(alice, { epoch: delta.epoch, cursors: cursors(delta), incremental: true }))
+          ).toEqual([])
+          yield* server.compactScopes(delta.revision)
+          expect(
+            Option.getOrUndefined(
+              Arr.findFirst(
+                (yield* server.pull(alice, {
+                  epoch: initial.epoch,
+                  cursors: cursors(initial),
+                  incremental: true
+                })).scopes,
+                (s) => s.scope === "user:alice"
+              )
+            )?.reset
+          ).toBe(true)
+          expect(
+            entries(yield* server.pull(alice, { epoch: delta.epoch, cursors: cursors(delta), incremental: true }))
+          ).toEqual([])
+          yield* server.execute(alice, {
+            epoch: delta.epoch,
+            clientId: "device",
+            batches: [
+              {
+                id: "move",
+                commands: [{ aggregate: "Tag", command: { _tag: "MoveTag", target: "row-2000", scope: room } }]
+              }
+            ]
+          })
+          const moved = yield* server.pull(alice, { epoch: delta.epoch, cursors: cursors(delta), incremental: true })
+          expect(Option.getOrUndefined(Arr.findFirst(moved.scopes, (s) => s.scope === "user:alice"))?.entries).toEqual([
+            { _tag: "Gone", aggregate: "Tag", id: "row-2000" }
+          ])
+          expect(Option.getOrUndefined(Arr.findFirst(moved.scopes, (s) => s.scope === room))?.entries[0]).toMatchObject(
+            {
+              _tag: "Upsert",
+              id: "row-2000",
+              state: { scope: room }
+            }
+          )
+          const mutateMembership = (enabled: boolean) =>
+            server.execute(alice, {
+              epoch: null,
+              clientId: "device",
+              batches: [
+                { id: `membership-${enabled}`, commands: [], action: { name: "membership", input: { enabled } } }
+              ]
+            })
+          yield* mutateMembership(false)
+          expect(
+            (yield* Effect.result(
+              server.pull(alice, {
+                epoch: initial.epoch,
+                cursors: {},
+                incremental: true,
+                continuation: { id: initial.page?.id ?? "", offset: 2048 }
+              })
+            ))._tag
+          ).toBe("Failure")
+          const revoked = yield* server.pull(alice, { epoch: delta.epoch, cursors: cursors(moved), incremental: true })
+          expect(Arr.some(revoked.scopes, (s) => s.scope === room)).toBe(false)
+          yield* mutateMembership(true)
+          const granted = yield* server.pull(alice, { epoch: delta.epoch, cursors: cursors(moved), incremental: true })
+          expect(Option.getOrUndefined(Arr.findFirst(granted.scopes, (s) => s.scope === room))).toMatchObject({
+            reset: true,
+            entries: [{ _tag: "Upsert", id: "row-2000" }]
+          })
+          yield* server.ingestCatalog({
+            scope: "catalog:deletes",
+            release: "one",
+            rows: [
+              { aggregate: "Tag", id: "deleted", state: { name: "deleted", scope: "catalog:deletes", removed: false } }
+            ]
+          })
+          const catalog = yield* server.pull(alice, { epoch: null, cursors: cursors(granted), incremental: true })
+          yield* server.ingestCatalog({ scope: "catalog:deletes", release: "empty", rows: [] })
+          const removed = yield* server.pull(alice, { epoch: null, cursors: cursors(catalog), incremental: true })
+          expect(
+            Option.getOrUndefined(Arr.findFirst(removed.scopes, (s) => s.scope === "catalog:deletes"))?.entries
+          ).toEqual([{ _tag: "Gone", aggregate: "Tag", id: "deleted" }])
+          yield* sql`UPDATE echosync_pull_sessions SET expires_at=now()-interval '1 second'`
+          expect(
+            (yield* Effect.result(
+              server.pull(alice, {
+                epoch: removed.epoch,
+                cursors: {},
+                incremental: true,
+                continuation: { id: removed.page?.id ?? "", offset: 0 }
+              })
+            ))._tag
+          ).toBe("Failure")
+          expect(
+            Option.getOrUndefined(
+              Arr.findFirst(
+                (yield* server.pull(alice, {
+                  epoch: null,
+                  cursors: { "user:alice": Number.MAX_SAFE_INTEGER },
+                  incremental: true
+                })).scopes,
+                (s) => s.scope === "user:alice"
+              )
+            )?.reset
+          ).toBe(true)
+        }),
+        12,
+        [membership]
+      )
+    },
+    60000
+  )
+
   it.effect("INV-SERVER-11 naming cutover cannot split rows, reset sequences or partially commit", () =>
     scenario(
       Effect.fnUntraced(function* (server, sql) {
@@ -1030,7 +1219,10 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         const protocol = RpcClient.layerProtocolHttp({
           url: `http://127.0.0.1:${address.port}`,
           transformClient: (client) =>
-            HttpClient.mapRequest(client, HttpClientRequest.setHeader("authorization", "Bearer fixture"))
+            HttpClient.mapRequest(
+              client,
+              HttpClientRequest.setHeaders({ authorization: "Bearer fixture", "x-echosync-protocol": "2" })
+            )
         }).pipe(Layer.provide([FetchHttpClient.layer, RpcSerialization.layerNdjson]))
         yield* Effect.gen(function* () {
           const client = yield* RpcClient.make(Wire.EchoSyncRpcs)

@@ -14,7 +14,7 @@ import type * as EffectScope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as SubscriptionRef from "effect/SubscriptionRef"
-import { FetchHttpClient, HttpClient } from "effect/http"
+import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http"
 import { RpcClient, RpcSerialization } from "effect/rpc"
 import type * as Aggregate from "../domain/Aggregate.ts"
 import type { Principal, Scope } from "../domain/Scope.ts"
@@ -124,7 +124,10 @@ export const httpTransport = Effect.fnUntraced(function* (
   const httpClient = Layer.effect(HttpClient.HttpClient)(
     Effect.map(HttpClient.HttpClient, HttpClient.filterStatusOk)
   ).pipe(Layer.provide(FetchHttpClient.layer), Layer.provide(Layer.succeed(FetchHttpClient.RequestInit)(requestInit)))
-  const protocol = RpcClient.layerProtocolHttp({ url }).pipe(
+  const protocol = RpcClient.layerProtocolHttp({
+    url,
+    transformClient: (client) => HttpClient.mapRequest(client, HttpClientRequest.setHeader("x-echosync-protocol", "2"))
+  }).pipe(
     // NDJSON measures UTF-16 code units per response frame, not bytes or total heap.
     // Server request parsing keeps Effect's smaller default limit.
     Layer.provide(RpcSerialization.layerNdjsonWith({ maxBufferSize: 64 * 1024 * 1024 })),
@@ -201,9 +204,9 @@ export const open = Effect.fnUntraced(function* (options: Options) {
     diagnostics.measure("journal", Storage.save(db, value), () => value.intents.length)
   const saveReplica = (db: Storage.Database, value: Model.Replica) =>
     diagnostics
-      .measure("replica", Storage.save(db, value), () => value.rows.length)
+      .measure("replica", Storage.saveReplica(db, value), (result) => result.writes)
       .pipe(
-        Effect.tap((token) =>
+        Effect.tap(({ token }) =>
           Effect.sync(() => {
             // Only reusable while this exact immutable value is installed as the current replica.
             committedReplica = { token, value }
@@ -466,11 +469,42 @@ export const open = Effect.fnUntraced(function* (options: Options) {
     )
   const pull = Effect.gen(function* () {
     const request = yield* locked(
-      Effect.sync(() => ({ epoch: journal.epoch, cursors: replica.epoch === journal.epoch ? replica.cursors : {} }))
+      Effect.sync(() => ({
+        epoch: journal.epoch,
+        cursors: replica.epoch === journal.epoch ? replica.cursors : {},
+        incremental: true
+      }))
     )
     const response = yield* diagnostics.measure("pull", options.transport.pull(request), (reply) =>
       Arr.reduce(reply.scopes, 0, (count, scope) => count + scope.entries.length)
     )
+    // Staging is session-local. No durable cursor, grant or receipt coverage changes until
+    // every page has arrived; a failed page restarts from the last installed replica.
+    let page = response.page
+    const accumulated = new Map(Arr.map(response.scopes, (scope) => [scope.scope, [...scope.entries]]))
+    while (page?.next !== null && page?.next !== undefined) {
+      const next = yield* diagnostics.measure(
+        "pull",
+        options.transport.pull({
+          ...request,
+          continuation: { id: page.id, offset: page.next }
+        }),
+        (reply) => Arr.reduce(reply.scopes, 0, (count, scope) => count + scope.entries.length)
+      )
+      if (
+        next.epoch !== response.epoch ||
+        next.revision !== response.revision ||
+        next.page?.id !== page.id ||
+        (next.page.next !== null && next.page.next <= page.next)
+      )
+        return yield* new ClientError({ cause: "Invalid Pull continuation" })
+      for (const scope of next.scopes) accumulated.get(scope.scope)?.push(...scope.entries)
+      page = next.page
+    }
+    const completeScopes =
+      response.page === undefined
+        ? response.scopes
+        : Arr.map(response.scopes, (scope) => ({ ...scope, entries: accumulated.get(scope.scope) ?? [] }))
     if (request.epoch !== null && response.epoch !== request.epoch) {
       return yield* new Protocol.ResyncRequired({ epoch: response.epoch })
     }
@@ -514,7 +548,7 @@ export const open = Effect.fnUntraced(function* (options: Options) {
           if (scopes.has(row.scope)) append(streamKey(row.aggregate, row.id), row)
         }
         const cursors: Record<string, number> = {}
-        for (const scope of response.scopes) {
+        for (const scope of completeScopes) {
           if (scope.reset) {
             for (const key of members.get(scope.scope) ?? []) remove(key)
           }

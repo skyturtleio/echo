@@ -23,6 +23,7 @@ agent-browser --session "$session" wait --fn 'typeof echosyncScenarios === "obje
 agent-browser --session "$session" eval "echosyncScenarios.verifyServerReload('$profile-server')"
 agent-browser --session "$session" set offline off
 agent-browser --session "$session" eval "echosyncScenarios.verifyServerReload('$profile-server')"
+agent-browser --session "$session" eval "echosyncScenarios.incremental('$profile-incremental')"
 curl --fail --silent --show-error "${ECHOSYNC_BROWSER_URL:-http://localhost:4178}/seed-catalog"
 agent-browser --session "$session" eval "echosyncScenarios.largeCatalog('$profile-catalog')"
 agent-browser --session "$session" reload

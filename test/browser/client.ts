@@ -2370,9 +2370,215 @@ const incompatibleCommands = (profile: string) =>
     })
   )
 
+// INV-SYNC-2: real HTTP/PG pages plus the actual IndexedDB write boundary, not estimated replica size.
+const incremental = (profile: string) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- standalone disposable fixture HTTP entry point
+      yield* HttpClient.get(`${location.origin}/seed-incremental`).pipe(Effect.provide(FetchHttpClient.layer))
+      const nativeFetch = globalThis.fetch.bind(globalThis)
+      // oxlint-disable-next-line typescript/unbound-method -- capture native put only to call with its object-store receiver and restore it
+      const put = IDBObjectStore.prototype.put
+      // oxlint-disable-next-line effecttsgo/schema-sync, effecttsgo/schema-sync-in-effect -- synchronous native IndexedDB instrumentation measures submitted values before the transaction returns
+      const stringify = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))
+      let wireBytes = 0
+      let wireRows = 0
+      let pages = 0
+      let puts = 0
+      let rowPuts = 0
+      let basePuts = 0
+      let localBytes = 0
+      let measuring = false
+      let failToken = false
+      const encoder = new TextEncoder()
+      const namespace = `${encodeURIComponent(profile)}:${encodeURIComponent(principal)}`
+      const replicaName = `echosync:replica:${namespace}`
+      const measuredFetch = Object.assign(
+        (input: RequestInfo | URL, init?: RequestInit) => {
+          const count = measuring
+          return nativeFetch(input, init).then((response) => {
+            if (!count) return response
+            return response
+              .clone()
+              .arrayBuffer()
+              .then((body) => {
+                wireBytes += body.byteLength
+                return response
+              })
+          })
+        },
+        { preconnect: globalThis.fetch.preconnect }
+      )
+      IDBObjectStore.prototype.put = function (stored: unknown, key?: IDBValidKey) {
+        if (this.transaction.db.name === replicaName || this.transaction.db.name === `${replicaName}-baseline`) {
+          if (failToken && key === "token") {
+            failToken = false
+            throw new DOMException("injected abort", "QuotaExceededError")
+          }
+          puts++
+          rowPuts += this.name === "rows" ? 1 : 0
+          basePuts += key === "base" ? 1 : 0
+          localBytes += encoder.encode(stringify({ key, value: stored })).byteLength
+        }
+        return put.call(this, stored, key)
+      }
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          IDBObjectStore.prototype.put = put
+        })
+      )
+      const clear = () => {
+        wireBytes = 0
+        wireRows = 0
+        pages = 0
+        puts = 0
+        rowPuts = 0
+        basePuts = 0
+        localBytes = 0
+      }
+      const metrics = () => ({ wireBytes, wireRows, pages, puts, rowPuts, basePuts, localBytes })
+      const http = yield* Client.httpTransport(`${location.origin}/sync`).pipe(
+        Effect.provideService(FetchHttpClient.Fetch, measuredFetch)
+      )
+      let losePage = true
+      let intervene = true
+      let offlineNow = false
+      const remove = (target: string, batch: string) =>
+        http.execute({
+          epoch: null,
+          clientId: "incremental-writer",
+          batches: [{ id: batch, commands: [{ aggregate: "Tag", command: { _tag: "RemoveTag", target } }] }]
+        })
+      const transport: Client.Transport = {
+        ...http,
+        pull: Effect.fnUntraced(function* (request: PullRequest) {
+          if (offlineNow) return yield* offline
+          if (request.continuation !== undefined && losePage) {
+            losePage = false
+            return yield* offline
+          }
+          if (request.continuation !== undefined && intervene) {
+            yield* check(puts === 0, "first page changed durable replica before completion")
+            yield* remove("incremental-2999", "between-pages")
+            intervene = false
+          }
+          measuring = true
+          const reply = yield* http.pull(request).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                measuring = false
+              })
+            )
+          )
+          pages++
+          wireRows += Arr.reduce(reply.scopes, 0, (n, s) => n + s.entries.length)
+          return reply
+        })
+      }
+      const scope = yield* Scope.make()
+      const client = yield* Client.open({
+        profile,
+        principal,
+        aggregates: [Tag, Note],
+        transport,
+        autoConnect: false
+      }).pipe(Effect.provideService(Scope.Scope, scope))
+      clear()
+      yield* check((yield* Effect.result(client.sync))._tag === "Failure", "lost page unexpectedly succeeded")
+      yield* check(puts === 0 && client.query((read) => read.scan(Tag)).length === 0, "partial catchup was installed")
+      clear()
+      const start = performance.now()
+      yield* client.sync
+      const initial = { ...metrics(), milliseconds: performance.now() - start }
+      yield* check(
+        pages >= 2 && client.query((read) => read.get(Tag, TagId.make("incremental-2999")))?.removed === false,
+        "intervening write changed staged snapshot"
+      )
+      const db = yield* Storage.openDatabase(replicaName)
+      const before = yield* Schema.decodeUnknownEffect(Model.Replica)(yield* Storage.load(db))
+      clear()
+      measuring = true
+      const legacy = yield* http.pull({ epoch: before.epoch, cursors: before.cursors }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            measuring = false
+          })
+        )
+      )
+      const legacyRows = Arr.reduce(legacy.scopes, 0, (n, s) => n + s.entries.length)
+      const baselineDb = yield* Storage.openDatabase(`${replicaName}-baseline`)
+      yield* Storage.save(baselineDb, before)
+      const baseline = { ...metrics(), wireRows: legacyRows }
+      clear()
+      const editStart = performance.now()
+      yield* client.sync
+      const edit = { ...metrics(), milliseconds: performance.now() - editStart }
+      yield* check(
+        wireRows === 1 && rowPuts === 1 && basePuts === 0 && puts === 3,
+        "single edit rewrote replica or downloaded unrelated rows"
+      )
+      yield* check(
+        client.query((read) => read.get(Tag, TagId.make("incremental-2999")))?.removed === true,
+        "delta did not install"
+      )
+      clear()
+      yield* client.sync
+      const unchanged = metrics()
+      yield* check(wireRows === 0 && puts === 0, "unchanged reconnect rewrote replica")
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- standalone disposable fixture HTTP entry point
+      yield* HttpClient.get(`${location.origin}/delete-incremental`).pipe(Effect.provide(FetchHttpClient.layer))
+      clear()
+      yield* client.sync
+      const deleted = metrics()
+      yield* check(
+        wireRows === 1 &&
+          rowPuts === 1 &&
+          basePuts === 0 &&
+          client.query((read) => read.get(Tag, TagId.make("incremental-deleted"))) === null,
+        "delete did not persist one tombstone"
+      )
+      yield* remove("incremental-2998", "abort-local")
+      clear()
+      failToken = true
+      yield* check((yield* Effect.result(client.sync))._tag === "Failure", "injected token failure committed")
+      yield* check(
+        client.query((read) => read.get(Tag, TagId.make("incremental-2998")))?.removed === false,
+        "failed local commit published"
+      )
+      offlineNow = true
+      yield* client.execute(Tag, new DefineTag({ target: TagId.make("incremental-pending"), name: "offline-pending" }))
+      yield* Scope.close(scope, Exit.void)
+      const reopened = yield* Client.open({
+        profile,
+        principal,
+        aggregates: [Tag, Note],
+        transport,
+        autoConnect: false
+      })
+      yield* check(
+        reopened.query((read) => read.get(Tag, TagId.make("incremental-2998")))?.removed === false &&
+          reopened.query((read) => read.get(Tag, TagId.make("incremental-pending")))?.name === "offline-pending",
+        "reopen lost pending work or observed aborted row"
+      )
+      offlineNow = false
+      clear()
+      yield* reopened.sync
+      yield* check(
+        reopened.query((read) => read.get(Tag, TagId.make("incremental-2998")))?.removed === true &&
+          (yield* Stream.runHead(reopened.status)).pipe(
+            Option.map((s) => s.pending),
+            Option.getOrElse(() => -1)
+          ) === 0,
+        "reconnect failed to rebase and retire pending work"
+      )
+      return `PASS INV-SYNC-2 ${yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))({ baseline, initial, edit, unchanged, deleted, reconnect: metrics(), localByteMeaning: "UTF-8 serialized actual IndexedDB put keys/values, not physical disk bytes" })}`
+    })
+  )
+
 const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect)
 Object.assign(globalThis, {
   echosyncScenarios: {
+    incremental: (profile: string) => run(incremental(profile)),
     compatibility: (profile: string) => run(compatibility(profile)),
     incompatibleCommands: (profile: string) => run(incompatibleCommands(profile)),
     durableRefresh: (profile: string) => run(durableRefresh(profile)),

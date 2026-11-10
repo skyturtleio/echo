@@ -5,6 +5,7 @@ import type * as Index from "./Indexes.ts"
 import { type Codec, type Fields, taggedClass } from "./internal/classes.ts"
 import type * as Rejection from "./Rejection.ts"
 import type { WriteAccess } from "./Scope.ts"
+import * as Payload from "./Payload.ts"
 
 /** The fields of a command instance: the id of the stream it addresses, then its input. */
 export type InputFields<Target extends Index.IdSchema, F extends Fields> = { readonly target: Target } & F
@@ -38,6 +39,7 @@ export interface CommandClass<
   readonly reads: Reads | readonly []
   readonly authority: "both" | "server"
   readonly access: WriteAccess
+  readonly evolution?: Payload.Evolution<Instance<Tag, Target, F>>
 }
 
 /** Structural constraint satisfied by every class produced by {@link make}. */
@@ -51,6 +53,7 @@ export interface Any extends Codec {
   readonly authority: "both" | "server"
   readonly access: WriteAccess
   readonly Type: { readonly _tag: string; readonly target: string }
+  readonly evolution?: Payload.Evolution<unknown>
 }
 
 /**
@@ -89,10 +92,13 @@ export const make = <
     readonly authority?: "both" | "server"
     /** Minimum role at both the original and resulting scope. Defaults to writer. Server authority bypasses this gate. */
     readonly access?: WriteAccess
+    readonly evolution?: Payload.Evolution<Instance<Tag, Target, F>>
   }
 ): CommandClass<Tag, Target, F, Events, Rejects, Reads> => {
   // `input` may be absent (then `F` is `{}`); `Object.assign` keeps the generic where a spread of an optional loses it.
   const fields: InputFields<Target, F> = Object.assign({ target: options.target }, options.input)
+  if ("_version" in fields) throw new Error("_version is reserved for persisted payloads")
+  if (options.evolution !== undefined) Payload.inspect(options.evolution)
   return Object.assign(taggedClass<Instance<Tag, Target, F>, Tag, InputFields<Target, F>>(tag, fields), {
     kind: "Command" as const,
     tag,
@@ -101,6 +107,7 @@ export const make = <
     rejects: options.rejects ?? ([] as const),
     reads: options.reads ?? ([] as const),
     authority: options.authority ?? "both",
-    access: options.access ?? "writer"
+    access: options.access ?? "writer",
+    ...(options.evolution === undefined ? {} : { evolution: options.evolution })
   })
 }

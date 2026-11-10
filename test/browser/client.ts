@@ -18,6 +18,13 @@ import * as SubscriptionRef from "effect/SubscriptionRef"
 import { FetchHttpClient, HttpClient } from "effect/http"
 import { DefineTag, Note, NoteId, Tag, TagId, WriteNote } from "../../examples/fixture/domain/src/index.ts"
 import { MoveTag } from "../../examples/fixture/domain/src/Tag/MoveTag.command.ts"
+import {
+  LegacyTally,
+  CurrentTally,
+  ProjectedTally,
+  OldAddTally,
+  AddTally
+} from "../../examples/fixture/domain/src/Evolution.ts"
 import * as Domain from "../../src/domain/index.ts"
 import * as Client from "../../src/client/index.ts"
 import * as Storage from "../../src/client/BrowserStorage.ts"
@@ -2641,10 +2648,94 @@ const incremental = (profile: string) =>
     })
   )
 
+// INV-SCHEMA-5 catches adapting the journal in place, losing quantity, and treating a stale projection as an intent failure.
+const payloadEvolution = (profile: string) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const actor = Domain.Scope.Principal.make("schema-fixture")
+      const config = { ...options(profile), principal: actor, aggregates: [LegacyTally] }
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const old = yield* Client.open(config)
+          yield* old.execute(LegacyTally, new OldAddTally({ target: profile, pairs: 3 }))
+        })
+      )
+      const namespace = `${encodeURIComponent(profile)}:${encodeURIComponent(actor)}`
+      const journalDb = yield* Storage.openDatabase(`echosync:journal:${namespace}`)
+      const raw = yield* Schema.decodeUnknownEffect(Model.Journal)(yield* Storage.load(journalDb))
+      const transport = yield* Client.httpTransport(`${location.origin}/schema-sync`)
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const next = yield* Client.open({ ...config, aggregates: [CurrentTally], transport })
+          yield* check(
+            next.query((read) => read.get(CurrentTally, profile))?.value === 6,
+            "old pair quantity reinterpreted"
+          )
+          const durable = yield* Schema.decodeUnknownEffect(Model.Journal)(yield* Storage.load(journalDb))
+          yield* check(Equal.equals(raw, durable), "prediction rewrote durable payload or identity")
+          yield* next.sync
+          yield* next.execute(CurrentTally, new AddTally({ target: profile, units: 5 }))
+          yield* next.sync
+          yield* check(
+            next.query((read) => read.get(CurrentTally, profile))?.value === 11 && (yield* next.pending).length === 0,
+            "old/new commands failed to converge"
+          )
+        })
+      )
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const old = yield* Client.open({ ...config, profile: `${profile}-old`, transport })
+          yield* old.sync
+          yield* check(
+            old.query((read) => read.get(LegacyTally, profile))?.value === 11,
+            "readable projection broke old client"
+          )
+        })
+      )
+      // Preserve an offline intent across a projection cache reset. This is a later migration, not the one-time cutover.
+      const committed = yield* Schema.decodeUnknownEffect(Model.Journal)(yield* Storage.load(journalDb))
+      const restored = { ...raw, epoch: committed.epoch }
+      yield* Storage.save(journalDb, restored)
+      const failed = yield* Effect.scoped(Client.open({ ...config, aggregates: [ProjectedTally] })).pipe(Effect.exit)
+      yield* check(Exit.isFailure(failed), "stale state projection silently decoded")
+      yield* check(
+        Equal.equals(restored, yield* Schema.decodeUnknownEffect(Model.Journal)(yield* Storage.load(journalDb))),
+        "projection failure quarantined intent"
+      )
+      yield* Client.resetReplica({ profile, principal: actor })
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const rebuilt = yield* Client.open({ ...config, aggregates: [ProjectedTally] })
+          yield* check(
+            rebuilt.query((read) => read.get(ProjectedTally, profile))?.value === 6,
+            "replica reset lost offline intent"
+          )
+        })
+      )
+      const first = raw.intents[0]
+      if (first === undefined) throw new Error("missing intent")
+      const unsupported = {
+        ...first,
+        commands: [{ aggregate: "Tally", command: { _tag: "AddTally", target: profile, units: 9, _version: 99 } }]
+      }
+      yield* Storage.save(journalDb, { ...raw, intents: [unsupported] })
+      const unsupportedClient = yield* Client.open({ ...config, aggregates: [CurrentTally] })
+      const retained = (yield* unsupportedClient.pending)[0]
+      yield* check(
+        retained?.phase === "Unknown" && Equal.equals(retained.commands, unsupported.commands),
+        "unsupported version lost raw intent"
+      )
+      yield* unsupportedClient.dismiss(first.id)
+      yield* check((yield* unsupportedClient.pending).length === 1, "dismiss deleted unsupported version")
+      return "PASS INV-SCHEMA-5 old offline quantity, raw identity, coexistence, projection reset and unsupported retention"
+    })
+  )
+
 const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect)
 Object.assign(globalThis, {
   echosyncScenarios: {
     incremental: (profile: string) => run(incremental(profile)),
+    payloadEvolution: (profile: string) => run(payloadEvolution(profile)),
     compatibility: (profile: string) => run(compatibility(profile)),
     incompatibleCommands: (profile: string) => run(incompatibleCommands(profile)),
     durableRefresh: (profile: string) => run(durableRefresh(profile)),

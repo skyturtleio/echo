@@ -17,6 +17,7 @@ import * as Aggregate from "../domain/Aggregate.ts"
 import type * as Command from "../domain/Command.ts"
 import type * as Index from "../domain/Indexes.ts"
 import type { Codec } from "../domain/internal/classes.ts"
+import * as Payload from "../domain/Payload.ts"
 import { canRead, canWrite, Grant, privateScope, type Principal, Scope, ScopeForbidden } from "../domain/Scope.ts"
 import * as Wire from "../protocol.ts"
 import type * as Action from "./Action.ts"
@@ -25,8 +26,8 @@ import * as Sync from "./Sync.ts"
 export * as Action from "./Action.ts"
 
 const decode = <S extends Codec>(schema: S, value: unknown) =>
-  Schema.decodeUnknownEffect(Schema.toCodecJson(schema))(value)
-const encode = (schema: Codec, value: unknown) => Schema.encodeEffect(Schema.toCodecJson(schema))(value)
+  Schema.decodeUnknownEffect(Payload.persisted(schema))(value)
+const encode = (schema: Codec, value: unknown) => Schema.encodeEffect(Payload.persisted(schema))(value)
 const fail = (message: string): never => {
   throw new Wire.ServerError({ message })
 }
@@ -163,6 +164,8 @@ export interface Server {
   readonly ingestCatalog: (catalog: Catalog) => Effect.Effect<void, ServerFailure>
   readonly compactScopes: (through: number) => Effect.Effect<void, ServerFailure>
   readonly importStreams: (request: ImportRequest) => Effect.Effect<void, ServerFailure>
+  /** Operator-only, atomic replay. Quiesce incompatible deployments first; catalogs must be reingested. */
+  readonly rebuildProjections: (aggregates: ReadonlyArray<Aggregate.Any>) => Effect.Effect<number, ServerFailure>
   readonly resetEpoch: Effect.Effect<string, ServerFailure>
   readonly changes: (principal: Principal) => Stream.Stream<Wire.Change, Wire.ServerError>
   readonly presence: (principal: Principal, request: Wire.PresenceRequest) => Effect.Effect<void, ServerFailure>
@@ -225,6 +228,43 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
     }
     yield* sql`SELECT pg_notify('echosync_changes',${global ? "" : Changes.notification(scopes)})`
   })
+  const rebuildProjections = Effect.fn("EchoSync.rebuildProjections")(function* (refs: ReadonlyArray<Aggregate.Any>) {
+    return yield* transaction(
+      Effect.gen(function* () {
+        let count = 0
+        const scopes = new Set<string>()
+        for (const ref of new Set(refs)) {
+          if (aggregate(ref.tag) !== ref) return yield* new Wire.ServerError({ message: "Unregistered aggregate" })
+          const rows =
+            yield* sql<Row>`SELECT aggregate,id,scope,seq,state FROM echosync_streams WHERE aggregate=${ref.tag} ORDER BY id`
+          for (const row of rows) {
+            if (Str.startsWith("catalog:")(row.scope))
+              return yield* new Wire.ServerError({ message: "Catalogs require reingestion" })
+            const events = yield* sql<{
+              readonly seq: number
+              readonly payload: unknown
+            }>`SELECT seq,payload FROM echosync_events WHERE aggregate=${ref.tag} AND id=${row.id} ORDER BY seq`
+            if (events.length !== row.seq || Arr.some(events, (event, i) => event.seq !== i + 1))
+              return yield* new Wire.ServerError({ message: "Incomplete event history" })
+            const state = yield* Effect.sync(() =>
+              Aggregate.replay(
+                ref,
+                Arr.map(events, (event) => event.payload)
+              )
+            )
+            const scope = ref.definition.scope(state)
+            // Projection evolution cannot silently reinterpret ownership or stream identity.
+            if (scope !== row.scope) return yield* new Wire.ServerError({ message: "Projection changed scope" })
+            yield* sql`UPDATE echosync_streams SET state=${sql.json(yield* encode(ref.definition.state, state))} WHERE aggregate=${ref.tag} AND id=${row.id}`
+            scopes.add(row.scope)
+            count++
+          }
+        }
+        if (count > 0) yield* changed([...scopes])
+        return count
+      })
+    )
+  }, protect("rebuildProjections"))
   const execute = Effect.fn("EchoSync.Execute")(function* (principal: Principal, request: Wire.ExecuteRequest) {
     const now = yield* DateTime.now
     const receipts: Array<Wire.Receipt> = []
@@ -562,7 +602,7 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
       })
     )
   }, protect("ingestCatalog"))
-  /** Trusted only: never mounted by httpApp. An id permanently identifies one exact import. */
+  /** Trusted only: never mounted by httpApp. Retry comparison may adapt stored facts, never rewrite them. */
   const importStreams = Effect.fn("EchoSync.importStreams")(function* (input: {
     readonly id: string
     readonly principal: Principal
@@ -596,9 +636,39 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
         const request = { ...input, streams: canonical }
         const prior = yield* sql<{
           readonly same: boolean
-        }>`SELECT request=${sql.json(request)} AS same FROM echosync_imports WHERE id=${input.id}`
+          readonly request: unknown
+        }>`SELECT request,request=${sql.json(request)} AS same FROM echosync_imports WHERE id=${input.id}`
         if (prior[0] !== undefined) {
-          if (!prior[0].same) return yield* new Wire.ServerError({ message: "Import identity conflict" })
+          if (prior[0].same) return
+          const stored = yield* Schema.decodeUnknownEffect(
+            Schema.Struct({
+              id: Schema.String,
+              principal: Schema.String,
+              streams: Schema.Array(
+                Schema.Struct({ aggregate: Schema.String, id: Schema.String, events: Schema.Array(Schema.Unknown) })
+              ),
+              grants: Schema.optionalKey(Schema.Array(Grant))
+            })
+          )(prior[0].request)
+          const streams: Array<ImportedStream> = []
+          for (const stream of stored.streams) {
+            const a = aggregate(stream.aggregate)
+            const events: Array<unknown> = []
+            for (const payload of stream.events) {
+              const tag = (yield* Schema.decodeUnknownEffect(tagged)(payload))._tag
+              const schema =
+                Option.getOrUndefined(
+                  Arr.findFirst(
+                    [...(a.definition.events ?? []), ...Arr.flatMap(a.definition.commands, (c) => c.events)],
+                    (event) => event.tag === tag
+                  )
+                ) ?? fail("Unregistered historical import event")
+              events.push(yield* encode(schema, yield* decode(schema, payload)))
+            }
+            streams.push({ ...stream, events })
+          }
+          if (!Equal.equals({ ...stored, streams }, request))
+            return yield* new Wire.ServerError({ message: "Import identity conflict" })
           return
         }
         const scopes = new Set<string>()
@@ -694,7 +764,18 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
   const compactScopes = (through: number) =>
     transaction(Sync.compact(through)).pipe(Effect.provideService(SqlClient.SqlClient, sql), protect("compactScopes"))
   const changes = yield* Changes.make(sql)
-  return { execute, pull, get, ingestCatalog, compactScopes, importStreams, resetEpoch, changes, presence }
+  return {
+    execute,
+    pull,
+    get,
+    ingestCatalog,
+    compactScopes,
+    importStreams,
+    rebuildProjections,
+    resetEpoch,
+    changes,
+    presence
+  }
 })
 
 /** Mount this HTTP effect at the application's sync route; authentication runs for every request. */

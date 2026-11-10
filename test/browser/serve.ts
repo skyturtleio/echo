@@ -7,6 +7,7 @@ import { Note, Tag } from "../../examples/fixture/domain/src/index.ts"
 import { TagHistoryImported } from "../../examples/fixture/domain/src/Tag/TagHistoryImported.event.ts"
 import { TagId } from "../../examples/fixture/domain/src/Tag/Tag.id.ts"
 import { Principal, Scope as SchemaScope } from "../../src/domain/Scope.ts"
+import { CurrentTally } from "../../examples/fixture/domain/src/Evolution.ts"
 import * as Server from "../../src/server/index.ts"
 
 // Dedicated disposable schema, never app data; this runner only connects to the orb's local test database.
@@ -21,9 +22,12 @@ await Effect.runPromise(
       yield* sql`DROP SCHEMA IF EXISTS echosync_browser_fixture CASCADE`
       yield* sql`CREATE SCHEMA echosync_browser_fixture`
       yield* Server.migrate
-      const server = yield* Server.make({ aggregates: [Note, Tag] })
+      const server = yield* Server.make({ aggregates: [Note, Tag, CurrentTally] })
       const rpc = HttpEffect.toWebHandler(
         Server.httpApp(server, () => Effect.succeed(Principal.make("browser-fixture")))
+      )
+      const schemaRpc = HttpEffect.toWebHandler(
+        Server.httpApp(server, () => Effect.succeed(Principal.make("schema-fixture")))
       )
       const run = Effect.runPromiseWith(yield* Effect.context())
       const seedCatalog = () =>
@@ -88,6 +92,7 @@ await Effect.runPromise(
                 return run(server.ingestCatalog({ scope: "catalog:incremental", release: "empty", rows: [] })).then(
                   () => Response.json(true)
                 )
+              if (path === "/schema-sync" || path === "/schema-sync/") return schemaRpc(request)
               if (path === "/seed-catalog") {
                 // Administrative fixture ingestion can exceed Bun's idle timeout; RPC deadlines stay unchanged.
                 listener.timeout(request, 0)

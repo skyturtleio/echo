@@ -196,6 +196,36 @@ export const resetProfile = Effect.fn("EchoSync.resetProfile")(function* (option
   )
 })
 
+/** Clear derived data before opening a changed projection. Journal identity and every raw intent remain untouched. */
+export const resetReplica = Effect.fn("EchoSync.resetReplica")(function* (options: {
+  readonly profile: string
+  readonly principal: Principal
+  readonly compatibilityGeneration?: number
+}) {
+  const namespace = profileNamespace(options)
+  yield* Storage.withLock(
+    `${namespace}:sync`,
+    Storage.withLock(
+      namespace,
+      Effect.gen(function* () {
+        const journalDb = yield* Storage.openDatabase(`echosync:journal:${namespace}`, options.compatibilityGeneration)
+        const replicaDb = yield* Storage.openDatabase(`echosync:replica:${namespace}`, options.compatibilityGeneration)
+        const saved = yield* Storage.load(journalDb)
+        if (saved !== undefined) {
+          const journal = yield* Schema.decodeUnknownEffect(Model.Journal)(saved)
+          if (journal.principal !== options.principal) return yield* new ProfileMismatch()
+        }
+        yield* Storage.save(replicaDb, undefined)
+        const channel = yield* Effect.acquireRelease(
+          Effect.sync(() => new BroadcastChannel(`echosync:${namespace}`)),
+          (value) => Effect.sync(() => value.close())
+        )
+        yield* Effect.sync(() => channel.postMessage("replica"))
+      })
+    )
+  )
+})
+
 /** Hydrates before returning. All resources, connection work and ownership end with the caller's Scope. */
 export const open = Effect.fnUntraced(function* (options: Options) {
   const diagnostics = Diagnostics.make()
@@ -765,7 +795,7 @@ export const open = Effect.fnUntraced(function* (options: Options) {
       )
     )
   }
-  const resetReplica = syncMutex.withPermit(
+  const resetLocalReplica = syncMutex.withPermit(
     Storage.withLock(
       `${namespace}:sync`,
       locked(
@@ -944,7 +974,7 @@ export const open = Effect.fnUntraced(function* (options: Options) {
     query,
     subscribe,
     sync,
-    resetReplica,
+    resetReplica: resetLocalReplica,
     dismiss,
     /** In-memory snapshot only; age uses the device clock and durable intent creation times. */
     diagnostics: Effect.gen(function* () {

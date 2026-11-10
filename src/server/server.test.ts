@@ -30,6 +30,13 @@ import { Tag } from "../../examples/fixture/domain/src/Tag/Tag.aggregate.ts"
 import { TagHistoryImported } from "../../examples/fixture/domain/src/Tag/TagHistoryImported.event.ts"
 import { MoveTag, RelocateTag } from "../../examples/fixture/domain/src/Tag/MoveTag.command.ts"
 import { TagId } from "../../examples/fixture/domain/src/Tag/Tag.id.ts"
+import {
+  LegacyTally,
+  CurrentTally,
+  ProjectedTally,
+  OldTallyAdded,
+  TallyAdded
+} from "../../examples/fixture/domain/src/Evolution.ts"
 import type * as Aggregate from "../domain/Aggregate.ts"
 import { capabilities } from "../domain/index.ts"
 import { Principal, privateScope, Scope as VisibilityScope, Grant } from "../domain/Scope.ts"
@@ -76,6 +83,12 @@ const transfer = (batchId: string, target: string, scope: VisibilityScope): Wire
   epoch: null,
   clientId: "device",
   batches: [{ id: batchId, commands: [{ aggregate: "Tag", command: { _tag: "MoveTag", target, scope } }] }]
+})
+
+const tallyBatch = (id: string, command: unknown): Wire.ExecuteRequest => ({
+  epoch: null,
+  clientId: "old-device",
+  batches: [{ id, commands: [{ aggregate: "Tally", command }] }]
 })
 
 // Every scenario owns a temporary schema, including its engine singleton and listener connections.
@@ -294,6 +307,107 @@ describe.skipIf(url === undefined)("Postgres server", () => {
     60000
   )
 
+  it.effect(
+    "INV-SCHEMA-4 deployment cannot rewrite historical facts or reinterpret old requests during projection rebuild",
+    () =>
+      scenario(
+        Effect.fnUntraced(function* (_, sql) {
+          const original = tallyBatch("original", { _tag: "AddTally", target: "one", pairs: 3 })
+          const old = yield* Server.make({ aggregates: [LegacyTally] })
+          const accepted = yield* old.execute(alice, original)
+          const current = yield* Server.make({ aggregates: [CurrentTally] })
+          yield* current.execute(alice, tallyBatch("offline", { _tag: "AddTally", target: "one", pairs: 2 }))
+          yield* current.execute(alice, tallyBatch("new", { _tag: "AddTally", target: "one", units: 5, _version: 2 }))
+          expect(yield* current.get(alice, CurrentTally, "one")).toEqual({ value: 15, scope: "user:alice" })
+          expect(yield* old.get(alice, LegacyTally, "one")).toEqual({ value: 15, scope: "user:alice" })
+          const facts = yield* sql`SELECT * FROM echosync_events ORDER BY seq`
+          const receipts = yield* sql`SELECT * FROM echosync_receipts ORDER BY batch_id`
+          const before = yield* current.pull(alice, { epoch: null, cursors: {} })
+          const projected = yield* Server.make({ aggregates: [ProjectedTally] })
+          expect(yield* projected.get(alice, ProjectedTally, "one").pipe(Effect.flip)).toMatchObject({
+            _tag: "ServerError"
+          })
+          expect(yield* projected.rebuildProjections([ProjectedTally])).toBe(1)
+          expect(yield* projected.get(alice, ProjectedTally, "one")).toEqual({ value: 15, scope: "user:alice" })
+          expect(yield* sql`SELECT * FROM echosync_events ORDER BY seq`).toEqual(facts)
+          expect(yield* sql`SELECT * FROM echosync_receipts ORDER BY batch_id`).toEqual(receipts)
+          const after = yield* projected.pull(alice, { epoch: before.epoch, cursors: cursors(before) })
+          expect(entries(after)).toEqual([
+            {
+              _tag: "Upsert",
+              aggregate: "Tally",
+              id: "one",
+              seq: 3,
+              state: { _projection: 2, state: { value: 15, scope: "user:alice" } }
+            }
+          ])
+          expect(after.revision).toBe(before.revision + 1)
+          // Receipt recovery must work even after the entire command registry has been removed.
+          const retired = yield* Server.make({ aggregates: [] })
+          expect(yield* retired.execute(alice, original)).toEqual(accepted)
+          const rows = yield* sql`SELECT * FROM echosync_streams`
+          yield* sql`UPDATE echosync_events SET seq=9 WHERE seq=3`
+          expect(yield* projected.rebuildProjections([ProjectedTally]).pipe(Effect.flip)).toMatchObject({
+            _tag: "ServerError"
+          })
+          expect(yield* sql`SELECT * FROM echosync_streams`).toEqual(rows)
+          yield* sql`UPDATE echosync_events SET seq=3 WHERE seq=9`
+          // A later invalid stream must roll back a genuinely changed earlier projection and its cursors.
+          yield* sql`UPDATE echosync_streams SET state='{"stale":true}' WHERE id='one'`
+          const staleRows = yield* sql`SELECT * FROM echosync_streams`
+          const engineBefore = yield* sql`SELECT * FROM echosync_engine`
+          const scopesBefore = yield* sql`SELECT * FROM echosync_scopes`
+          yield* sql`INSERT INTO echosync_streams VALUES ('Tally','z-catalog','catalog:tally',1,'null')`
+          expect(yield* projected.rebuildProjections([ProjectedTally]).pipe(Effect.flip)).toMatchObject({
+            _tag: "ServerError"
+          })
+          expect(yield* sql`SELECT * FROM echosync_streams WHERE id='one'`).toEqual(staleRows)
+          expect(yield* sql`SELECT * FROM echosync_engine`).toEqual(engineBefore)
+          expect(yield* sql`SELECT * FROM echosync_scopes`).toEqual(scopesBefore)
+          yield* sql`DELETE FROM echosync_streams WHERE id='z-catalog'`
+          yield* sql`UPDATE echosync_streams SET scope='user:bob' WHERE id='one'`
+          expect(yield* projected.rebuildProjections([ProjectedTally]).pipe(Effect.flip)).toMatchObject({
+            _tag: "ServerError"
+          })
+          expect(yield* sql`SELECT * FROM echosync_events ORDER BY seq`).toEqual(facts)
+          const imported = {
+            id: "imported",
+            principal: alice,
+            streams: [
+              Server.importedStream(LegacyTally, "imported", [
+                new OldTallyAdded({ pairs: 4, scope: privateScope(alice) })
+              ])
+            ]
+          }
+          yield* old.importStreams(imported)
+          const beforeRetry = yield* sql`SELECT * FROM echosync_events ORDER BY id,seq`
+          const importIdentity = yield* sql`SELECT * FROM echosync_imports`
+          const retry = {
+            ...imported,
+            streams: [
+              Server.importedStream(CurrentTally, "imported", [
+                new TallyAdded({ units: 8, scope: privateScope(alice) })
+              ])
+            ]
+          }
+          yield* current.importStreams(retry)
+          expect(yield* sql`SELECT * FROM echosync_events ORDER BY id,seq`).toEqual(beforeRetry)
+          expect(yield* sql`SELECT * FROM echosync_imports`).toEqual(importIdentity)
+          expect(
+            yield* current
+              .importStreams({
+                ...retry,
+                streams: [
+                  Server.importedStream(CurrentTally, "imported", [
+                    new TallyAdded({ units: 9, scope: privateScope(alice) })
+                  ])
+                ]
+              })
+              .pipe(Effect.flip)
+          ).toMatchObject({ _tag: "ServerError" })
+        })
+      )
+  )
   it.effect("INV-SERVER-11 naming cutover cannot split rows, reset sequences or partially commit", () =>
     scenario(
       Effect.fnUntraced(function* (server, sql) {

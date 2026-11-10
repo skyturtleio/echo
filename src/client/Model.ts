@@ -12,6 +12,7 @@ import * as Aggregate from "../domain/Aggregate.ts"
 import type * as Command from "../domain/Command.ts"
 import type * as Index from "../domain/Indexes.ts"
 import type { Codec } from "../domain/internal/classes.ts"
+import * as Payload from "../domain/Payload.ts"
 import { canRead, canWrite, Grant, type Principal, ScopeForbidden } from "../domain/Scope.ts"
 import { Batch, Position, Receipt } from "../protocol.ts"
 
@@ -64,7 +65,7 @@ export interface Read {
 
 /** Schema registry is the boundary where persisted unknown values regain domain types. */
 const codec = memoize((schema: Codec) => {
-  const json = Schema.toCodecJson(schema)
+  const json = Payload.persisted(schema)
   return { decode: Schema.decodeUnknownSync(json), encode: Schema.encodeSync(json) }
 })
 export const decode = (schema: Codec, value: unknown): unknown => codec(schema).decode(value)

@@ -2,11 +2,13 @@ import * as Arr from "effect/Array"
 import type * as DateTime from "effect/DateTime"
 import * as Option from "effect/Option"
 import * as Record from "effect/Record"
+import * as Schema from "effect/Schema"
 import type * as Command from "./Command.ts"
 import type * as Event from "./Event.ts"
 import type * as Index from "./Indexes.ts"
 import type { Bivariant, Codec } from "./internal/classes.ts"
 import { canWrite, type Grant, type Principal, role, type Scope } from "./Scope.ts"
+import * as Payload from "./Payload.ts"
 
 /**
  * The instance type of a domain class: `InstanceOf<typeof DuplicateName>` is `DuplicateName`.
@@ -147,6 +149,8 @@ export const make = <
   name: Name,
   definition: Definition<Id, S, C, X, E>
 ): AggregateClass<Name, Id, S, C, X, E> => {
+  if (new Set(Arr.map(definition.commands, (command) => command.tag)).size !== definition.commands.length)
+    throw new Error(`Conflicting command tags in ${name}`)
   const events = new Map<string, Event.Any>()
   for (const event of [
     ...Arr.flatMap(definition.commands, (command) => command.events),
@@ -216,4 +220,35 @@ export const capabilities = <A extends Any>(
             : canWrite(principal, scope, grants, command.access)
     }))
   }
+}
+
+/** Fold persisted facts, never re-decide old commands. Callers supply a complete, sequence-ordered history. */
+export const replay = <A extends Any>(aggregate: A, payloads: ReadonlyArray<unknown>): StateOf<A> => {
+  // oxlint-disable-next-line effecttsgo/schema-sync -- replay is pure and synchronous like decide/evolve; schemas must not suspend
+  const tag = Schema.decodeUnknownSync(Schema.Struct({ _tag: Schema.String }))
+  const schemas = new Map(
+    Arr.map(
+      [
+        ...Arr.flatMap(aggregate.definition.commands, (command) => command.events),
+        ...(aggregate.definition.events ?? [])
+      ],
+      (event) => [event.tag, event]
+    )
+  )
+  const stateSchema = Schema.toCodecJson(aggregate.definition.state)
+  // oxlint-disable-next-line effecttsgo/schema-sync -- validate the pure fold's state at each step, including initial
+  const validate = Schema.encodeSync(stateSchema)
+  let state = aggregate.definition.initial
+  validate(state)
+  for (const payload of payloads) {
+    const name = tag(payload)._tag
+    const schema = schemas.get(name)
+    const evolve = aggregate.definition.evolve[name]
+    if (schema === undefined || evolve === undefined) throw new Error(`Unknown historical event ${name}`)
+    // oxlint-disable-next-line effecttsgo/schema-sync -- pure historical read uses the same codec as Execute
+    const event = Schema.decodeUnknownSync(Payload.codec(schema))(payload)
+    state = evolve(state, event)
+    validate(state)
+  }
+  return state
 }

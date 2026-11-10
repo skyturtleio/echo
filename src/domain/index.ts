@@ -11,6 +11,7 @@
  *
  * Command `access` declares the minimum scope role; `authority` restricts trusted commands.
  * `capabilities` inspects these declarations without running a domain decision.
+ * `Payload` defines persisted versions and historical adapters; `replay` folds stored facts.
  */
 import * as AggregateModule from "./Aggregate.ts"
 import * as CommandModule from "./Command.ts"
@@ -69,6 +70,7 @@ export declare namespace Aggregate {
 }
 /** One kind of stream: state, scope, indexes, `decide` and `evolve`. See {@link AggregateModule.make}. */
 export const Aggregate = AggregateModule.make
+export const replay = AggregateModule.replay
 
 export { capabilities } from "./Aggregate.ts"
 
@@ -77,3 +79,4 @@ export * as Scope from "./Scope.ts"
 
 /** The pure story runner; `echosync/domain/testing` binds it to vitest. */
 export * as Story from "./Story.ts"
+export * as Payload from "./Payload.ts"

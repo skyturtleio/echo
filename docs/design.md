@@ -42,7 +42,8 @@ importing only `effect` and `echosync/domain`) plus thin server and client wirin
 | `Index` | `Domain.Index(id, state, spec)`, field lists over state, bound to the aggregate and exposed as statics (§2 item 9) |
 | `Scope` | `Principal`, `Scope` (opaque id), `privateScope`, `catalogScope`, the pre-grants rule, and `ScopeForbidden` (§2 item 8) |
 | `Story` | the domain test: *given* events (one stream, or several seeded with `Story.stream(Aggregate, id, events)`), *when* command, *as* principal, *then* events or rejection; pure runner in `echosync/domain`, vitest binding in `echosync/domain/testing` (§2 item 10) |
-| `Policy`, `Batch`, versioning | server-side reaction to events; several commands committed atomically under one id; `(name, version)` on events, state and commands with upcasters. Not built yet (§4) |
+| `Payload` | Explicit command/event versions and historical adapters; projection codecs and immutable event replay (§2 item 36) |
+| `Policy`, `Batch` | Server-side reaction to events (deferred); several commands committed atomically under one id |
 
 `decide` is pure and sees only its stream's state, the command and `ctx = { principal, now,
 read }`; `evolve` is total; events are business-named; nothing in `evolve` reads a clock or
@@ -146,14 +147,14 @@ base* (opt-in `expectedSeq`, `decide` returns `Stale`); a *vanished target or lo
 checks are `ctx.read` over an index inside `decide`: authoritative on the server because the
 transaction is serializable, optimistic on the device and corrected by the rebase (§2 item 2).
 
-**Schema evolution.** Events are immutable and versioned: a shape change is a new version plus
-an `upcast` registered next to it; `evolve` sees only the latest. State is a derived cache with
-a version: the server rebuilds a stream whose `state_version` is older by replay on first touch
-and in a background sweep; the device treats a mismatch as "discard cache, re-pull", keeping
-the journal; a periodic `Snapshot` event bounds replay. Read models are rebuilt from state. No
-app-level DDL runs against event or state data; the only DDL is engine schema and index
-promotion. Journaled commands are versioned too: one with no upcaster becomes an `Unknown`
-notice. The server rejects clients below a `CompatibilityFloor`.
+**Schema evolution.** Command/event payloads have opt-in explicit versions and pure direct
+historical adapters (§2 item 36). Events remain immutable; replay decodes historical facts
+before folding current `evolve`, never re-decides commands. State is a derived cache whose
+explicit projection codec can reject stale versions. Operators rebuild server projections
+transactionally and reset only the browser replica before reopening, retaining the journal.
+Automatic first-touch rebuilds, background sweeps, snapshots bounding replay, downcasts and
+a server compatibility floor are not implemented. Protocol compatibility, IndexedDB format
+and bundle admission generations are separate from domain payload and projection versions.
 
 **Presence** is ephemeral: a room is a scope; `join(room, state)` and `track(state)` are small
 requests; the server fans out `{ principal, clientId, state }` to the room's members over the
@@ -482,7 +483,7 @@ behaviour adds or amends an item here in the same branch.
     Trusted actions remain opaque and unpredicted.
     This is local fencing, not a server compatibility floor: deploy additive server support
     first, retain safe old codecs and reject unsafe legacy operations on other devices.
-    State/event upcasting remains deferred. Rejected: journal metadata alone (old clients
+    Explicit payload adapters and projection rebuilds are now covered by item 36. Rejected: journal metadata alone (old clients
     ignore it), separate versioned profiles (strands pending work), and broad exception
     quarantine (hides defects and mislabels unresolved execution).
 
@@ -611,6 +612,48 @@ behaviour adds or amends an item here in the same branch.
     Accepted receipt proves acceptance. Rejected: arbitrary authorization callbacks, per-field
     visibility, reader-authorized mutation, and presenting local capability checks as acceptance.
 
+36. **Explicit one-way payload adapters and operator-run projection rebuilds** (2026-11-10).
+    Borrow Jazz alpha migration workflow's reviewed paths, explicit defaults and immutable
+    source identity, not its bidirectional row lenses. `Command` options and the third `Event`
+    argument accept `evolution: { version, unversioned, history }` (the Event argument is that
+    object itself). Every earlier integer version requires exactly one `Payload.from` or
+    `Payload.reject`, with a semantic explanation; `Payload.inspect` exposes this deterministic
+    inventory and constructors reject gaps/ambiguity before serving. Adapters map directly to
+    current decoded values and explicitly supply new required fields; no inferred renames,
+    generated defaults, graph search, or claim of semantic equivalence from shape validation.
+    Application scenarios must prove historical business meaning. Decoders validate both old
+    input and current output; adapters and domain codecs must be pure and synchronous.
+    `_version` is reserved on persisted command/event JSON. Existing declarations remain
+    unversioned v1; updated engines reject unknown explicit versions even on legacy classes.
+    Opted-in declarations stamp new writes; absent stamps use only the declared `unversioned`
+    version, never a shape heuristic. Deploy additive readers first: engines predating this
+    change do not enforce stamps. Commands must retain their tag and target. Raw journals,
+    batch/client identity, requests stored with receipts and applied event payloads never
+    change. Receipt lookup still precedes decoding, including unsupported Sent retries.
+    Trusted import retries compare stored historical events after adapting them into the
+    current representation when exact JSON identity differs; principal, stream order/identity,
+    grants and current facts must match. The stored import request and facts are never rewritten.
+    This requires retained historical readers; it does not promise recovery after removing them.
+    `Payload.projection(stateSchema, version)` stamps state separately; a mismatch fails
+    visibly, not as an incompatible-command notice. `replay` folds validated facts from initial
+    and validates every resulting state. `server.rebuildProjections([Aggregate])` validates
+    complete contiguous event history, atomically rewrites derived states and advances scope
+    invalidation under normal engine serialization. It preserves sequences, events, receipts
+    and epoch, and refuses scope changes or catalogs (reingest those). It is an explicit
+    operator operation, not RPC or startup work; quiesce incompatible writers first. Reset
+    only browser replica/cursors before reopening a changed projection, retaining the journal;
+    a bundle generation bump fences same-profile old writers. As with open, admission upgrades
+    of the two databases are not atomic: a blocked replica upgrade can already supersede the
+    journal's old handles, without changing its data. Old/new command versions can
+    coexist on separate devices while the state projection remains readable to both. Projection
+    changes require a coordinated rollout; no reverse projection or old-client negotiation is
+    promised. The owner permits discarding old browser caches and local-only pending work at
+    the coordinated architecture cutover; no server history or data may be discarded. This
+    one-time loss boundary does not weaken future queued-work guarantees. These payload APIs
+    do not perform that wipe or fence old transports; the coordinated protocol deployment must
+    reject stale clients. Rejected: silently upcasting caches as if they were facts, rewriting event history,
+    retrying adapted rather than original requests, and silently dropping offline work.
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -638,6 +681,15 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
   partial predictions or sending; dismissal retains payloads. Sent/Accepted outcomes still
   recover by original identity and revision; their missing predictions block dependent
   decisions until recovery. State/handler defects and unsupported asynchronous codecs are not quarantined.
+- **INV-SCHEMA-3:** Payload evolution refuses missing, ambiguous and unsupported version paths;
+  historical adapters preserve command identity and validate old input/current output, without
+  silently selecting defaults. Current writes have an explicit version when opted in.
+- **INV-SCHEMA-4:** Old and new commands coexist against a readable projection; historical
+  event replay and explicit projection rebuild preserve immutable facts, receipts and stream
+  sequence. Incomplete histories, changed scopes and catalog rebuilds fail atomically.
+- **INV-SCHEMA-5:** A supported old offline command predicts and synchronizes without rewriting
+  its durable payload or identity; unsupported versions retain notices and sent receipt recovery.
+  Projection mismatches fail visibly and replica-only reset preserves pending work.
 
 - **INV-SERVER-7:** Shared grants authorize reads and writes by role; scope moves invalidate
   old and new readers, and revoked readers lose the entire scope on their next pull.
@@ -759,7 +811,8 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
    data. (b) The shared shape, through a stand-in under `examples/` written then and the shared
    app's port in its own repository: grants aggregate, `Batch`, `Policy`, `authority: "server"`
    commands, scope moves, presence. Phases 1 and 2 build these interfaces but may stub them.
-4. **Migrations tooling:** upcasters, state-version rebuild sweep, compatibility floor, import.
+4. **Migrations tooling:** explicit payload adapters, event replay and operator-run projection
+   rebuild implemented (§2 item 36); automatic rebuild sweep and compatibility floor remain deferred.
 
 ## 5. Working rules
 

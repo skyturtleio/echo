@@ -659,6 +659,30 @@ behaviour adds or amends an item here in the same branch.
     reject stale clients. Rejected: silently upcasting caches as if they were facts, rewriting event history,
     retrying adapted rather than original requests, and silently dropping offline work.
 
+39. **Operation telemetry is scalar, opt-in on browsers and automatic on servers** (2026-11-11).
+    `Options.onTelemetry` synchronously receives `TelemetryEvent`: a fresh UUID operationId,
+    operation (open/sync/pull/execute/journal/replica/rebase), outcome
+    (started/succeeded/failed/interrupted/stalled), nonnegative durationMs, fixed diagnostic
+    failure category or null, count/pageCount (nonnegative integers or null), and mode
+    (bootstrap/incremental/mixed or null). Open covers acquisition, sync covers the complete
+    attempt including lock waits, and pull measures each page. Counts retain item 20's meanings;
+    sync totals received entries/pages. Reset flags determine mode, including empty scopes.
+    In-progress and failed events have null counts/mode. No identities, domain names, URLs,
+    payloads or raw errors enter these events. Callback exceptions cannot change outcomes;
+    callbacks must return promptly. A lifecycle-owned timer emits at most one stalled event
+    after ten seconds without timing out work, and is interrupted on completion. Busy browser
+    event loops may delay observation. IDs correlate only one operation's lifecycle, not users
+    or requests across the wire. Existing local diagnostics remain independent.
+    Server operation logs use the current Effect logger and request annotations; Pull includes
+    first/continuation page, counts and reset mode. Changes logs connection lifecycle, never
+    idle frames. Safe summary spans contain scalar attributes, not operation causes or ambient
+    span attributes/links. They retain the request trace parent but do not become the parent of
+    existing SQL/domain spans; operationId correlates the summary with lifecycle logs. Tracer
+    failures cannot suppress working logs. Applications own batching, retention, access controls
+    and log redaction outside these engine records.
+    Rejected: hosted telemetry, persistent browser history, per-row/frame logs, raw error
+    serialization, new protocol correlation fields and timeouts that change operation semantics.
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -783,6 +807,12 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
   allowlisted timing/count/failure data only. Offline work retains its age across reopen;
   follow-up counts exclude initial calls, successful sync reports actual response counts,
   and diagnostic reads neither sync nor persist nor mutate the retained records.
+- **INV-CLIENT-10:** Opt-in telemetry correlates acquisition, complete sync and nested operation
+  lifecycles using fresh UUIDs and only allowlisted scalar fields. Observer failures cannot
+  affect operations; stalled observations neither cancel work nor survive completion/interruption.
+- **INV-SERVER-12:** Structured operation logs distinguish Pull page work from Changes
+  connection lifetime without payloads, identifiers or raw failures, preserving request log
+  annotations and operation outcomes.
 - **INV-SYNC-1:** A browser's offline journal survives reload, reconnects over authenticated
   HTTP RPC to Postgres, converges with an independent device and retains authoritative rejection notices.
   Authentication failure in automatic Pull, Execute or Changes stops automatic retries without

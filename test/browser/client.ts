@@ -2731,9 +2731,139 @@ const payloadEvolution = (profile: string) =>
     })
   )
 
+// INV-CLIENT-10 catches omitted acquisition failures, callback defects, page totals and orphan timers.
+const telemetry = (profile: string) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const events: Array<Client.TelemetryEvent> = []
+      const onTelemetry = (event: Client.TelemetryEvent) => {
+        events.push(event)
+        throw new Error("private-observer-error")
+      }
+      const invalid = yield* Effect.exit(Client.open({ ...options(profile), compatibilityGeneration: 0, onTelemetry }))
+      yield* check(Exit.isFailure(invalid), "invalid acquisition unexpectedly succeeded")
+      yield* check(
+        Arr.some(events, (event) => event.operation === "open" && event.outcome === "failed"),
+        "early open failure omitted"
+      )
+      const gate = yield* Deferred.make<void>()
+      let wait = false
+      let forever = false
+      const transport: Client.Transport = {
+        changes: Stream.never,
+        execute: () => Effect.fail(new Client.TransportError({ reason: "auth", cause: "private-transport-error" })),
+        pull: Effect.fnUntraced(function* (request: PullRequest) {
+          if (forever) return yield* Effect.never
+          if (wait) yield* Deferred.await(gate)
+          const continuation = request.continuation !== undefined
+          return {
+            epoch: "private-epoch",
+            revision: 1,
+            grants: [],
+            scopes: [
+              {
+                scope: Domain.Scope.privateScope(principal),
+                cursor: 1,
+                reset: true,
+                entries: Arr.map(continuation ? [3] : [1, 2], (n) => ({
+                  _tag: "Upsert" as const,
+                  aggregate: "Tag",
+                  id: String(n),
+                  seq: 1,
+                  state: { name: "private-payload", removed: false, scope: Domain.Scope.privateScope(principal) }
+                }))
+              }
+            ],
+            page: { id: "private-page-id", next: continuation ? null : 2 }
+          }
+        })
+      }
+      const client = yield* Client.open({ ...options(profile, transport), aggregates: [Tag], onTelemetry })
+      yield* client.sync
+      yield* check(client.query((read) => read.scan(Tag)).length === 3, "observer changed installation")
+      yield* check(
+        Arr.some(
+          events,
+          (event) =>
+            event.operation === "sync" &&
+            event.outcome === "succeeded" &&
+            event.count === 3 &&
+            event.pageCount === 2 &&
+            event.mode === "bootstrap"
+        ),
+        "sync did not total pages"
+      )
+      yield* check(
+        Arr.filter(events, (event) => event.operation === "pull" && event.outcome === "succeeded").length === 2,
+        "pages not independently measured"
+      )
+      wait = true
+      const slow = yield* client.sync.pipe(Effect.forkChild)
+      yield* Effect.sleep("10100 millis")
+      yield* check(
+        Arr.filter(events, (event) => event.outcome === "stalled" && event.operation === "sync").length === 1,
+        "stalled sync missing or repeated"
+      )
+      yield* Deferred.succeed(gate, undefined)
+      yield* Fiber.join(slow)
+      forever = true
+      const cancelled = yield* client.sync.pipe(Effect.forkChild)
+      yield* Effect.sleep("20 millis")
+      yield* Fiber.interrupt(cancelled)
+      forever = false
+      yield* client.execute(Tag, new DefineTag({ target: TagId.make("pending"), name: "private-command" }))
+      const denied = yield* Effect.exit(client.sync)
+      yield* check(
+        Exit.isFailure(denied) &&
+          Arr.some(events, (event) => event.operation === "execute" && event.failure === "auth"),
+        "transport outcome replaced"
+      )
+      const length = events.length
+      yield* Effect.sleep("10100 millis")
+      yield* check(events.length === length, "timer survived completed or interrupted operation")
+      const keys = Arr.sort(
+        ["operationId", "operation", "outcome", "durationMs", "failure", "count", "pageCount", "mode"],
+        Str.Order
+      )
+      for (const event of events) {
+        yield* check(Equal.equals(Arr.sort(Record.keys(event), Str.Order), keys), "unexpected telemetry fields")
+        yield* check(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(event.operationId),
+          "not a random UUID"
+        )
+        yield* check(Number.isFinite(event.durationMs) && event.durationMs >= 0, "invalid duration")
+        const peers = Arr.filter(events, (other) => other.operationId === event.operationId)
+        yield* check(
+          Arr.filter(peers, (other) => other.outcome === "started").length === 1 &&
+            Arr.filter(
+              peers,
+              (other) => other.outcome === "succeeded" || other.outcome === "failed" || other.outcome === "interrupted"
+            ).length === 1,
+          "unpaired operation lifecycle"
+        )
+      }
+      const serialized = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(events)
+      yield* check(
+        !Str.includes("private-")(serialized) && !Str.includes(profile)(serialized),
+        "telemetry leaked private values"
+      )
+      yield* check(
+        Arr.some(events, (event) => event.operation === "sync" && event.outcome === "interrupted"),
+        "interruption omitted"
+      )
+      for (const operation of ["journal", "replica", "rebase"] as const)
+        yield* check(
+          Arr.some(events, (event) => event.operation === operation && event.outcome === "succeeded"),
+          `missing ${operation}`
+        )
+      return "PASS INV-CLIENT-10 acquisition, pages, callback isolation, stall/success/interruption and privacy"
+    })
+  )
+
 const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect)
 Object.assign(globalThis, {
   echosyncScenarios: {
+    telemetry: (profile: string) => run(telemetry(profile)),
     incremental: (profile: string) => run(incremental(profile)),
     payloadEvolution: (profile: string) => run(payloadEvolution(profile)),
     compatibility: (profile: string) => run(compatibility(profile)),

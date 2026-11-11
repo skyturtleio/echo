@@ -1,22 +1,12 @@
 import * as Arr from "effect/Array"
-import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
-import * as Option from "effect/Option"
-import * as Schema from "effect/Schema"
+import * as Telemetry from "../Telemetry.ts"
+import { category, type Failure } from "../Telemetry.ts"
 
 export type Operation = "execute" | "pull" | "journal" | "replica" | "rebase"
-export type Failure =
-  | "offline"
-  | "auth"
-  | "oversized"
-  | "transport"
-  | "storage"
-  | "resync"
-  | "client"
-  | "interrupted"
-  | "unknown"
+export type { Failure } from "../Telemetry.ts"
 export interface DiagnosticOperation {
   readonly operation: Operation
   readonly durationMs: number
@@ -34,34 +24,8 @@ export interface Diagnostics {
   readonly pending: { readonly count: number; readonly oldestAgeMs: number | null }
 }
 
-const category = (cause: Cause.Cause<unknown>): Failure => {
-  if (Cause.hasInterruptsOnly(cause)) return "interrupted"
-  const error = Option.getOrUndefined(Cause.findErrorOption(cause))
-  if (
-    Schema.is(
-      Schema.TaggedStruct("TransportError", {
-        reason: Schema.Literals(["offline", "auth", "oversized"])
-      })
-    )(error)
-  )
-    return error.reason
-  if (Schema.is(Schema.Struct({ _tag: Schema.String }))(error)) {
-    switch (error._tag) {
-      case "TransportError":
-        return "transport"
-      case "StorageError":
-        return "storage"
-      case "ResyncRequired":
-        return "resync"
-      case "ClientError":
-        return "client"
-    }
-  }
-  return "unknown"
-}
-
 /** Private per-open recorder. Only allowlisted scalar fields cross the export boundary. */
-export const make = () => {
+export const make = (onTelemetry?: (event: Telemetry.TelemetryEvent) => void) => {
   let operations: ReadonlyArray<DiagnosticOperation> = []
   const failedOperationFollowups = { execute: 0, pull: 0 }
   const failed = { execute: false, pull: false }
@@ -98,7 +62,18 @@ export const make = () => {
     )
   })
   return {
-    measure,
+    measure: <A, E, R>(
+      operation: Operation,
+      effect: Effect.Effect<A, E, R>,
+      count: (value: A) => number,
+      metrics?: (value: A) => Telemetry.Metrics
+    ) =>
+      Telemetry.measure(
+        operation,
+        measure(operation, effect, count),
+        onTelemetry,
+        metrics ?? ((value) => ({ ...Telemetry.empty, count: count(value) }))
+      ),
     snapshot: () => ({
       operations: Arr.map(operations, (entry) => ({ ...entry })),
       failedOperationFollowups: { ...failedOperationFollowups }

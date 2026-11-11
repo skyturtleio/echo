@@ -19,12 +19,14 @@ import { RpcClient, RpcSerialization } from "effect/rpc"
 import type * as Aggregate from "../domain/Aggregate.ts"
 import type { Principal, Scope } from "../domain/Scope.ts"
 import * as Protocol from "../protocol.ts"
+import * as Telemetry from "../Telemetry.ts"
 import * as Storage from "./BrowserStorage.ts"
 import * as Diagnostics from "./Diagnostics.ts"
 import * as Model from "./Model.ts"
 
 export { CompatibilityError, ProfileBusy, StorageError } from "./BrowserStorage.ts"
 export type { Diagnostics, DiagnosticOperation } from "./Diagnostics.ts"
+export type { TelemetryEvent } from "../Telemetry.ts"
 export type { Read } from "./Model.ts"
 export class ClientClosed extends Data.TaggedError("ClientClosed") {}
 export class PendingIntents extends Data.TaggedError("PendingIntents")<{ readonly count: number }> {}
@@ -56,6 +58,8 @@ export interface Options {
   readonly compatibilityGeneration?: number
   /** Defaults to true. Auth/oversized failures stop automation until close/reopen; sync stays one-shot. */
   readonly autoConnect?: boolean
+  /** Best-effort scalar operation events. Return promptly; thrown exceptions are ignored. */
+  readonly onTelemetry?: (event: Telemetry.TelemetryEvent) => void
 }
 export interface Status {
   readonly connection: "idle" | "syncing" | "offline" | "error" | "auth" | "oversized" | "reset" | "incompatible"
@@ -227,8 +231,8 @@ export const resetReplica = Effect.fn("EchoSync.resetReplica")(function* (option
 })
 
 /** Hydrates before returning. All resources, connection work and ownership end with the caller's Scope. */
-export const open = Effect.fnUntraced(function* (options: Options) {
-  const diagnostics = Diagnostics.make()
+const openClient = Effect.fnUntraced(function* (options: Options) {
+  const diagnostics = Diagnostics.make(options.onTelemetry)
   let committedReplica: { readonly token: string; readonly value: Model.Replica } | undefined
   const saveJournal = (db: Storage.Database, value: Model.Journal) =>
     diagnostics.measure("journal", Storage.save(db, value), () => value.intents.length)
@@ -505,9 +509,13 @@ export const open = Effect.fnUntraced(function* (options: Options) {
         incremental: true
       }))
     )
-    const response = yield* diagnostics.measure("pull", options.transport.pull(request), (reply) =>
-      Arr.reduce(reply.scopes, 0, (count, scope) => count + scope.entries.length)
+    const response = yield* diagnostics.measure(
+      "pull",
+      options.transport.pull(request),
+      (reply) => Arr.reduce(reply.scopes, 0, (count, scope) => count + scope.entries.length),
+      Telemetry.pageMetrics
     )
+    let pageCount = 1
     // Staging is session-local. No durable cursor, grant or receipt coverage changes until
     // every page has arrived; a failed page restarts from the last installed replica.
     let page = response.page
@@ -519,8 +527,10 @@ export const open = Effect.fnUntraced(function* (options: Options) {
           ...request,
           continuation: { id: page.id, offset: page.next }
         }),
-        (reply) => Arr.reduce(reply.scopes, 0, (count, scope) => count + scope.entries.length)
+        (reply) => Arr.reduce(reply.scopes, 0, (count, scope) => count + scope.entries.length),
+        Telemetry.pageMetrics
       )
+      pageCount++
       if (
         next.epoch !== response.epoch ||
         next.revision !== response.revision ||
@@ -623,6 +633,7 @@ export const open = Effect.fnUntraced(function* (options: Options) {
         yield* publish(true)
       })
     )
+    return { ...Telemetry.pageMetrics({ scopes: completeScopes }), pageCount }
   })
   const send = Effect.fnUntraced(function* (intent: Model.Intent) {
     const request = yield* locked(
@@ -690,7 +701,7 @@ export const open = Effect.fnUntraced(function* (options: Options) {
           // Recover lost receipts BEFORE applying any newer snapshot: otherwise a non-idempotent prediction doubles.
           const sent = yield* locked(Effect.sync(() => Arr.filter(journal.intents, (i) => i.phase === "Sent")))
           for (const intent of sent) yield* send(intent)
-          yield* pull
+          let totals = yield* pull
           while (true) {
             const intent = yield* locked(
               Effect.gen(function* () {
@@ -701,7 +712,12 @@ export const open = Effect.fnUntraced(function* (options: Options) {
             )
             if (intent === undefined) break
             yield* send(intent)
-            yield* pull
+            const next = yield* pull
+            totals = {
+              count: (totals.count ?? 0) + (next.count ?? 0),
+              pageCount: totals.pageCount + next.pageCount,
+              mode: totals.mode === next.mode ? totals.mode : "mixed"
+            }
           }
           const now = yield* Clock.currentTimeMillis
           yield* SubscriptionRef.update(status, (s): Status => ({
@@ -710,6 +726,7 @@ export const open = Effect.fnUntraced(function* (options: Options) {
             lastSynced: now,
             error: null
           }))
+          return totals
         })
       )
     )
@@ -726,7 +743,9 @@ export const open = Effect.fnUntraced(function* (options: Options) {
           }))
           return yield* error
         })
-      )
+      ),
+      (effect) => Telemetry.measure("sync", effect, options.onTelemetry, (totals) => totals),
+      Effect.asVoid
     )
 
   function enqueue(entries: ReadonlyArray<CommandEntry>, action?: { readonly name: string; readonly input: unknown }) {
@@ -1002,4 +1021,5 @@ export const open = Effect.fnUntraced(function* (options: Options) {
 })
 
 const ProtocolEpoch = Schema.TaggedStruct("ResyncRequired", { epoch: Schema.String })
+export const open = (options: Options) => Telemetry.measure("open", openClient(options), options.onTelemetry)
 export type Client = Effect.Success<ReturnType<typeof open>>

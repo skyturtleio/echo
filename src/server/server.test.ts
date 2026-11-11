@@ -7,14 +7,17 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Logger from "effect/Logger"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Record from "effect/Record"
 import * as Redacted from "effect/Redacted"
+import * as References from "effect/References"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as Str from "effect/String"
+import * as Tracer from "effect/Tracer"
 import { FetchHttpClient, HttpClient, HttpClientRequest, HttpEffect } from "effect/http"
 import { Reactivity } from "effect/reactivity"
 import { RpcClient, RpcSerialization } from "effect/rpc"
@@ -118,6 +121,188 @@ const scenario = <A, E>(
   )
 
 describe.skipIf(url === undefined)("Postgres server", () => {
+  it.effect("INV-SERVER-12 operation logs cannot leak payloads or confuse page work with Changes lifetime", () => {
+    const logs: Array<{
+      readonly message: unknown
+      readonly cause: string | undefined
+      readonly annotations: Record<string, unknown>
+    }> = []
+    const logger = Logger.map(Logger.formatStructured, (entry) => {
+      logs.push(entry)
+    })
+    const spans: Array<Tracer.Span> = []
+    let tracerFailure: "none" | "create" | "end" = "none"
+    const tracer = Tracer.make({
+      span(options) {
+        const operation = Str.startsWith("EchoSync.operation.")(options.name)
+        if (operation && tracerFailure === "create") throw new Error("private-tracer-error")
+        const span = Tracer.nativeTracer.span(options)
+        if (operation) {
+          spans.push(span)
+          if (tracerFailure === "end")
+            span.end = () => {
+              throw new Error("private-tracer-error")
+            }
+        }
+        return span
+      }
+    })
+    return scenario(
+      Effect.fnUntraced(function* (server) {
+        yield* server.importStreams({
+          id: "private-import",
+          principal: alice,
+          streams: Arr.makeBy(2049, (n) =>
+            Server.importedStream(Tag, TagId.make(`private-${n}`), [
+              new TagHistoryImported({
+                snapshot: { name: "private-payload", scope: privateScope(alice), removed: false }
+              })
+            ])
+          )
+        })
+        const first = yield* server.pull(alice, { epoch: null, cursors: {}, incremental: true })
+        if (first.page?.next === null || first.page?.next === undefined)
+          return yield* Effect.die("missing continuation")
+        yield* server.pull(alice, {
+          epoch: first.epoch,
+          cursors: {},
+          incremental: true,
+          continuation: { id: first.page.id, offset: first.page.next }
+        })
+        yield* server.pull(alice, { epoch: first.epoch, cursors: cursors(first), incremental: true })
+        yield* Effect.exit(server.pull(alice, { epoch: "private-wrong-epoch", cursors: {} }))
+        yield* server.execute(alice, request("private-command"))
+        yield* server.changes(alice).pipe(Stream.take(1), Stream.runDrain)
+        const operations = Arr.filter(logs, (entry) => entry.message === "echosync.operation")
+        expect(operations).toHaveLength(12)
+        const completed = Arr.map(
+          Arr.filter(operations, (entry) => entry.annotations["outcome"] !== "started"),
+          (entry) => entry.annotations
+        )
+        expect(completed).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              operation: "Pull",
+              page: "first",
+              outcome: "succeeded",
+              count: 2048,
+              pageCount: 1,
+              mode: "bootstrap"
+            }),
+            expect.objectContaining({
+              operation: "Pull",
+              page: "continuation",
+              outcome: "succeeded",
+              count: 1,
+              pageCount: 1,
+              mode: "bootstrap"
+            }),
+            expect.objectContaining({ operation: "Pull", count: 0, mode: "incremental" }),
+            expect.objectContaining({
+              operation: "Pull",
+              outcome: "failed",
+              failure: "resync",
+              count: null,
+              mode: null
+            }),
+            expect.objectContaining({ operation: "Execute", outcome: "succeeded", count: 1 }),
+            expect.objectContaining({ operation: "Changes", count: null, pageCount: null, mode: null })
+          ])
+        )
+        for (const entry of operations) {
+          expect(entry.cause).toBeUndefined()
+          expect(entry.annotations["requestId"]).toBe("test-request")
+          expect(entry.annotations["durationMs"]).toBeGreaterThanOrEqual(0)
+          expect(
+            Arr.filter(operations, (other) => other.annotations["operationId"] === entry.annotations["operationId"])
+          ).toHaveLength(2)
+          expect(Arr.sort(Record.keys(entry.annotations), Str.Order)).toEqual(
+            Arr.sort(
+              [
+                "operationId",
+                "operation",
+                "page",
+                "outcome",
+                "durationMs",
+                "failure",
+                "count",
+                "pageCount",
+                "mode",
+                "requestId"
+              ],
+              Str.Order
+            )
+          )
+        }
+        expect(yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(operations)).not.toMatch(
+          /private-|alice|user:/
+        )
+        // A broken application logger cannot change the successful page or its row count.
+        const broken = Logger.make(() => {
+          throw new Error("private-logger-error")
+        })
+        const unchanged = yield* server
+          .pull(alice, { epoch: first.epoch, cursors: cursors(first), incremental: true })
+          .pipe(Effect.provideService(Logger.CurrentLoggers, new Set([broken])))
+        expect(entries(unchanged)).toHaveLength(1)
+        // Interrupt exactly when the started log is emitted, before connection acquisition.
+        const interrupting = Logger.make((options) => {
+          const entry = Logger.formatStructured.log(options)
+          logs.push(entry)
+          if (
+            entry.message === "echosync.operation" &&
+            entry.annotations["operation"] === "Changes" &&
+            entry.annotations["outcome"] === "started"
+          )
+            options.fiber.interruptUnsafe()
+        })
+        const interrupted = yield* server
+          .changes(alice)
+          .pipe(
+            Stream.runDrain,
+            Effect.provideService(Logger.CurrentLoggers, new Set([interrupting])),
+            Effect.forkChild
+          )
+        yield* Fiber.await(interrupted)
+        expect(
+          Arr.filter(
+            logs,
+            (entry) => entry.annotations["operation"] === "Changes" && entry.annotations["outcome"] === "interrupted"
+          )
+        ).toHaveLength(1)
+        expect(spans.length).toBe(8)
+        for (const span of spans) {
+          expect(span.status._tag).toBe("Ended")
+          if (span.status._tag === "Ended") expect(span.status.exit).toEqual(Exit.void)
+          expect(span.attributes.has("privateAttribute")).toBe(false)
+          expect(span.links).toHaveLength(0)
+          expect(Arr.sort([...span.attributes.keys()], Str.Order)).toEqual(
+            Arr.sort(
+              ["operationId", "operation", "page", "outcome", "failure", "durationMs", "count", "pageCount", "mode"],
+              Str.Order
+            )
+          )
+        }
+        for (const failure of ["create", "end"] as const) {
+          tracerFailure = failure
+          const before = logs.length
+          yield* server.pull(alice, { epoch: first.epoch, cursors: cursors(first), incremental: true })
+          expect(Arr.map(logs.slice(before), (entry) => entry.annotations["outcome"])).toEqual(["started", "succeeded"])
+        }
+      })
+    ).pipe(
+      Effect.annotateLogs({ requestId: "test-request" }),
+      Effect.annotateSpans({ privateAttribute: "private-payload" }),
+      Effect.provideService(References.TracerSpanLinks, [
+        {
+          span: Tracer.externalSpan({ spanId: "private-span", traceId: "private-trace" }),
+          attributes: { privateLink: "private-payload" }
+        }
+      ]),
+      Effect.provideService(Tracer.Tracer, tracer),
+      Effect.provideService(Logger.CurrentLoggers, new Set([logger]))
+    )
+  })
   it.effect(
     "INV-SYNC-2 paged catchup cannot skip concurrent edits, deletes or revoked access",
     () => {

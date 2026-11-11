@@ -11,7 +11,7 @@ agent-browser --session "$session" eval "echosyncScenarios.prepareReload('$profi
 agent-browser --session "$session" reload
 agent-browser --session "$session" wait --fn 'typeof echosyncScenarios === "object"'
 agent-browser --session "$session" eval "echosyncScenarios.verifyReload('$profile-reload')"
-for scenario in lostReceipt rebaseAndEpoch lifetime queries diagnostics batches ownership durableRefresh compatibility incompatibleCommands payloadEvolution; do
+for scenario in lostReceipt rebaseAndEpoch lifetime queries diagnostics telemetry batches ownership durableRefresh compatibility incompatibleCommands payloadEvolution; do
   agent-browser --session "$session" eval "echosyncScenarios.$scenario('$profile-$scenario')"
 done
 agent-browser --session "$session" wait --fn 'navigator.serviceWorker.controller !== null'

@@ -20,9 +20,11 @@ import type { Codec } from "../domain/internal/classes.ts"
 import * as Payload from "../domain/Payload.ts"
 import { canRead, canWrite, Grant, privateScope, type Principal, Scope, ScopeForbidden } from "../domain/Scope.ts"
 import * as Wire from "../protocol.ts"
+import * as OperationTelemetry from "../Telemetry.ts"
 import type * as Action from "./Action.ts"
 import * as Changes from "./Changes.ts"
 import * as Sync from "./Sync.ts"
+import * as Telemetry from "./Telemetry.ts"
 export * as Action from "./Action.ts"
 
 const decode = <S extends Codec>(schema: S, value: unknown) =>
@@ -770,15 +772,25 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
     transaction(Sync.compact(through)).pipe(Effect.provideService(SqlClient.SqlClient, sql), protect("compactScopes"))
   const changes = yield* Changes.make(sql)
   return {
-    execute,
-    pull,
+    execute: (principal, request) =>
+      Telemetry.measure("Execute", execute(principal, request), null, (reply) => ({
+        ...OperationTelemetry.empty,
+        count: reply.receipts.length
+      })),
+    pull: (principal, request) =>
+      Telemetry.measure(
+        "Pull",
+        pull(principal, request),
+        request.continuation === undefined ? "first" : "continuation",
+        OperationTelemetry.pageMetrics
+      ),
     get,
     ingestCatalog,
     compactScopes,
     importStreams,
     rebuildProjections,
     resetEpoch,
-    changes,
+    changes: (principal) => Telemetry.changes(changes(principal)),
     presence
   }
 })
